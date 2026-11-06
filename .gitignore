@@ -1,0 +1,5 @@
+sqlc
+*.o
+*.dSYM/
+compile_flags.txt
+.DS_Store
