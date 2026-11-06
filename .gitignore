@@ -1,4 +1,6 @@
 sqlc
+sqlc-gui
+build/
 *.o
 *.dSYM/
 compile_flags.txt

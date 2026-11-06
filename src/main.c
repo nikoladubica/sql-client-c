@@ -15,6 +15,7 @@
 #include <mysql.h>
 
 #include "complete.h"
+#include "db.h"
 
 #define MAX_PASSWORD 256
 
@@ -51,172 +52,67 @@ static void usage(const char *prog) {
         prog);
 }
 
-static void print_error(MYSQL *conn) {
-    fflush(stdout);
-    fprintf(stderr, "ERROR %u (%s): %s\n",
-            mysql_errno(conn), mysql_sqlstate(conn), mysql_error(conn));
-}
-
 /* Print a horizontal separator like +------+-----+ */
-static void print_separator(const size_t *widths, const int *show, unsigned int n) {
+static void print_separator(const size_t *widths, unsigned int n) {
     putchar('+');
     for (unsigned int i = 0; i < n; i++) {
-        if (!show[i]) continue;
         for (size_t j = 0; j < widths[i] + 2; j++) putchar('-');
         putchar('+');
     }
     putchar('\n');
 }
 
-/*
- * How to filter a result set. type_col >= 0 means "skip rows whose value in
- * that column is a view"; hide_type_col also removes that column from output.
- */
-typedef struct {
-    int type_col;
-    int hide_type_col;
-} filter_t;
+static void print_set(const db_set *s) {
+    if (!s->has_rows) {
+        printf("Query OK, %llu row%s affected\n\n", s->affected, s->affected == 1 ? "" : "s");
+        return;
+    }
 
-static const filter_t no_filter = { -1, 0 };
-
-static int row_is_view(MYSQL_ROW row, const filter_t *f) {
-    return f->type_col >= 0 && row[f->type_col] &&
-           strstr(row[f->type_col], "VIEW") != NULL;
-}
-
-static void print_result(MYSQL_RES *res, const filter_t *f) {
-    unsigned int ncols = mysql_num_fields(res);
-    MYSQL_FIELD *fields = mysql_fetch_fields(res);
-    size_t *widths = calloc(ncols, sizeof *widths);
-    int *show = calloc(ncols, sizeof *show);
-    if (!widths || !show) { perror("calloc"); free(widths); free(show); return; }
-
-    for (unsigned int i = 0; i < ncols; i++) {
-        show[i] = !(f->hide_type_col && (int)i == f->type_col);
-        size_t w = strlen(fields[i].name);
+    size_t *widths = calloc(s->ncols ? s->ncols : 1, sizeof *widths);
+    if (!widths) { perror("calloc"); return; }
+    for (unsigned int i = 0; i < s->ncols; i++) {
+        size_t w = strlen(s->names[i]);
         widths[i] = w < 4 ? 4 : w; /* room for "NULL" */
+        for (size_t r = 0; r < s->nrows; r++) {
+            const char *v = db_cell(s, r, i);
+            if (v && strlen(v) > widths[i]) widths[i] = strlen(v);
+        }
     }
 
-    /* First pass: column widths from the rows we will actually print. */
-    MYSQL_ROW row;
-    while ((row = mysql_fetch_row(res))) {
-        if (row_is_view(row, f)) continue;
-        unsigned long *lens = mysql_fetch_lengths(res);
-        for (unsigned int i = 0; i < ncols; i++)
-            if (row[i] && lens[i] > widths[i]) widths[i] = lens[i];
-    }
-    mysql_data_seek(res, 0);
-
-    print_separator(widths, show, ncols);
+    print_separator(widths, s->ncols);
     putchar('|');
-    for (unsigned int i = 0; i < ncols; i++)
-        if (show[i]) printf(" %-*s |", (int)widths[i], fields[i].name);
+    for (unsigned int i = 0; i < s->ncols; i++)
+        printf(" %-*s |", (int)widths[i], s->names[i]);
     putchar('\n');
-    print_separator(widths, show, ncols);
+    print_separator(widths, s->ncols);
 
-    unsigned long long printed = 0;
-    while ((row = mysql_fetch_row(res))) {
-        if (row_is_view(row, f)) continue;
+    for (size_t r = 0; r < s->nrows; r++) {
         putchar('|');
-        for (unsigned int i = 0; i < ncols; i++) {
-            if (!show[i]) continue;
-            const char *val = row[i] ? row[i] : "NULL";
-            if (IS_NUM(fields[i].type))
-                printf(" %*s |", (int)widths[i], val);
-            else
-                printf(" %-*s |", (int)widths[i], val);
+        for (unsigned int i = 0; i < s->ncols; i++) {
+            const char *v = db_cell(s, r, i);
+            if (!v) v = "NULL";
+            printf(s->numeric[i] ? " %*s |" : " %-*s |", (int)widths[i], v);
         }
         putchar('\n');
-        printed++;
     }
-    print_separator(widths, show, ncols);
+    print_separator(widths, s->ncols);
 
-    printf("%llu row%s in set\n\n", printed, printed == 1 ? "" : "s");
+    printf("%zu row%s in set\n\n", s->nrows, s->nrows == 1 ? "" : "s");
     free(widths);
-    free(show);
-}
-
-/* Case-insensitive keyword match at *p followed by a word boundary. */
-static int match_word(const char **p, const char *word) {
-    size_t n = strlen(word);
-    if (strncasecmp(*p, word, n) != 0) return 0;
-    char next = (*p)[n];
-    if (next != '\0' && next != ';' && !isspace((unsigned char)next)) return 0;
-    *p += n;
-    while (isspace((unsigned char)**p)) (*p)++;
-    return 1;
-}
-
-/*
- * If sql is a single "SHOW [FULL] TABLES ..." statement, return a malloc'd
- * "SHOW FULL TABLES ..." so we get the Table_type column to filter on.
- * *was_full tells whether the user asked for FULL themselves.
- */
-static char *rewrite_show_tables(const char *sql, int *was_full) {
-    const char *p = sql;
-    while (isspace((unsigned char)*p)) p++;
-    if (!match_word(&p, "SHOW")) return NULL;
-    *was_full = match_word(&p, "FULL");
-    if (!match_word(&p, "TABLES")) return NULL;
-
-    /* Only handle a single statement: no ';' before the trailing one. */
-    const char *semi = strchr(p, ';');
-    if (semi) {
-        const char *q = semi + 1;
-        while (isspace((unsigned char)*q)) q++;
-        if (*q != '\0') return NULL;
-    }
-
-    const char *prefix = "SHOW FULL TABLES ";
-    char *out = malloc(strlen(prefix) + strlen(p) + 1);
-    if (!out) return NULL;
-    strcpy(out, prefix);
-    strcat(out, p);
-    return out;
-}
-
-static int find_column(MYSQL_RES *res, const char *name) {
-    unsigned int n = mysql_num_fields(res);
-    MYSQL_FIELD *fields = mysql_fetch_fields(res);
-    for (unsigned int i = 0; i < n; i++)
-        if (strcasecmp(fields[i].name, name) == 0) return (int)i;
-    return -1;
 }
 
 /* Run SQL (possibly several statements) and print every result set. */
 static int run_query(MYSQL *conn, const char *sql) {
-    int was_full = 0;
-    char *rewritten = opt.hide_views ? rewrite_show_tables(sql, &was_full) : NULL;
-
-    int filtering = rewritten != NULL;
-    int qrc = mysql_query(conn, rewritten ? rewritten : sql);
-    free(rewritten);
-    if (qrc != 0) { print_error(conn); return -1; }
-
-    int status;
-    do {
-        MYSQL_RES *res = mysql_store_result(conn);
-        if (res) {
-            filter_t f = no_filter;
-            if (filtering) {
-                f.type_col = find_column(res, "Table_type");
-                f.hide_type_col = !was_full;
-            }
-            print_result(res, &f);
-            mysql_free_result(res);
-        } else if (mysql_field_count(conn) == 0) {
-            my_ulonglong n = mysql_affected_rows(conn);
-            printf("Query OK, %llu row%s affected\n\n", n, n == 1 ? "" : "s");
-        } else {
-            print_error(conn);
-            return -1;
-        }
-
-        status = mysql_next_result(conn); /* 0 = more, -1 = done, >0 = error */
-        if (status > 0) { print_error(conn); return -1; }
-    } while (status == 0);
-
-    return 0;
+    db_exec_opts eo = { .hide_views = opt.hide_views, .max_rows = 0 };
+    db_outcome out;
+    int rc = db_execute(conn, sql, &eo, &out);
+    for (size_t i = 0; i < out.nsets; i++) print_set(&out.sets[i]);
+    if (out.error) {
+        fflush(stdout);
+        fprintf(stderr, "%s\n", out.error);
+    }
+    db_outcome_free(&out);
+    return rc;
 }
 
 static char *rtrim(char *s) {
@@ -380,7 +276,9 @@ int main(int argc, char **argv) {
     if (!mysql_real_connect(conn, opt.host, opt.user, opt.password,
                             opt.database, opt.port, opt.socket,
                             CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS)) {
-        print_error(conn);
+        char *e = db_error_string(conn);
+        fprintf(stderr, "%s\n", e ? e : "connection failed");
+        free(e);
         mysql_close(conn);
         return 1;
     }

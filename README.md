@@ -1,10 +1,24 @@
 # sqlc
 
-A small MySQL / MariaDB command-line client written in C, built on
+A small MySQL / MariaDB client written in C, built on
 [MariaDB Connector/C](https://mariadb.com/kb/en/mariadb-connector-c/).
+It comes as a command-line client (`sqlc`) and a simple native macOS GUI
+(`sqlc-gui`, built with [libui-ng](https://github.com/libui-ng/libui-ng)).
 It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
 
 ## Features
+
+### GUI (`sqlc-gui`)
+
+- Connection bar (host, port, user, password, database)
+- SQL editor with **Run** (button or ⌘↩); several statements at once
+- Results grid, with one tab per result set, plus "Query OK" and error pages
+- Sidebar listing the tables in the current database, with a **Hide views** checkbox
+- Double-click a table to browse it (`SELECT * ... LIMIT 1000`)
+- Queries run on a background thread, so the window never freezes
+- Shows the first 10,000 rows per result set
+
+### CLI (`sqlc`)
 
 - Interactive prompt with history and multi-line statements (end with `;`)
 - `mysql`-style table output (numbers right-aligned, `NULL` shown)
@@ -22,17 +36,33 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
   brew install mariadb-connector-c   # or: brew install mariadb
   ```
 
-It uses `libedit`, which ships with macOS.
+It uses `libedit` and AppKit, which ship with macOS. libui-ng is included as a
+git submodule and compiled by the Makefile, so meson/ninja aren't needed.
 
 ## Build
 
 ```sh
-make            # builds ./sqlc
-make debug      # build with AddressSanitizer + UBSan
+git clone --recursive https://github.com/nikoladubica/sql-client-c.git
+cd sql-client-c
+make            # builds ./sqlc and ./sqlc-gui
+make sqlc       # CLI only
+make gui        # GUI only
+make debug      # both, with AddressSanitizer + UBSan
 make compile_flags.txt   # optional: include paths for clangd / your editor
 ```
 
-## Usage
+If you cloned without `--recursive`, the Makefile fetches the submodule for you
+(or run `git submodule update --init`).
+
+## GUI
+
+```sh
+./sqlc-gui
+```
+
+Fill in the connection fields, press **Connect**, type SQL and press **Run** (⌘↩).
+
+## CLI usage
 
 ```sh
 ./sqlc -u root -p                       # prompts for the password
@@ -73,6 +103,23 @@ make compile_flags.txt   # optional: include paths for clangd / your editor
   only shown if you asked for `FULL` yourself. `LIKE` and `WHERE` clauses keep
   working.
 
+## Project layout
+
+| Path | What |
+| --- | --- |
+| `src/db.c`, `src/db.h` | Shared core: run SQL, collect results, views filter |
+| `src/main.c`, `src/complete.c` | CLI and its tab completion |
+| `src/gui.c` | GUI (libui-ng) |
+| `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), which libui-ng lacks |
+| `third_party/libui-ng` | libui-ng submodule |
+
+## Development
+
+`make gui-test` builds the GUI with sanitizers and runs a scripted smoke test
+(connect, multi-statement results, views filter, double-click, row cap). It
+expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
+`customers` and `orders` plus a view.
+
 ## Limitations
 
 - The `--no-views` filter applies only when `SHOW TABLES` is the sole statement
@@ -80,6 +127,9 @@ make compile_flags.txt   # optional: include paths for clangd / your editor
 - A `;` at the end of a line inside a quoted string ends the statement early.
 - Column widths are counted in bytes, so non-ASCII text may misalign.
 - No `\G` vertical output, TLS options or prepared statements yet.
+- GUI: the grid is read-only, there's no syntax highlighting, and it always
+  runs the whole editor (not just the selection). A running query can't be
+  cancelled yet.
 
 ## License
 
