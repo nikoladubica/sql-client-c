@@ -48,4 +48,7 @@ static inline const char *db_cell(const db_set *s, size_t row, unsigned int col)
 /* malloc'd "ERROR <n> (<state>): <message>" for the connection's last error. */
 char *db_error_string(MYSQL *conn);
 
+/* malloc'd `name` with any backticks doubled, for use as an identifier. */
+char *db_quote_ident(const char *name);
+
 #endif

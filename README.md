@@ -19,6 +19,8 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
 - Sidebar listing the tables in the current database, with a **Load tables** /
   **Refresh tables** button; drag its right edge to resize it (the width is remembered)
 - Double-click a table to browse it (`SELECT * ... LIMIT 1000`)
+- Right-click a table for **Copy Table Name**, **Rename**, **Truncate**, **Delete**
+  and **Export** (Truncate and Delete always ask first; Cancel is the default)
 - **Export** a table as SQL, CSV or XML (select it, then **Export…** in the
   sidebar or **File › Export Table…**)
 - Queries run on a background thread, so the window never freezes
@@ -158,6 +160,7 @@ freeze the window; the file only appears once the export has finished.
 | `src/export.c` | Streaming SQL / CSV / XML writers (no database code) |
 | `src/export_db.c` | Export a table from a connection through those writers |
 | `src/export_dialog.m` | Native export options dialog and save panel |
+| `src/table_menu.m` | Sidebar right-click menu, rename prompt, confirmations, clipboard |
 | `third_party/libui-ng` | libui-ng submodule |
 
 ## Development
@@ -172,7 +175,7 @@ with Python. It creates and drops `test_sqlc_export_src` and `test_sqlc_export_d
 
 `make gui-test` builds the GUI with sanitizers and runs a scripted smoke test
 (connect, multi-statement results, views filter, double-click, row cap,
-export, `-A`). It
+export, `-A`, and the context-menu actions on a scratch table `ctx_tmp`). It
 expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
 `customers` and `orders` plus a view.
 

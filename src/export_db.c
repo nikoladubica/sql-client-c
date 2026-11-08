@@ -22,18 +22,6 @@ static char *fmt_error(const char *fmt, ...) {
     return strdup(buf);
 }
 
-/* `name` with backticks doubled; malloc'd. */
-static char *quote_ident(const char *name) {
-    size_t n = strlen(name);
-    char *q = malloc(2 * n + 3), *o = q;
-    if (!q) return NULL;
-    *o++ = '`';
-    for (const char *c = name; *c; c++) { if (*c == '`') *o++ = '`'; *o++ = *c; }
-    *o++ = '`';
-    *o = '\0';
-    return q;
-}
-
 /* Run a query and return its result (stored), or NULL with *err set. */
 static MYSQL_RES *query_store(MYSQL *conn, const char *sql, char **err) {
     if (mysql_real_query(conn, sql, strlen(sql)) != 0) { *err = db_error_string(conn); return NULL; }
@@ -100,7 +88,7 @@ static char *select_sql(MYSQL *conn, const char *table, const char *qtable,
     MYSQL_ROW row;
     unsigned int ncols = 0;
     while (sql && (row = mysql_fetch_row(r))) {
-        char *qc = row[0] ? quote_ident(row[0]) : NULL;
+        char *qc = row[0] ? db_quote_ident(row[0]) : NULL;
         if (!qc) continue;
         size_t need = len + strlen(qc) + strlen(qtable) + 16;
         if (need > cap) {
@@ -150,7 +138,7 @@ int export_table(MYSQL *conn, const char *table, int is_view, export_format fmt,
                  unsigned long long *rows_out, char **err) {
     export_opts opts = opts_in ? *opts_in : export_default_opts();
     unsigned long long rows = 0;
-    char *qtable = quote_ident(table);
+    char *qtable = db_quote_ident(table);
     char *create = NULL, *sql = NULL, *tz = NULL, *tmp = NULL;
     FILE *f = NULL;
     export_writer *w = NULL;

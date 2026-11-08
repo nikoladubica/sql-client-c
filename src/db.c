@@ -15,6 +15,17 @@ char *db_error_string(MYSQL *conn) {
     return s;
 }
 
+char *db_quote_ident(const char *name) {
+    size_t n = strlen(name);
+    char *q = malloc(2 * n + 3), *o = q;
+    if (!q) return NULL;
+    *o++ = '`';
+    for (const char *c = name; *c; c++) { if (*c == '`') *o++ = '`'; *o++ = *c; }
+    *o++ = '`';
+    *o = '\0';
+    return q;
+}
+
 /* Case-insensitive keyword match at *p followed by a word boundary. */
 static int match_word(const char **p, const char *word) {
     size_t n = strlen(word);

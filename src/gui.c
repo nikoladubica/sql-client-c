@@ -33,6 +33,7 @@
 #include "export.h"
 #include "export_db.h"
 #include "export_dialog.h"
+#include "table_menu.h"
 #include "profiles.h"
 
 #define GUI_MAX_ROWS 10000 /* rows kept per result set in the grid */
@@ -135,6 +136,9 @@ static struct {
     db_outcome tables_raw;   /* TABLE_NAME, TABLE_TYPE from the server */
     size_t *side_index;      /* visible row -> row in tables_raw */
     int tables_loaded;       /* tables_raw holds this connection's list */
+    char *menu_table;        /* table the context menu was opened on */
+    int menu_is_view;
+    char *browsing;          /* table shown by a double-click browse, or NULL */
 
     MYSQL *conn;
     int busy;
@@ -148,6 +152,14 @@ static void set_status(const char *fmt, ...) {
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     uiLabelSetText(app.status, buf);
+}
+
+static void show_error(const char *title, const char *msg) {
+#ifdef SQLC_AUTOTEST
+    printf("[dialog] %s: %s\n", title, msg);
+#else
+    uiMsgBoxError(app.win, title, msg);
+#endif
 }
 
 static void set_busy(int busy) {
@@ -239,6 +251,8 @@ static void show_outcome(db_outcome *out) {
 /* ---------- sidebar ---------- */
 
 static void on_table_double_click(uiTable *t, int row, void *data);
+static unsigned on_table_menu_open(int row, void *data);
+static void on_table_menu_action(table_menu_item item, int row, void *data);
 
 static int is_view(const char *type) { return type && strstr(type, "VIEW") != NULL; }
 
@@ -286,12 +300,16 @@ static void rebuild_sidebar(void) {
     app.side_table = new_grid(app.side_model);
     sqlc_table_fill_width(app.side_table); /* column follows the sidebar width */
     uiTableOnRowDoubleClicked(app.side_table, on_table_double_click, NULL);
+    sqlc_table_set_context_menu(app.side_table, on_table_menu_open, on_table_menu_action, NULL);
     uiBoxAppend(app.side_box, uiControl(app.side_table), 1);
 }
 
 /* ---------- worker thread ---------- */
 
-typedef enum { JOB_CONNECT, JOB_QUERY, JOB_TABLES, JOB_EXPORT } job_kind;
+typedef enum { JOB_CONNECT, JOB_QUERY, JOB_TABLES, JOB_EXPORT, JOB_ALTER } job_kind;
+
+/* JOB_ALTER: what the context menu asked for */
+typedef enum { ALTER_RENAME, ALTER_TRUNCATE, ALTER_DROP } alter_kind;
 
 typedef struct {
     job_kind kind;
@@ -303,8 +321,10 @@ typedef struct {
     char *profile;            /* saved connection used to connect, if any */
     int load_tables;          /* refresh the table list afterwards */
     int hide_views;           /* ... leaving views out of it */
-    /* JOB_EXPORT */
+    /* JOB_EXPORT, JOB_ALTER */
     char *table, *path;
+    alter_kind alter;
+    char *new_name;           /* ALTER_RENAME */
     int is_view;
     export_format fmt;
     export_opts xopts;
@@ -326,6 +346,7 @@ static void job_free(job *j) {
     free(j->profile);
     free(j->table);
     free(j->path);
+    free(j->new_name);
     db_outcome_free(&j->out);
     db_outcome_free(&j->tables);
     free(j);
@@ -398,7 +419,7 @@ static void *worker(void *data) {
                 j->conn = NULL;
             }
         }
-    } else if (j->kind == JOB_QUERY) {
+    } else if (j->kind == JOB_QUERY || j->kind == JOB_ALTER) {
         j->ok = db_execute(j->conn, j->sql, &j->eo, &j->out) == 0;
     } else if (j->kind == JOB_EXPORT) {
         j->ok = export_table(j->conn, j->table, j->is_view, j->fmt, &j->xopts, j->path,
@@ -425,6 +446,67 @@ static void start_job(job *j) {
     pthread_detach(th);
 }
 
+static void show_message_page(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void show_message_page(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    clear_results();
+    show_results_control(message_page(buf));
+}
+
+/* "SELECT * FROM `name` LIMIT 1000;" (malloc'd) */
+static char *browse_sql(const char *name) {
+    char *q = db_quote_ident(name);
+    if (!q) return NULL;
+    size_t n = strlen(q) + 40;
+    char *sql = malloc(n);
+    if (sql) snprintf(sql, n, "SELECT * FROM %s LIMIT 1000;", q);
+    free(q);
+    return sql;
+}
+
+/* A rename/truncate/drop from the context menu finished. */
+static void alter_done(job *j) {
+    static const char *const verbs[] = { "Rename", "Truncate", "Drop" };
+    if (!j->ok) {
+        const char *err = j->out.error ? j->out.error : "unknown error";
+        char title[64];
+        snprintf(title, sizeof title, "%s failed", verbs[j->alter]);
+        set_status("%s: %s", title, err);
+        show_error(title, err);
+        return;
+    }
+    const char *what = j->is_view ? "view" : "table";
+    int shown = app.browsing && strcmp(app.browsing, j->table) == 0;
+    switch (j->alter) {
+    case ALTER_RENAME:
+        set_status("Renamed %s %s to %s", what, j->table, j->new_name);
+        if (shown) { /* same rows, new name: just follow it */
+            free(app.browsing);
+            app.browsing = strdup(j->new_name);
+            char *sql = browse_sql(j->new_name);
+            if (sql) uiMultilineEntrySetText(app.editor, sql);
+            free(sql);
+        }
+        break;
+    case ALTER_TRUNCATE:
+        set_status("Truncated table %s", j->table);
+        if (shown) show_message_page("Table %s was truncated: it has no rows now.", j->table);
+        break;
+    case ALTER_DROP:
+        set_status("Dropped %s %s", what, j->table);
+        if (shown) {
+            show_message_page("The %s %s was dropped.", what, j->table);
+            free(app.browsing);
+            app.browsing = NULL;
+        }
+        break;
+    }
+}
+
 /* Back on the UI thread. */
 static void job_done(void *data) {
     job *j = data;
@@ -448,13 +530,17 @@ static void job_done(void *data) {
         /* The old connection's list is stale whether or not we reload it. */
         db_outcome_free(&app.tables_raw);
         app.tables_loaded = 0;
+        free(app.browsing);
+        app.browsing = NULL;
+    } else if (j->kind == JOB_ALTER) {
+        alter_done(j);
     } else if (j->kind == JOB_EXPORT) {
         if (j->ok) {
             set_status("Exported %llu row%s of %s to %s (%.2f s)", j->rows, j->rows == 1 ? "" : "s",
                        j->table, j->path, j->seconds);
         } else {
             set_status("Export failed: %s", j->error ? j->error : "unknown error");
-            uiMsgBoxError(app.win, "Export failed", j->error ? j->error : "");
+            show_error("Export failed", j->error ? j->error : "");
         }
     } else if (j->kind == JOB_TABLES) {
         const db_set *t = j->tables.nsets ? &j->tables.sets[0] : NULL;
@@ -537,16 +623,17 @@ static void on_connect(uiButton *b, void *data) {
     start_job(j);
 }
 
-static void run_sql(const char *sql) {
-    if (app.busy) return;
-    if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return; }
+/* Returns 1 if the query was started. */
+static int run_sql(const char *sql) {
+    if (app.busy) return 0;
+    if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return 0; }
 
     const char *p = sql;
     while (isspace((unsigned char)*p)) p++;
-    if (!*p) { set_status("Nothing to run."); return; }
+    if (!*p) { set_status("Nothing to run."); return 0; }
 
     job *j = calloc(1, sizeof *j);
-    if (!j) return;
+    if (!j) return 0;
     j->kind = JOB_QUERY;
     j->conn = app.conn;
     j->sql = strdup(sql);
@@ -557,11 +644,15 @@ static void run_sql(const char *sql) {
     j->hide_views = j->eo.hide_views;
     set_status("Running...");
     start_job(j);
+    return 1;
 }
 
 static void on_run_menu(void) {
     char *sql = uiMultilineEntryText(app.editor);
-    run_sql(sql ? sql : "");
+    if (run_sql(sql ? sql : "")) { /* the user's own SQL: no longer browsing a table */
+        free(app.browsing);
+        app.browsing = NULL;
+    }
     uiFreeText(sql);
 }
 
@@ -606,16 +697,28 @@ static void start_export(const char *table, int is_view, export_format fmt,
     start_job(j);
 }
 
+static const char *table_at_row(int row, int *is_view_out);
+
 /* The table selected in the sidebar, or NULL (pointer into tables_raw). */
 static const char *selected_table(int *is_view_out) {
     if (!app.side_table || !app.side_data.nsets) return NULL;
     uiTableSelection *sel = uiTableGetSelection(app.side_table);
     int row = sel && sel->NumRows > 0 ? sel->Rows[0] : -1;
     uiFreeTableSelection(sel);
-    if (row < 0 || (size_t)row >= app.side_data.sets[0].nrows) return NULL;
-    size_t r = app.side_index[row];
-    if (is_view_out) *is_view_out = is_view(db_cell(&app.tables_raw.sets[0], r, 1));
-    return db_cell(&app.tables_raw.sets[0], r, 0);
+    return table_at_row(row, is_view_out);
+}
+
+/* Options dialog + save panel, then the export job. */
+static void export_table_flow(const char *table, int view) {
+    if (app.busy || !app.conn) return;
+    char *t = strdup(table); /* the dialog runs a modal loop; keep our own copy */
+    if (!t) return;
+    export_format fmt;
+    export_opts opts;
+    char *path = NULL;
+    if (sqlc_export_dialog(t, view, &fmt, &opts, &path)) start_export(t, view, fmt, &opts, path);
+    free(path);
+    free(t);
 }
 
 static void export_selected_table(void) {
@@ -629,14 +732,7 @@ static void export_selected_table(void) {
                                         : "Load the table list and select a table first.");
         return;
     }
-    char *table = strdup(name); /* the dialog runs a modal loop; keep our own copy */
-    if (!table) return;
-    export_format fmt;
-    export_opts opts;
-    char *path = NULL;
-    if (sqlc_export_dialog(table, view, &fmt, &opts, &path)) start_export(table, view, fmt, &opts, path);
-    free(path);
-    free(table);
+    export_table_flow(name, view);
 }
 
 static void on_export(uiButton *b, void *data) {
@@ -663,20 +759,117 @@ static void on_table_double_click(uiTable *t, int row, void *data) {
     if (row < 0 || !app.side_data.nsets || (size_t)row >= app.side_data.sets[0].nrows) return;
     const char *name = db_cell(&app.tables_raw.sets[0], app.side_index[row], 0);
     if (!name) return;
-
-    /* Quote as `name`, doubling any backticks inside. */
-    static const char head[] = "SELECT * FROM `", tail[] = "` LIMIT 1000;";
-    size_t cap = sizeof head + strlen(name) * 2 + sizeof tail;
-    char *sql = malloc(cap);
+    char *sql = browse_sql(name);
     if (!sql) return;
-    char *o = sql;
-    memcpy(o, head, sizeof head - 1); o += sizeof head - 1;
-    for (const char *c = name; *c; c++) { if (*c == '`') *o++ = '`'; *o++ = *c; }
-    memcpy(o, tail, sizeof tail); /* includes the terminating NUL */
-
     uiMultilineEntrySetText(app.editor, sql);
-    run_sql(sql);
+    if (run_sql(sql)) {
+        free(app.browsing);
+        app.browsing = strdup(name);
+    }
     free(sql);
+}
+
+/* ---------- sidebar context menu ---------- */
+
+/* Name and kind of the table on a visible sidebar row (pointer into tables_raw). */
+static const char *table_at_row(int row, int *is_view_out) {
+    if (row < 0 || !app.side_data.nsets || (size_t)row >= app.side_data.sets[0].nrows) return NULL;
+    size_t r = app.side_index[row];
+    if (is_view_out) *is_view_out = is_view(db_cell(&app.tables_raw.sets[0], r, 1));
+    return db_cell(&app.tables_raw.sets[0], r, 0);
+}
+
+/* Rename, truncate or drop a table on the worker thread. */
+static void start_alter(alter_kind kind, const char *table, int view, const char *new_name) {
+    if (app.busy || !app.conn) return;
+    char *qt = db_quote_ident(table);
+    char *qn = new_name ? db_quote_ident(new_name) : NULL;
+    job *j = calloc(1, sizeof *j);
+    size_t n = (qt ? strlen(qt) : 0) + (qn ? strlen(qn) : 0) + 32;
+    char *sql = malloc(n);
+    if (!qt || (new_name && !qn) || !j || !sql) { free(qt); free(qn); free(j); free(sql); return; }
+    switch (kind) {
+    case ALTER_RENAME:   snprintf(sql, n, "RENAME TABLE %s TO %s", qt, qn); break;
+    case ALTER_TRUNCATE: snprintf(sql, n, "TRUNCATE TABLE %s", qt); break;
+    case ALTER_DROP:     snprintf(sql, n, view ? "DROP VIEW %s" : "DROP TABLE %s", qt); break;
+    }
+    free(qt);
+    free(qn);
+    j->kind = JOB_ALTER;
+    j->conn = app.conn;
+    j->sql = sql;
+    j->alter = kind;
+    j->table = strdup(table);
+    j->new_name = new_name ? strdup(new_name) : NULL;
+    j->is_view = view;
+    j->load_tables = app.tables_loaded; /* show the change in the sidebar */
+    j->hide_views = uiCheckboxChecked(app.hide_views);
+    set_status("Running %s...", sql);
+    start_job(j);
+}
+
+static unsigned on_table_menu_open(int row, void *data) {
+    (void)data;
+    int view = 0;
+    const char *name = table_at_row(row, &view);
+    free(app.menu_table);
+    app.menu_table = name ? strdup(name) : NULL;
+    app.menu_is_view = view;
+    if (!app.menu_table) return 0;
+    unsigned items = TABLE_MENU_BIT(TABLE_MENU_COPY_NAME);
+    if (app.conn && !app.busy) {
+        items |= TABLE_MENU_BIT(TABLE_MENU_RENAME) | TABLE_MENU_BIT(TABLE_MENU_DELETE) |
+                 TABLE_MENU_BIT(TABLE_MENU_EXPORT);
+        if (!view) items |= TABLE_MENU_BIT(TABLE_MENU_TRUNCATE); /* not for views */
+    }
+    return items;
+}
+
+static void export_table_flow(const char *table, int view);
+
+static void on_table_menu_action(table_menu_item item, int row, void *data) {
+    (void)row; (void)data;
+    if (!app.menu_table) return;
+    /* the name as it was when the menu opened, in case the list changed since */
+    char *name = strdup(app.menu_table);
+    int view = app.menu_is_view;
+    if (!name) return;
+    const char *what = view ? "view" : "table";
+    char title[600], msg[600];
+
+    switch (item) {
+    case TABLE_MENU_COPY_NAME:
+        sqlc_copy_to_clipboard(name);
+        set_status("Copied \"%s\" to the clipboard", name);
+        break;
+    case TABLE_MENU_RENAME: {
+        snprintf(title, sizeof title, "Rename %s `%s`", what, name);
+        char *new_name = sqlc_prompt(title, "New name:", name, "Rename");
+        if (new_name && new_name[0] && strcmp(new_name, name) != 0)
+            start_alter(ALTER_RENAME, name, view, new_name);
+        free(new_name);
+        break;
+    }
+    case TABLE_MENU_TRUNCATE:
+        if (view) break;
+        snprintf(title, sizeof title, "Truncate table `%s`?", name);
+        if (sqlc_confirm_danger(title, "All rows will be deleted. This cannot be undone.", "Truncate", 0))
+            start_alter(ALTER_TRUNCATE, name, view, NULL);
+        break;
+    case TABLE_MENU_DELETE:
+        snprintf(title, sizeof title, "Drop %s `%s`?", what, name);
+        snprintf(msg, sizeof msg, view ? "The view will be permanently deleted."
+                                       : "The table and all its data will be permanently deleted.");
+        if (sqlc_confirm_danger(title, msg, "Delete", 1))
+            start_alter(ALTER_DROP, name, view, NULL);
+        break;
+    case TABLE_MENU_EXPORT:
+        export_table_flow(name, view);
+        break;
+    default:
+        break;
+    }
+    free(name);
 }
 
 /* ---------- saved connections ---------- */
@@ -860,6 +1053,15 @@ static void autotest_print(const char *what) {
     fflush(stdout);
 }
 
+/* Visible sidebar row of a table, or -1. */
+static int autotest_row(const char *name) {
+    for (size_t r = 0; app.side_data.nsets && r < app.side_data.sets[0].nrows; r++) {
+        const char *t = table_at_row((int)r, NULL);
+        if (t && strcmp(t, name) == 0) return (int)r;
+    }
+    return -1;
+}
+
 static void autotest_next(void) {
     switch (autotest_step++) {
     case 0:
@@ -951,8 +1153,72 @@ static void autotest_next(void) {
         break;
     case 8:
         autotest_print("load tables");
+        /* context menu: work on a scratch table, with -A off so the list follows */
+        uiCheckboxSetChecked(app.no_rehash, 0);
+        run_sql("DROP TABLE IF EXISTS ctx_tmp; CREATE TABLE ctx_tmp (id INT); "
+                "INSERT INTO ctx_tmp VALUES (1), (2);");
+        break;
+    case 9: {
+        int row = autotest_row("ctx_tmp");
+        char menu[512];
+        sqlc_table_menu_describe(app.side_table, row, menu, sizeof menu);
+        printf("[menu] table: %s\n", menu);
+        printf("[menu] selected after right-click: %s\n", selected_table(NULL) ? selected_table(NULL) : "-");
+        sqlc_table_menu_describe(app.side_table, 999, menu, sizeof menu);
+        printf("[menu] empty space: [%s]\n", menu);
+        /* Copy table name (keeping the user's clipboard) */
+        char *saved = sqlc_clipboard_text();
+        sqlc_table_menu_describe(app.side_table, row, menu, sizeof menu);
+        on_table_menu_action(TABLE_MENU_COPY_NAME, row, NULL);
+        char *clip = sqlc_clipboard_text();
+        printf("[menu] clipboard: %s\n", clip ? clip : "-");
+        free(clip);
+        if (saved) sqlc_copy_to_clipboard(saved);
+        free(saved);
+        on_table_double_click(app.side_table, row, NULL); /* browse it */
+        break;
+    }
+    case 10:
+        autotest_print("browse ctx_tmp");
+        start_alter(ALTER_RENAME, "ctx_tmp", 0, "ctx `odd` name");
+        break;
+    case 11: {
+        autotest_print("rename");
+        char *ed = uiMultilineEntryText(app.editor);
+        printf("[rename] editor: %s, browsing: %s\n", ed, app.browsing ? app.browsing : "-");
+        uiFreeText(ed);
+        start_alter(ALTER_TRUNCATE, "ctx `odd` name", 0, NULL);
+        break;
+    }
+    case 12:
+        autotest_print("truncate");
+        run_sql("SELECT COUNT(*) FROM `ctx ``odd`` name`");
+        break;
+    case 13:
+        printf("[truncate] rows left: %s\n", db_cell(&app.shown.sets[0], 0, 0));
+        on_table_double_click(app.side_table, autotest_row("ctx `odd` name"), NULL);
+        break;
+    case 14:
+        start_alter(ALTER_DROP, "ctx `odd` name", 0, NULL);
+        break;
+    case 15:
+        autotest_print("drop");
+        printf("[drop] browsing: %s\n", app.browsing ? app.browsing : "-");
+        start_alter(ALTER_DROP, "ctx `odd` name", 0, NULL); /* again: server error */
+        break;
+    case 16:
+        autotest_print("drop again");
+        /* views: Truncate is disabled */
+        uiCheckboxSetChecked(app.hide_views, 0);
+        on_hide_views(app.hide_views, NULL);
+        break;
+    case 17: {
+        char menu[512];
+        sqlc_table_menu_describe(app.side_table, autotest_row("customer_totals"), menu, sizeof menu);
+        printf("[menu] view: %s\n", menu);
         if (on_should_quit(NULL)) uiQuit();
         break;
+    }
     }
 }
 
@@ -1113,6 +1379,8 @@ int main(void) {
         db_outcome_free(&app.side_data);
         db_outcome_free(&app.tables_raw);
         free(app.side_index);
+        free(app.menu_table);
+        free(app.browsing);
         profiles_free(&app.profiles);
         free(app.profiles_file);
         if (app.conn) mysql_close(app.conn);
