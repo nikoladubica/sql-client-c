@@ -17,6 +17,7 @@
  *   database=shop
  *   remember_password=1
  *   hide_views=0
+ *   no_auto_rehash=0
  *
  * Passwords are never written here; see keychain.h.
  */
@@ -29,6 +30,7 @@ typedef struct {
     char *database;
     int remember_password; /* password lives in the Keychain */
     int hide_views;
+    int no_auto_rehash;    /* like the CLI's -A: don't load the table list */
 } profile;
 
 typedef struct {

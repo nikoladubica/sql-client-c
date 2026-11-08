@@ -110,8 +110,9 @@ static struct {
     uiCheckbox *remember_pw;
     profile_list profiles;
     char *profiles_file;
-    uiButton *connect_btn, *run_btn;
-    uiCheckbox *hide_views;
+    uiButton *connect_btn, *run_btn, *load_tables_btn;
+    uiCheckbox *hide_views;     /* views left out of the sidebar and SHOW TABLES */
+    uiCheckbox *no_rehash;      /* -A: only load the table list on request */
     uiMultilineEntry *editor;
     uiLabel *status;
 
@@ -130,6 +131,7 @@ static struct {
     db_outcome side_data;    /* the visible list (1 column) */
     db_outcome tables_raw;   /* TABLE_NAME, TABLE_TYPE from the server */
     size_t *side_index;      /* visible row -> row in tables_raw */
+    int tables_loaded;       /* tables_raw holds this connection's list */
 
     MYSQL *conn;
     int busy;
@@ -150,9 +152,11 @@ static void set_busy(int busy) {
     if (busy) {
         uiControlDisable(uiControl(app.connect_btn));
         uiControlDisable(uiControl(app.run_btn));
+        uiControlDisable(uiControl(app.load_tables_btn));
     } else {
         uiControlEnable(uiControl(app.connect_btn));
         uiControlEnable(uiControl(app.run_btn));
+        uiControlEnable(uiControl(app.load_tables_btn));
     }
 }
 
@@ -282,7 +286,7 @@ static void rebuild_sidebar(void) {
 
 /* ---------- worker thread ---------- */
 
-typedef enum { JOB_CONNECT, JOB_QUERY } job_kind;
+typedef enum { JOB_CONNECT, JOB_QUERY, JOB_TABLES } job_kind;
 
 typedef struct {
     job_kind kind;
@@ -292,12 +296,14 @@ typedef struct {
     char *sql;
     db_exec_opts eo;
     char *profile;            /* saved connection used to connect, if any */
+    int load_tables;          /* refresh the table list afterwards */
+    int hide_views;           /* ... leaving views out of it */
 
     /* results, filled by the worker */
     int ok;
     char *error;              /* connect error */
     db_outcome out;           /* query results */
-    db_outcome tables;        /* refreshed table list */
+    db_outcome tables;        /* refreshed table list (if load_tables) */
     char *current_db;
     double seconds;
 } job;
@@ -318,13 +324,18 @@ static double now_seconds(void) {
     return (double)ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-/* Table list + current database; runs on the worker thread. */
+/* Table list (if asked for) + current database; runs on the worker thread. */
 static void load_tables(job *j) {
     db_exec_opts eo = { 0 };
-    db_execute(j->conn,
-               "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
-               "WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME",
-               &eo, &j->tables);
+    if (j->load_tables)
+        db_execute(j->conn,
+                   j->hide_views
+                   ? "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
+                     "WHERE TABLE_SCHEMA = DATABASE() "
+                     "AND TABLE_TYPE NOT IN ('VIEW', 'SYSTEM VIEW') ORDER BY TABLE_NAME"
+                   : "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
+                     "WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME",
+                   &eo, &j->tables);
     db_outcome cur;
     if (db_execute(j->conn, "SELECT DATABASE()", &eo, &cur) == 0 && cur.nsets &&
         cur.sets[0].nrows && db_cell(&cur.sets[0], 0, 0))
@@ -359,8 +370,10 @@ static void *worker(void *data) {
                 j->conn = NULL;
             }
         }
-    } else {
+    } else if (j->kind == JOB_QUERY) {
         j->ok = db_execute(j->conn, j->sql, &j->eo, &j->out) == 0;
+    } else {
+        j->ok = 1; /* JOB_TABLES: just the refresh below */
     }
     j->seconds = now_seconds() - t0;
 
@@ -396,10 +409,22 @@ static void job_done(void *data) {
         if (app.conn) mysql_close(app.conn);
         app.conn = j->conn;
         remember_last_profile(j->profile);
-        set_status("Connected to %s (server %s)%s%s",
+        set_status("Connected to %s (server %s)%s%s%s",
                    mysql_get_host_info(app.conn), mysql_get_server_info(app.conn),
                    j->current_db ? " - database: " : "",
-                   j->current_db ? j->current_db : "");
+                   j->current_db ? j->current_db : "",
+                   j->load_tables ? "" : " - table list not loaded (-A)");
+        /* The old connection's list is stale whether or not we reload it. */
+        db_outcome_free(&app.tables_raw);
+        app.tables_loaded = 0;
+    } else if (j->kind == JOB_TABLES) {
+        const db_set *t = j->tables.nsets ? &j->tables.sets[0] : NULL;
+        if (j->tables.error)
+            set_status("Could not load tables: %s", j->tables.error);
+        else
+            set_status("%zu table%s%s%s", t ? t->nrows : 0, t && t->nrows == 1 ? "" : "s",
+                       j->current_db ? " in " : " (no database selected)",
+                       j->current_db ? j->current_db : "");
     } else {
         size_t rows = 0;
         int truncated = 0;
@@ -424,9 +449,13 @@ static void job_done(void *data) {
     }
 
     /* Refresh the sidebar (the database may have changed via USE). */
-    db_outcome_free(&app.tables_raw);
-    app.tables_raw = j->tables;
-    memset(&j->tables, 0, sizeof j->tables);
+    if (j->load_tables) {
+        db_outcome_free(&app.tables_raw);
+        app.tables_raw = j->tables;
+        memset(&j->tables, 0, sizeof j->tables);
+        app.tables_loaded = 1;
+    }
+    uiButtonSetText(app.load_tables_btn, app.tables_loaded ? "Refresh tables" : "Load tables");
     rebuild_sidebar();
 
     job_free(j);
@@ -462,6 +491,8 @@ static void on_connect(uiButton *b, void *data) {
     int sel = uiComboboxSelected(app.profile_box);
     if (sel > 0 && (size_t)sel <= app.profiles.n)
         j->profile = strdup(app.profiles.items[sel - 1].name);
+    j->load_tables = !uiCheckboxChecked(app.no_rehash);
+    j->hide_views = uiCheckboxChecked(app.hide_views);
     set_status("Connecting to %s...", j->host);
     start_job(j);
 }
@@ -481,6 +512,9 @@ static void run_sql(const char *sql) {
     j->sql = strdup(sql);
     j->eo.hide_views = uiCheckboxChecked(app.hide_views);
     j->eo.max_rows = GUI_MAX_ROWS;
+    /* With -A the list is only refreshed when asked (Load/Refresh tables). */
+    j->load_tables = !uiCheckboxChecked(app.no_rehash);
+    j->hide_views = j->eo.hide_views;
     set_status("Running...");
     start_job(j);
 }
@@ -496,9 +530,30 @@ static void on_run(uiButton *b, void *data) {
     on_run_menu();
 }
 
+static void load_tables_now(void) {
+    if (app.busy) return;
+    if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return; }
+    job *j = calloc(1, sizeof *j);
+    if (!j) return;
+    j->kind = JOB_TABLES;
+    j->conn = app.conn;
+    j->load_tables = 1;
+    j->hide_views = uiCheckboxChecked(app.hide_views);
+    set_status("Loading tables...");
+    start_job(j);
+}
+
+static void on_load_tables(uiButton *b, void *data) {
+    (void)b; (void)data;
+    load_tables_now();
+}
+
 static void on_hide_views(uiCheckbox *c, void *data) {
     (void)c; (void)data;
+    /* Views are filtered on the server, so turning this off needs a reload
+     * to bring them back. Filter what we have meanwhile (or if busy). */
     rebuild_sidebar();
+    if (app.tables_loaded) load_tables_now();
 }
 
 /* Double-click a table: SELECT * FROM it. */
@@ -563,6 +618,7 @@ static void apply_selected_profile(void) {
     uiEntrySetText(app.db, p->database);
     uiCheckboxSetChecked(app.remember_pw, p->remember_password);
     uiCheckboxSetChecked(app.hide_views, p->hide_views);
+    uiCheckboxSetChecked(app.no_rehash, p->no_auto_rehash);
     rebuild_sidebar();
 
     char *pw = p->remember_password ? keychain_get(p->name) : NULL;
@@ -608,6 +664,7 @@ static void on_save_profile(uiButton *b, void *data) {
         .database = entry_dup(app.db),
         .remember_password = uiCheckboxChecked(app.remember_pw),
         .hide_views = uiCheckboxChecked(app.hide_views),
+        .no_auto_rehash = uiCheckboxChecked(app.no_rehash),
     };
     int existed = profiles_find(&app.profiles, name) != NULL;
 
@@ -696,6 +753,9 @@ static void autotest_print(const char *what) {
     printf("[%s] sidebar:", what);
     for (size_t r = 0; s && r < s->nrows; r++) printf(" [%s]", db_cell(s, r, 0));
     printf("\n");
+    printf("[%s] table list loaded: %s, rows from server: %zu\n", what,
+           app.tables_loaded ? "yes" : "no",
+           app.tables_raw.nsets ? app.tables_raw.sets[0].nrows : 0);
     fflush(stdout);
 }
 
@@ -710,34 +770,39 @@ static void autotest_next(void) {
     case 1:
         autotest_print("multi");
         uiCheckboxSetChecked(app.hide_views, 1);
-        on_hide_views(app.hide_views, NULL);
+        on_hide_views(app.hide_views, NULL); /* reloads without views */
+        break;
+    case 2:
         autotest_print("hide views");
         on_table_double_click(app.side_table, 0, NULL);
         break;
-    case 2:
+    case 3:
         autotest_print("double-click");
         uiMultilineEntrySetText(app.editor, "SHOW TABLES;");
         on_run_menu();
         break;
-    case 3:
+    case 4:
         autotest_print("show tables, views hidden");
         uiMultilineEntrySetText(app.editor, "SELECT seq FROM seq_1_to_20000;");
         on_run_menu();
         break;
-    case 4:
+    case 5:
         autotest_print("20000 rows");
         printf("[20000 rows] grid rows kept: %zu, truncated: %d\n",
                app.shown.sets[0].nrows, app.shown.sets[0].truncated);
         /* save the current connection as a profile, then read the file back */
         uiEntrySetText(app.profile_name, "autotest");
         uiCheckboxSetChecked(app.remember_pw, 0);
+        uiCheckboxSetChecked(app.no_rehash, 1);
         on_save_profile(NULL, NULL);
         {
             profile_list back;
             int rc = profiles_load(app.profiles_file, &back);
             profile *p = rc == 0 ? profiles_find(&back, "autotest") : NULL;
-            printf("[profiles] saved: %s, db: %s, last: %s, dropdown items: %d\n",
-                   p ? "yes" : "no", p ? p->database : "-",
+            printf("[profiles] saved: %s, db: %s, hide_views: %d, no_auto_rehash: %d, "
+                   "last: %s, dropdown items: %d\n",
+                   p ? "yes" : "no", p ? p->database : "-", p ? p->hide_views : -1,
+                   p ? p->no_auto_rehash : -1,
                    back.last ? back.last : "-", uiComboboxNumItems(app.profile_box));
             profiles_free(&back);
         }
@@ -754,6 +819,15 @@ static void autotest_next(void) {
         sqlc_split_set_sidebar_width(app.split, 5000);
         printf("[sidebar] width 5000 -> %d (window leaves room for the editor)\n",
                sqlc_split_sidebar_width(app.split));
+        /* reconnect with -A (still checked): no table list until asked */
+        on_connect(app.connect_btn, NULL);
+        break;
+    case 6:
+        autotest_print("connect -A");
+        load_tables_now();
+        break;
+    case 7:
+        autotest_print("load tables");
         if (on_should_quit(NULL)) uiQuit();
         break;
     }
@@ -832,12 +906,18 @@ static void build_window(void) {
     if (login) uiEntrySetText(app.user, login);
     app.connect_btn = uiNewButton("Connect");
     uiButtonOnClicked(app.connect_btn, on_connect, NULL);
+    /* connection options, settable before connecting (saved with profiles) */
+    app.hide_views = uiNewCheckbox("Hide views");
+    uiCheckboxOnToggled(app.hide_views, on_hide_views, NULL);
+    app.no_rehash = uiNewCheckbox("No auto-rehash (-A)");
 
     uiBoxAppend(bar, uiControl(labeled("Host", uiControl(app.host))), 1);
     uiBoxAppend(bar, uiControl(labeled("Port", uiControl(app.port))), 0);
     uiBoxAppend(bar, uiControl(labeled("User", uiControl(app.user))), 1);
     uiBoxAppend(bar, uiControl(labeled("Password", uiControl(app.pass))), 1);
     uiBoxAppend(bar, uiControl(labeled("Database", uiControl(app.db))), 1);
+    uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.hide_views))), 0);
+    uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.no_rehash))), 0);
     uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.connect_btn))), 0);
     uiBoxAppend(root, uiControl(bar), 0);
     uiBoxAppend(root, uiControl(uiNewHorizontalSeparator()), 0);
@@ -845,9 +925,9 @@ static void build_window(void) {
     /* main area: sidebar | editor + results, with a draggable divider */
     app.side_box = uiNewVerticalBox();
     uiBoxSetPadded(app.side_box, 1);
-    app.hide_views = uiNewCheckbox("Hide views");
-    uiCheckboxOnToggled(app.hide_views, on_hide_views, NULL);
-    uiBoxAppend(app.side_box, uiControl(app.hide_views), 0);
+    app.load_tables_btn = uiNewButton("Load tables");
+    uiButtonOnClicked(app.load_tables_btn, on_load_tables, NULL);
+    uiBoxAppend(app.side_box, uiControl(app.load_tables_btn), 0);
 
     uiBox *right = uiNewVerticalBox();
     uiBoxSetPadded(right, 1);

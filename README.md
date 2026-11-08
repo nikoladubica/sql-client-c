@@ -10,12 +10,14 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
 
 ### GUI (`sqlc-gui`)
 
-- Connection bar (host, port, user, password, database)
+- Connection bar (host, port, user, password, database) with options you can
+  set before connecting: **Hide views** and **No auto-rehash (-A)**
 - **Saved connections**: save the connection fields under a name and pick it
   from a dropdown next time (passwords go in the macOS Keychain)
 - SQL editor with **Run** (button or ⌘↩); several statements at once
 - Results grid, with one tab per result set, plus "Query OK" and error pages
-- Sidebar listing the tables in the current database, with a **Hide views** checkbox; drag its right edge to resize it (the width is remembered)
+- Sidebar listing the tables in the current database, with a **Load tables** /
+  **Refresh tables** button; drag its right edge to resize it (the width is remembered)
 - Double-click a table to browse it (`SELECT * ... LIMIT 1000`)
 - Queries run on a background thread, so the window never freezes
 - Shows the first 10,000 rows per result set
@@ -63,6 +65,14 @@ If you cloned without `--recursive`, the Makefile fetches the submodule for you
 ```
 
 Fill in the connection fields, press **Connect**, type SQL and press **Run** (⌘↩).
+
+Connection options (both are saved with a connection):
+
+- **Hide views**: views are left out of the sidebar (they're filtered in the
+  query to the server) and out of `SHOW TABLES` results, like the CLI's `--no-views`.
+- **No auto-rehash (-A)**: like the CLI's `-A`, the table list isn't loaded
+  on connect or after each query, which speeds up connecting to large schemas.
+  Press **Load tables** in the sidebar to load it when you need it.
 
 To keep a connection, type a **Name** and press **Save**. Saved connections
 appear in the **Saved connections** dropdown; choosing one fills in the fields,
