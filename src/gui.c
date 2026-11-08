@@ -30,6 +30,9 @@
 #include "keychain.h"
 #include "macos_menu.h"
 #include "splitview.h"
+#include "export.h"
+#include "export_db.h"
+#include "export_dialog.h"
 #include "profiles.h"
 
 #define GUI_MAX_ROWS 10000 /* rows kept per result set in the grid */
@@ -110,7 +113,7 @@ static struct {
     uiCheckbox *remember_pw;
     profile_list profiles;
     char *profiles_file;
-    uiButton *connect_btn, *run_btn, *load_tables_btn;
+    uiButton *connect_btn, *run_btn, *load_tables_btn, *export_btn;
     uiCheckbox *hide_views;     /* views left out of the sidebar and SHOW TABLES */
     uiCheckbox *no_rehash;      /* -A: only load the table list on request */
     uiMultilineEntry *editor;
@@ -153,10 +156,12 @@ static void set_busy(int busy) {
         uiControlDisable(uiControl(app.connect_btn));
         uiControlDisable(uiControl(app.run_btn));
         uiControlDisable(uiControl(app.load_tables_btn));
+        uiControlDisable(uiControl(app.export_btn));
     } else {
         uiControlEnable(uiControl(app.connect_btn));
         uiControlEnable(uiControl(app.run_btn));
         uiControlEnable(uiControl(app.load_tables_btn));
+        uiControlEnable(uiControl(app.export_btn));
     }
 }
 
@@ -286,7 +291,7 @@ static void rebuild_sidebar(void) {
 
 /* ---------- worker thread ---------- */
 
-typedef enum { JOB_CONNECT, JOB_QUERY, JOB_TABLES } job_kind;
+typedef enum { JOB_CONNECT, JOB_QUERY, JOB_TABLES, JOB_EXPORT } job_kind;
 
 typedef struct {
     job_kind kind;
@@ -298,6 +303,12 @@ typedef struct {
     char *profile;            /* saved connection used to connect, if any */
     int load_tables;          /* refresh the table list afterwards */
     int hide_views;           /* ... leaving views out of it */
+    /* JOB_EXPORT */
+    char *table, *path;
+    int is_view;
+    export_format fmt;
+    export_opts xopts;
+    unsigned long long rows;
 
     /* results, filled by the worker */
     int ok;
@@ -313,6 +324,8 @@ static void job_free(job *j) {
     if (j->pass) { memset(j->pass, 0, strlen(j->pass)); free(j->pass); }
     free(j->current_db);
     free(j->profile);
+    free(j->table);
+    free(j->path);
     db_outcome_free(&j->out);
     db_outcome_free(&j->tables);
     free(j);
@@ -350,6 +363,21 @@ static void autotest_next(void);
 static int on_should_quit(void *data);
 #endif
 
+/* Export progress: called on the worker thread, shown on the UI thread. */
+static void show_export_progress(void *data) {
+    unsigned long long *rows = data;
+    if (app.busy) set_status("Exporting... %llu rows", *rows);
+    free(rows);
+}
+
+static void export_progress(unsigned long long rows, void *data) {
+    (void)data;
+    unsigned long long *r = malloc(sizeof *r);
+    if (!r) return;
+    *r = rows;
+    uiQueueMain(show_export_progress, r);
+}
+
 static void *worker(void *data) {
     job *j = data;
     double t0 = now_seconds();
@@ -372,6 +400,9 @@ static void *worker(void *data) {
         }
     } else if (j->kind == JOB_QUERY) {
         j->ok = db_execute(j->conn, j->sql, &j->eo, &j->out) == 0;
+    } else if (j->kind == JOB_EXPORT) {
+        j->ok = export_table(j->conn, j->table, j->is_view, j->fmt, &j->xopts, j->path,
+                             export_progress, NULL, &j->rows, &j->error) == 0;
     } else {
         j->ok = 1; /* JOB_TABLES: just the refresh below */
     }
@@ -417,6 +448,14 @@ static void job_done(void *data) {
         /* The old connection's list is stale whether or not we reload it. */
         db_outcome_free(&app.tables_raw);
         app.tables_loaded = 0;
+    } else if (j->kind == JOB_EXPORT) {
+        if (j->ok) {
+            set_status("Exported %llu row%s of %s to %s (%.2f s)", j->rows, j->rows == 1 ? "" : "s",
+                       j->table, j->path, j->seconds);
+        } else {
+            set_status("Export failed: %s", j->error ? j->error : "unknown error");
+            uiMsgBoxError(app.win, "Export failed", j->error ? j->error : "");
+        }
     } else if (j->kind == JOB_TABLES) {
         const db_set *t = j->tables.nsets ? &j->tables.sets[0] : NULL;
         if (j->tables.error)
@@ -456,7 +495,8 @@ static void job_done(void *data) {
         app.tables_loaded = 1;
     }
     uiButtonSetText(app.load_tables_btn, app.tables_loaded ? "Refresh tables" : "Load tables");
-    rebuild_sidebar();
+    /* Only when the list changed, so the selection survives e.g. an export. */
+    if (j->kind == JOB_CONNECT || j->load_tables) rebuild_sidebar();
 
     job_free(j);
 #ifdef SQLC_AUTOTEST
@@ -546,6 +586,67 @@ static void load_tables_now(void) {
 static void on_load_tables(uiButton *b, void *data) {
     (void)b; (void)data;
     load_tables_now();
+}
+
+/* Export a table on the worker thread (reusable from other entry points). */
+static void start_export(const char *table, int is_view, export_format fmt,
+                         const export_opts *opts, const char *path) {
+    if (app.busy || !app.conn) return;
+    job *j = calloc(1, sizeof *j);
+    if (!j) return;
+    j->kind = JOB_EXPORT;
+    j->conn = app.conn;
+    j->table = strdup(table);
+    j->path = strdup(path);
+    j->is_view = is_view;
+    j->fmt = fmt;
+    j->xopts = *opts;
+    if (!j->table || !j->path) { job_free(j); return; }
+    set_status("Exporting %s...", table);
+    start_job(j);
+}
+
+/* The table selected in the sidebar, or NULL (pointer into tables_raw). */
+static const char *selected_table(int *is_view_out) {
+    if (!app.side_table || !app.side_data.nsets) return NULL;
+    uiTableSelection *sel = uiTableGetSelection(app.side_table);
+    int row = sel && sel->NumRows > 0 ? sel->Rows[0] : -1;
+    uiFreeTableSelection(sel);
+    if (row < 0 || (size_t)row >= app.side_data.sets[0].nrows) return NULL;
+    size_t r = app.side_index[row];
+    if (is_view_out) *is_view_out = is_view(db_cell(&app.tables_raw.sets[0], r, 1));
+    return db_cell(&app.tables_raw.sets[0], r, 0);
+}
+
+static void export_selected_table(void) {
+    if (app.busy) return;
+    if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return; }
+    int view = 0;
+    const char *name = selected_table(&view);
+    if (!name) {
+        uiMsgBoxError(app.win, "Export",
+                      app.tables_loaded ? "Select a table in the sidebar first."
+                                        : "Load the table list and select a table first.");
+        return;
+    }
+    char *table = strdup(name); /* the dialog runs a modal loop; keep our own copy */
+    if (!table) return;
+    export_format fmt;
+    export_opts opts;
+    char *path = NULL;
+    if (sqlc_export_dialog(table, view, &fmt, &opts, &path)) start_export(table, view, fmt, &opts, path);
+    free(path);
+    free(table);
+}
+
+static void on_export(uiButton *b, void *data) {
+    (void)b; (void)data;
+    export_selected_table();
+}
+
+static void on_export_menu(uiMenuItem *m, uiWindow *w, void *data) {
+    (void)m; (void)w; (void)data;
+    export_selected_table();
 }
 
 static void on_hide_views(uiCheckbox *c, void *data) {
@@ -819,14 +920,36 @@ static void autotest_next(void) {
         sqlc_split_set_sidebar_width(app.split, 5000);
         printf("[sidebar] width 5000 -> %d (window leaves room for the editor)\n",
                sqlc_split_sidebar_width(app.split));
+        /* export the selected sidebar table (the dialog is skipped) */
+        {
+            int r0 = 0;
+            uiTableSelection sel = { .NumRows = 1, .Rows = &r0 };
+            uiTableSetSelection(app.side_table, &sel);
+            int view = -1;
+            const char *t = selected_table(&view);
+            printf("[export] selected: %s (view: %d)\n", t ? t : "-", view);
+            export_opts o = export_default_opts();
+            if (t) start_export(t, view, EXPORT_CSV, &o, "build/autotest-export.csv");
+        }
+        break;
+    case 6:
+        autotest_print("export");
+        {
+            FILE *f = fopen("build/autotest-export.csv", "r");
+            int lines = 0;
+            for (int c; f && (c = getc(f)) != EOF;) lines += c == '\n';
+            if (f) fclose(f);
+            printf("[export] file lines: %d\n", lines);
+            remove("build/autotest-export.csv");
+        }
         /* reconnect with -A (still checked): no table list until asked */
         on_connect(app.connect_btn, NULL);
         break;
-    case 6:
+    case 7:
         autotest_print("connect -A");
         load_tables_now();
         break;
-    case 7:
+    case 8:
         autotest_print("load tables");
         if (on_should_quit(NULL)) uiQuit();
         break;
@@ -864,6 +987,8 @@ static uiBox *labeled(const char *label, uiControl *c) {
 
 static void build_window(void) {
     uiMenu *file = uiNewMenu("File");
+    uiMenuItemOnClicked(uiMenuAppendItem(file, "Export Table\xE2\x80\xA6"), on_export_menu, NULL);
+    uiMenuAppendSeparator(file);
     uiMenuAppendQuitItem(file);
     uiOnShouldQuit(on_should_quit, NULL);
 
@@ -928,6 +1053,9 @@ static void build_window(void) {
     app.load_tables_btn = uiNewButton("Load tables");
     uiButtonOnClicked(app.load_tables_btn, on_load_tables, NULL);
     uiBoxAppend(app.side_box, uiControl(app.load_tables_btn), 0);
+    app.export_btn = uiNewButton("Export\xE2\x80\xA6");
+    uiButtonOnClicked(app.export_btn, on_export, NULL);
+    uiBoxAppend(app.side_box, uiControl(app.export_btn), 0);
 
     uiBox *right = uiNewVerticalBox();
     uiBoxSetPadded(right, 1);

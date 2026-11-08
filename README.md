@@ -19,6 +19,8 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
 - Sidebar listing the tables in the current database, with a **Load tables** /
   **Refresh tables** button; drag its right edge to resize it (the width is remembered)
 - Double-click a table to browse it (`SELECT * ... LIMIT 1000`)
+- **Export** a table as SQL, CSV or XML (select it, then **Export…** in the
+  sidebar or **File › Export Table…**)
 - Queries run on a background thread, so the window never freezes
 - Shows the first 10,000 rows per result set
 
@@ -86,6 +88,23 @@ Connections are stored in `~/Library/Application Support/sqlc/connections`
 ask whether `sqlc-gui` may use it (and again after a rebuild, since the binary
 changes).
 
+### Export
+
+Select a table in the sidebar and press **Export…** (or **File › Export Table…**),
+pick a format and options, then where to save (defaults to `<table>.<ext>`).
+Rows are streamed to the file on a background thread, so big tables don't
+freeze the window; the file only appears once the export has finished.
+
+- **SQL**: `DROP TABLE IF EXISTS` + `SHOW CREATE TABLE`, then multi-row `INSERT`s
+  (structure only, data only, or both). Binary columns are written as hex,
+  `NULL` as `NULL`, and generated columns are left out. Import it with
+  `mysql db < table.sql`. A view exports as its `CREATE VIEW`.
+- **CSV**: RFC 4180 (comma separated, CRLF, fields with `,` `"` or line breaks
+  quoted), header row, UTF-8 with a BOM so Excel detects it (optional).
+  `NULL` is an empty field (or `\N`), an empty string is `""`; binary as `0x…` hex.
+- **XML**: UTF-8, `<table name="…"><row><field name="…">…</field></row></table>`;
+  `NULL` is `<field name="…" xsi:nil="true"/>`, binary is `encoding="hex"`.
+
 ## CLI usage
 
 ```sh
@@ -136,14 +155,24 @@ changes).
 | `src/gui.c` | GUI (libui-ng) |
 | `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), which libui-ng lacks |
 | `src/splitview.m` | Resizable sidebar: an `NSSplitView` wrapped as a libui control |
+| `src/export.c` | Streaming SQL / CSV / XML writers (no database code) |
+| `src/export_db.c` | Export a table from a connection through those writers |
+| `src/export_dialog.m` | Native export options dialog and save panel |
 | `third_party/libui-ng` | libui-ng submodule |
 
 ## Development
 
-`make test` runs the unit tests for the saved-connections file (no database needed).
+`make test` runs the unit tests for the saved-connections file and the export
+writers' escaping/quoting (no database needed).
+
+`make export-test` exports an edge-case table in every format and checks the
+result: the SQL is re-imported into an empty database and compared with
+`CHECKSUM TABLE`, the XML is checked with `xmllint`, and the CSV is parsed back
+with Python. It creates and drops `test_sqlc_export_src` and `test_sqlc_export_dst`.
 
 `make gui-test` builds the GUI with sanitizers and runs a scripted smoke test
-(connect, multi-statement results, views filter, double-click, row cap). It
+(connect, multi-statement results, views filter, double-click, row cap,
+export, `-A`). It
 expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
 `customers` and `orders` plus a view.
 
