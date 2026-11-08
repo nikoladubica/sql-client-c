@@ -29,6 +29,7 @@
 #include "db.h"
 #include "keychain.h"
 #include "macos_menu.h"
+#include "splitview.h"
 #include "profiles.h"
 
 #define GUI_MAX_ROWS 10000 /* rows kept per result set in the grid */
@@ -122,6 +123,7 @@ static struct {
     db_outcome shown; /* data behind the result grids */
 
     /* sidebar: list of tables in the current database */
+    uiControl *split;        /* sidebar | editor + results */
     uiBox *side_box;
     uiTable *side_table;
     set_model *side_model;
@@ -273,7 +275,7 @@ static void rebuild_sidebar(void) {
 
     app.side_model = new_set_model(s);
     app.side_table = new_grid(app.side_model);
-    uiTableColumnSetWidth(app.side_table, 0, 200);
+    sqlc_table_fill_width(app.side_table); /* column follows the sidebar width */
     uiTableOnRowDoubleClicked(app.side_table, on_table_double_click, NULL);
     uiBoxAppend(app.side_box, uiControl(app.side_table), 1);
 }
@@ -742,6 +744,16 @@ static void autotest_next(void) {
         on_delete_profile(NULL, NULL);
         printf("[profiles] after delete: %zu saved, dropdown items: %d\n",
                app.profiles.n, uiComboboxNumItems(app.profile_box));
+        /* sidebar divider: min width, and the table column follows it */
+        sqlc_split_set_sidebar_width(app.split, 400);
+        printf("[sidebar] width 400 -> %d, column %d\n",
+               sqlc_split_sidebar_width(app.split), uiTableColumnWidth(app.side_table, 0));
+        sqlc_split_set_sidebar_width(app.split, 50);
+        printf("[sidebar] width 50 -> %d (min 120), column %d\n",
+               sqlc_split_sidebar_width(app.split), uiTableColumnWidth(app.side_table, 0));
+        sqlc_split_set_sidebar_width(app.split, 5000);
+        printf("[sidebar] width 5000 -> %d (window leaves room for the editor)\n",
+               sqlc_split_sidebar_width(app.split));
         if (on_should_quit(NULL)) uiQuit();
         break;
     }
@@ -830,21 +842,19 @@ static void build_window(void) {
     uiBoxAppend(root, uiControl(bar), 0);
     uiBoxAppend(root, uiControl(uiNewHorizontalSeparator()), 0);
 
-    /* main area: sidebar | editor + results */
-    uiBox *main_area = uiNewHorizontalBox();
-    uiBoxSetPadded(main_area, 1);
-    uiBoxAppend(root, uiControl(main_area), 1);
-
+    /* main area: sidebar | editor + results, with a draggable divider */
     app.side_box = uiNewVerticalBox();
     uiBoxSetPadded(app.side_box, 1);
     app.hide_views = uiNewCheckbox("Hide views");
     uiCheckboxOnToggled(app.hide_views, on_hide_views, NULL);
     uiBoxAppend(app.side_box, uiControl(app.hide_views), 0);
-    uiBoxAppend(main_area, uiControl(app.side_box), 0);
 
     uiBox *right = uiNewVerticalBox();
     uiBoxSetPadded(right, 1);
-    uiBoxAppend(main_area, uiControl(right), 1);
+
+    app.split = sqlc_new_sidebar_split(uiControl(app.side_box), uiControl(right),
+                                       220, 120, "SidebarWidth");
+    uiBoxAppend(root, app.split, 1);
 
     app.editor = uiNewNonWrappingMultilineEntry();
     uiMultilineEntrySetText(app.editor, "SHOW TABLES;");

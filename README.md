@@ -15,7 +15,7 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
   from a dropdown next time (passwords go in the macOS Keychain)
 - SQL editor with **Run** (button or ⌘↩); several statements at once
 - Results grid, with one tab per result set, plus "Query OK" and error pages
-- Sidebar listing the tables in the current database, with a **Hide views** checkbox
+- Sidebar listing the tables in the current database, with a **Hide views** checkbox; drag its right edge to resize it (the width is remembered)
 - Double-click a table to browse it (`SELECT * ... LIMIT 1000`)
 - Queries run on a background thread, so the window never freezes
 - Shows the first 10,000 rows per result set
@@ -125,6 +125,7 @@ changes).
 | `src/main.c`, `src/complete.c` | CLI and its tab completion |
 | `src/gui.c` | GUI (libui-ng) |
 | `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), which libui-ng lacks |
+| `src/splitview.m` | Resizable sidebar: an `NSSplitView` wrapped as a libui control |
 | `third_party/libui-ng` | libui-ng submodule |
 
 ## Development
