@@ -66,3 +66,14 @@ void sqlc_install_menus(void (*on_run)(void)) {
     [qholder release];
     [query release];
 }
+
+int sqlc_confirm(const char *title, const char *message, const char *ok_label) {
+    NSAlert *alert = [[NSAlert alloc] init];
+    [alert setMessageText:[NSString stringWithUTF8String:title]];
+    [alert setInformativeText:[NSString stringWithUTF8String:message]];
+    [alert addButtonWithTitle:[NSString stringWithUTF8String:ok_label]];
+    [alert addButtonWithTitle:@"Cancel"];
+    int ok = [alert runModal] == NSAlertFirstButtonReturn;
+    [alert release];
+    return ok;
+}

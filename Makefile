@@ -37,9 +37,9 @@ $(LIBUI_LIB): $(LIBUI_OBJ)
 
 # ---- GUI: sqlc-gui ----
 GUI_BIN := sqlc-gui
-GUI_SRC := src/gui.c src/db.c src/macos_menu.m
-GUI_HDR := src/db.h src/macos_menu.h
-GUI_LIBS := $(LIBUI_LIB) -framework Foundation -framework AppKit -lobjc
+GUI_SRC := src/gui.c src/db.c src/profiles.c src/keychain.c src/macos_menu.m
+GUI_HDR := src/db.h src/profiles.h src/keychain.h src/macos_menu.h
+GUI_LIBS := $(LIBUI_LIB) -framework Foundation -framework AppKit -framework Security -lobjc
 
 gui: $(GUI_BIN)
 
@@ -52,7 +52,15 @@ $(GUI_BIN): $(GUI_SRC) $(GUI_HDR) $(LIBUI_LIB)
 gui-test: $(GUI_SRC) $(GUI_HDR) $(LIBUI_LIB)
 	$(CC) $(CPPFLAGS) -I$(LIBUI_DIR) -std=c11 -Wall -Wextra -g -O0 -fsanitize=address,undefined \
 		-DSQLC_AUTOTEST -o $(BUILD)/sqlc-gui-test $(GUI_SRC) $(GUI_LIBS) $(LDLIBS)
-	SQLC_TEST_DB=$${SQLC_TEST_DB:-test_sqlc_demo} $(BUILD)/sqlc-gui-test
+	SQLC_CONFIG_DIR=$(BUILD)/test-config SQLC_TEST_DB=$${SQLC_TEST_DB:-test_sqlc_demo} \
+		$(BUILD)/sqlc-gui-test
+
+# Unit test for the saved-connections file format (no database needed).
+test: tests/profiles_test.c src/profiles.c src/profiles.h
+	@mkdir -p $(BUILD)
+	$(CC) -std=c11 -Wall -Wextra -g -O0 -D_DARWIN_C_SOURCE -fsanitize=address,undefined -Isrc \
+		-o $(BUILD)/profiles_test tests/profiles_test.c src/profiles.c
+	$(BUILD)/profiles_test $(BUILD)/test-profiles
 
 debug: CFLAGS = -std=c11 -Wall -Wextra -g -O0 -fsanitize=address,undefined
 debug: LDFLAGS += -fsanitize=address,undefined
@@ -68,4 +76,4 @@ clean:
 distclean: clean
 	rm -rf $(BUILD)
 
-.PHONY: all gui gui-test clean distclean debug compile_flags.txt
+.PHONY: all gui gui-test test clean distclean debug compile_flags.txt

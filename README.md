@@ -11,6 +11,8 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
 ### GUI (`sqlc-gui`)
 
 - Connection bar (host, port, user, password, database)
+- **Saved connections**: save the connection fields under a name and pick it
+  from a dropdown next time (passwords go in the macOS Keychain)
 - SQL editor with **Run** (button or ⌘↩); several statements at once
 - Results grid, with one tab per result set, plus "Query OK" and error pages
 - Sidebar listing the tables in the current database, with a **Hide views** checkbox
@@ -61,6 +63,18 @@ If you cloned without `--recursive`, the Makefile fetches the submodule for you
 ```
 
 Fill in the connection fields, press **Connect**, type SQL and press **Run** (⌘↩).
+
+To keep a connection, type a **Name** and press **Save**. Saved connections
+appear in the **Saved connections** dropdown; choosing one fills in the fields,
+and the last one you connected with is preselected on launch. **Delete** removes
+the selected one.
+
+Connections are stored in `~/Library/Application Support/sqlc/connections`
+(mode `0600`; override the folder with `SQLC_CONFIG_DIR`). With
+**Remember password** ticked, the password is stored in your login Keychain
+(service `sqlc`), never in that file. The first time an item is read, macOS may
+ask whether `sqlc-gui` may use it (and again after a rebuild, since the binary
+changes).
 
 ## CLI usage
 
@@ -114,6 +128,8 @@ Fill in the connection fields, press **Connect**, type SQL and press **Run** (�
 | `third_party/libui-ng` | libui-ng submodule |
 
 ## Development
+
+`make test` runs the unit tests for the saved-connections file (no database needed).
 
 `make gui-test` builds the GUI with sanitizers and runs a scripted smoke test
 (connect, multi-statement results, views filter, double-click, row cap). It

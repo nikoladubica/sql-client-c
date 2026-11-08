@@ -2,6 +2,7 @@
  * sqlc-gui - a simple MySQL/MariaDB GUI built with libui-ng.
  *
  * Layout:
+ *   [Saved connections v][Name][x] Remember password [Save][Delete]
  *   [Host][Port][User][Password][Database][Connect]
  *   +-----------+------------------------------------+
  *   | Tables    | SQL editor                         |
@@ -19,13 +20,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 #include <time.h>
 
 #include <ui.h>
 #include <mysql.h>
 
 #include "db.h"
+#include "keychain.h"
 #include "macos_menu.h"
+#include "profiles.h"
 
 #define GUI_MAX_ROWS 10000 /* rows kept per result set in the grid */
 
@@ -97,6 +101,14 @@ static uiTable *new_grid(set_model *sm) {
 static struct {
     uiWindow *win;
     uiEntry *host, *port, *user, *pass, *db;
+
+    /* saved connections; profile_box item 0 is "New connection",
+     * item i is profiles.items[i - 1] */
+    uiCombobox *profile_box;
+    uiEntry *profile_name;
+    uiCheckbox *remember_pw;
+    profile_list profiles;
+    char *profiles_file;
     uiButton *connect_btn, *run_btn;
     uiCheckbox *hide_views;
     uiMultilineEntry *editor;
@@ -277,6 +289,7 @@ typedef struct {
     unsigned int port;
     char *sql;
     db_exec_opts eo;
+    char *profile;            /* saved connection used to connect, if any */
 
     /* results, filled by the worker */
     int ok;
@@ -291,6 +304,7 @@ static void job_free(job *j) {
     free(j->host); free(j->user); free(j->dbname); free(j->sql); free(j->error);
     if (j->pass) { memset(j->pass, 0, strlen(j->pass)); free(j->pass); }
     free(j->current_db);
+    free(j->profile);
     db_outcome_free(&j->out);
     db_outcome_free(&j->tables);
     free(j);
@@ -317,6 +331,7 @@ static void load_tables(job *j) {
 }
 
 static void job_done(void *data);
+static void remember_last_profile(const char *name);
 #ifdef SQLC_AUTOTEST
 static void autotest_next(void);
 static int on_should_quit(void *data);
@@ -378,6 +393,7 @@ static void job_done(void *data) {
         }
         if (app.conn) mysql_close(app.conn);
         app.conn = j->conn;
+        remember_last_profile(j->profile);
         set_status("Connected to %s (server %s)%s%s",
                    mysql_get_host_info(app.conn), mysql_get_server_info(app.conn),
                    j->current_db ? " - database: " : "",
@@ -441,6 +457,9 @@ static void on_connect(uiButton *b, void *data) {
     free(port);
     if (!j->host[0]) { free(j->host); j->host = strdup("localhost"); }
     if (!j->dbname[0]) { free(j->dbname); j->dbname = NULL; }
+    int sel = uiComboboxSelected(app.profile_box);
+    if (sel > 0 && (size_t)sel <= app.profiles.n)
+        j->profile = strdup(app.profiles.items[sel - 1].name);
     set_status("Connecting to %s...", j->host);
     start_job(j);
 }
@@ -502,6 +521,162 @@ static void on_table_double_click(uiTable *t, int row, void *data) {
     free(sql);
 }
 
+/* ---------- saved connections ---------- */
+
+static int save_profiles_file(void) {
+    if (app.profiles_file && profiles_save(app.profiles_file, &app.profiles) == 0) return 0;
+    char msg[1200];
+    snprintf(msg, sizeof msg, "Could not write %s: %s",
+             app.profiles_file ? app.profiles_file : "(no config path)", strerror(errno));
+    uiMsgBoxError(app.win, "Could not save connections", msg);
+    return -1;
+}
+
+/* Refill the dropdown and select the profile called name (or "New connection"). */
+static void fill_profile_box(const char *name) {
+    uiComboboxClear(app.profile_box);
+    uiComboboxAppend(app.profile_box, "New connection");
+    int sel = 0;
+    for (size_t i = 0; i < app.profiles.n; i++) {
+        uiComboboxAppend(app.profile_box, app.profiles.items[i].name);
+        if (name && strcmp(app.profiles.items[i].name, name) == 0) sel = (int)i + 1;
+    }
+    uiComboboxSetSelected(app.profile_box, sel);
+}
+
+/* Fill the connection fields from the selected dropdown item. */
+static void apply_selected_profile(void) {
+    int sel = uiComboboxSelected(app.profile_box);
+    if (sel <= 0 || (size_t)sel > app.profiles.n) {
+        uiEntrySetText(app.profile_name, "");
+        return;
+    }
+    const profile *p = &app.profiles.items[sel - 1];
+    char port[16];
+    snprintf(port, sizeof port, "%u", p->port ? p->port : 3306);
+    uiEntrySetText(app.profile_name, p->name);
+    uiEntrySetText(app.host, p->host);
+    uiEntrySetText(app.port, port);
+    uiEntrySetText(app.user, p->user);
+    uiEntrySetText(app.db, p->database);
+    uiCheckboxSetChecked(app.remember_pw, p->remember_password);
+    uiCheckboxSetChecked(app.hide_views, p->hide_views);
+    rebuild_sidebar();
+
+    char *pw = p->remember_password ? keychain_get(p->name) : NULL;
+    uiEntrySetText(app.pass, pw ? pw : "");
+    if (pw) { memset(pw, 0, strlen(pw)); free(pw); }
+}
+
+static void on_profile_selected(uiCombobox *c, void *data) {
+    (void)c; (void)data;
+    apply_selected_profile();
+}
+
+static char *trimmed_entry(uiEntry *e) {
+    char *s = entry_dup(e);
+    if (!s) return NULL;
+    char *b = s;
+    while (isspace((unsigned char)*b)) b++;
+    char *end = b + strlen(b);
+    while (end > b && isspace((unsigned char)end[-1])) *--end = '\0';
+    memmove(s, b, strlen(b) + 1);
+    return s;
+}
+
+static void on_save_profile(uiButton *b, void *data) {
+    (void)b; (void)data;
+    char *name = trimmed_entry(app.profile_name);
+    if (!name) return;
+    if (!profile_name_valid(name)) {
+        uiMsgBoxError(app.win, "Can't save connection",
+                      "Enter a name for this connection (no line breaks, '[' or ']').");
+        free(name);
+        return;
+    }
+
+    char *port = entry_dup(app.port);
+    unsigned long portn = port ? strtoul(port, NULL, 10) : 0;
+    free(port);
+    profile p = {
+        .name = name,
+        .host = entry_dup(app.host),
+        .port = portn > 0 && portn <= 65535 ? (unsigned int)portn : 3306,
+        .user = entry_dup(app.user),
+        .database = entry_dup(app.db),
+        .remember_password = uiCheckboxChecked(app.remember_pw),
+        .hide_views = uiCheckboxChecked(app.hide_views),
+    };
+    int existed = profiles_find(&app.profiles, name) != NULL;
+
+    if (p.remember_password) {
+        char *pw = entry_dup(app.pass);
+        char err[512] = "";
+        if (pw && keychain_set(name, pw, err, sizeof err) != 0) {
+            char msg[700];
+            snprintf(msg, sizeof msg,
+                     "The password could not be stored in the Keychain (%s). "
+                     "The connection is saved without it.", err);
+            uiMsgBoxError(app.win, "Keychain", msg);
+            p.remember_password = 0;
+        }
+        if (pw) { memset(pw, 0, strlen(pw)); free(pw); }
+    } else {
+        keychain_delete(name);
+    }
+
+    if (profiles_put(&app.profiles, &p) < 0) {
+        set_status("Out of memory");
+    } else {
+        profiles_set_last(&app.profiles, name);
+        if (save_profiles_file() == 0) {
+            fill_profile_box(name);
+            uiCheckboxSetChecked(app.remember_pw, p.remember_password);
+            set_status("%s connection \"%s\".", existed ? "Updated" : "Saved", name);
+        }
+    }
+    free(p.name); free(p.host); free(p.user); free(p.database);
+}
+
+static void on_delete_profile(uiButton *b, void *data) {
+    (void)b; (void)data;
+    int sel = uiComboboxSelected(app.profile_box);
+    if (sel <= 0 || (size_t)sel > app.profiles.n) {
+        set_status("Pick a saved connection to delete.");
+        return;
+    }
+    char *name = strdup(app.profiles.items[sel - 1].name);
+    if (!name) return;
+    char msg[300];
+    snprintf(msg, sizeof msg, "Delete the saved connection \"%s\"? "
+             "Its saved password is removed from the Keychain too.", name);
+#ifndef SQLC_AUTOTEST
+    if (!sqlc_confirm("Delete saved connection?", msg, "Delete")) { free(name); return; }
+#endif
+    keychain_delete(name);
+    profiles_remove(&app.profiles, name);
+    if (save_profiles_file() == 0) set_status("Deleted connection \"%s\".", name);
+    fill_profile_box(NULL);
+    uiEntrySetText(app.profile_name, "");
+    free(name);
+}
+
+/* After a successful connect: preselect this profile on the next launch. */
+static void remember_last_profile(const char *name) {
+    if (!name || !profiles_find(&app.profiles, name)) return;
+    if (app.profiles.last && strcmp(app.profiles.last, name) == 0) return;
+    if (profiles_set_last(&app.profiles, name) == 0) save_profiles_file();
+}
+
+static void load_profiles(void) {
+    app.profiles_file = profiles_path();
+    if (app.profiles_file && profiles_load(app.profiles_file, &app.profiles) != 0)
+        set_status("Could not read saved connections from %s: %s",
+                   app.profiles_file, strerror(errno));
+    fill_profile_box(app.profiles.last);
+    apply_selected_profile();
+}
+
 #ifdef SQLC_AUTOTEST
 /*
  * Scripted smoke test (make gui-test): drives the real callbacks against
@@ -551,6 +726,22 @@ static void autotest_next(void) {
         autotest_print("20000 rows");
         printf("[20000 rows] grid rows kept: %zu, truncated: %d\n",
                app.shown.sets[0].nrows, app.shown.sets[0].truncated);
+        /* save the current connection as a profile, then read the file back */
+        uiEntrySetText(app.profile_name, "autotest");
+        uiCheckboxSetChecked(app.remember_pw, 0);
+        on_save_profile(NULL, NULL);
+        {
+            profile_list back;
+            int rc = profiles_load(app.profiles_file, &back);
+            profile *p = rc == 0 ? profiles_find(&back, "autotest") : NULL;
+            printf("[profiles] saved: %s, db: %s, last: %s, dropdown items: %d\n",
+                   p ? "yes" : "no", p ? p->database : "-",
+                   back.last ? back.last : "-", uiComboboxNumItems(app.profile_box));
+            profiles_free(&back);
+        }
+        on_delete_profile(NULL, NULL);
+        printf("[profiles] after delete: %zu saved, dropdown items: %d\n",
+               app.profiles.n, uiComboboxNumItems(app.profile_box));
         if (on_should_quit(NULL)) uiQuit();
         break;
     }
@@ -597,6 +788,25 @@ static void build_window(void) {
     uiBox *root = uiNewVerticalBox();
     uiBoxSetPadded(root, 1);
     uiWindowSetChild(app.win, uiControl(root));
+
+    /* saved connections */
+    uiBox *saved = uiNewHorizontalBox();
+    uiBoxSetPadded(saved, 1);
+    app.profile_box = uiNewCombobox();
+    uiComboboxOnSelected(app.profile_box, on_profile_selected, NULL);
+    app.profile_name = uiNewEntry();
+    app.remember_pw = uiNewCheckbox("Remember password");
+    uiCheckboxSetChecked(app.remember_pw, 1);
+    uiButton *save_btn = uiNewButton("Save");
+    uiButtonOnClicked(save_btn, on_save_profile, NULL);
+    uiButton *delete_btn = uiNewButton("Delete");
+    uiButtonOnClicked(delete_btn, on_delete_profile, NULL);
+    uiBoxAppend(saved, uiControl(labeled("Saved connections", uiControl(app.profile_box))), 1);
+    uiBoxAppend(saved, uiControl(labeled("Name", uiControl(app.profile_name))), 1);
+    uiBoxAppend(saved, uiControl(labeled(" ", uiControl(app.remember_pw))), 0);
+    uiBoxAppend(saved, uiControl(labeled(" ", uiControl(save_btn))), 0);
+    uiBoxAppend(saved, uiControl(labeled(" ", uiControl(delete_btn))), 0);
+    uiBoxAppend(root, uiControl(saved), 0);
 
     /* connection bar */
     uiBox *bar = uiNewHorizontalBox();
@@ -655,6 +865,7 @@ static void build_window(void) {
     uiBoxAppend(root, uiControl(app.status), 0);
 
     rebuild_sidebar();
+    load_profiles();
 }
 
 int main(void) {
@@ -684,6 +895,8 @@ int main(void) {
         db_outcome_free(&app.side_data);
         db_outcome_free(&app.tables_raw);
         free(app.side_index);
+        profiles_free(&app.profiles);
+        free(app.profiles_file);
         if (app.conn) mysql_close(app.conn);
         uiUninit();
     }
