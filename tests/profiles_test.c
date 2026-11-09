@@ -31,10 +31,11 @@ int main(int argc, char **argv) {
     CHECK(!profile_name_valid("a\nb"));
 
     profile a = { .name = "zeta", .host = "db.example.com", .port = 3307, .user = "app",
-                  .database = "shop", .remember_password = 1, .hide_views = 1,
+                  .database = "shop", .remember_password = 1, .password = " p@ss=word#1 ",
+                  .hide_views = 1,
                   .no_auto_rehash = 1, .tables_once = 1 };
     profile b = { .name = "Alpha", .host = "localhost", .port = 3306, .user = "root",
-                  .database = "", .remember_password = 0 };
+                  .database = "", .remember_password = 0, .password = "not kept" };
     profile c = { .name = "bad\nname", .host = "x", .user = "x", .database = "x" };
     CHECK(profiles_put(&pl, &a) >= 0);
     CHECK(profiles_put(&pl, &b) == 0); /* sorted case-insensitively: Alpha first */
@@ -59,9 +60,11 @@ int main(int argc, char **argv) {
     CHECK(z && strcmp(z->host, "db.example.com") == 0 && z->port == 3307 &&
           strcmp(z->user, "app2") == 0 && strcmp(z->database, "shop") == 0 &&
           z->remember_password == 1 && z->hide_views == 1 &&
-          z->no_auto_rehash == 1 && z->tables_once == 1);
+          z->no_auto_rehash == 1 && z->tables_once == 1 &&
+          strcmp(z->password, " p@ss=word#1 ") == 0); /* kept verbatim */
     profile *al = profiles_find(&back, "Alpha");
     CHECK(al && strcmp(al->database, "") == 0 && al->remember_password == 0 &&
+          strcmp(al->password, "") == 0 && /* not remembered: never written */
           al->no_auto_rehash == 0 && al->tables_once == 0);
     CHECK(strcmp(back.items[0].name, "Alpha") == 0);
 
@@ -83,6 +86,18 @@ int main(int argc, char **argv) {
     CHECK(sp && strcmp(sp->host, "h") == 0 && sp->port == 3306 &&
           strcmp(sp->user, "u=with=equals") == 0 && strcmp(sp->database, "") == 0);
     profiles_free(&back);
+
+    /* single secrets (the Claude API key) */
+    char sec[1024];
+    snprintf(sec, sizeof sec, "%s/nested/claude-api-key", argv[1]);
+    CHECK(secret_remove(sec) == 0); /* missing is fine */
+    CHECK(secret_read(sec) == NULL);
+    CHECK(secret_write(sec, "sk-ant-123") == 0);
+    CHECK(stat(sec, &st) == 0 && (st.st_mode & 0777) == 0600);
+    char *k = secret_read(sec);
+    CHECK(k && strcmp(k, "sk-ant-123") == 0);
+    free(k);
+    CHECK(secret_remove(sec) == 0 && secret_read(sec) == NULL);
 
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     printf("profiles_test: all checks passed\n");

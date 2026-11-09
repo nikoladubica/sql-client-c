@@ -16,11 +16,13 @@
  *   user=app
  *   database=shop
  *   remember_password=1
+ *   password=secret
  *   hide_views=0
  *   no_auto_rehash=0
  *   tables_once=0
  *
- * Passwords are never written here; see keychain.h.
+ * The password is stored (in plain text, which is why the file is 0600)
+ * only for profiles with remember_password set.
  */
 
 typedef struct {
@@ -29,7 +31,8 @@ typedef struct {
     unsigned int port;
     char *user;
     char *database;
-    int remember_password; /* password lives in the Keychain */
+    int remember_password; /* keep the password in the file */
+    char *password;        /* "" if not remembered */
     int hide_views;
     int no_auto_rehash;    /* like the CLI's -A: don't load the table list */
     int tables_once;       /* tables only (no views), loaded on connect, then -A */
@@ -44,6 +47,17 @@ typedef struct {
 /* $SQLC_CONFIG_DIR/connections, or
  * ~/Library/Application Support/sqlc/connections. malloc'd; NULL on error. */
 char *profiles_path(void);
+
+/* $SQLC_CONFIG_DIR/<file>, or ~/Library/Application Support/sqlc/<file>.
+ * malloc'd; NULL on error. */
+char *config_path(const char *file);
+
+/* A small secret (e.g. the Claude API key) in its own 0600 file, written
+ * atomically. secret_read: malloc'd text without its trailing line break,
+ * NULL if the file is missing or empty. secret_remove: a missing file is fine. */
+int secret_write(const char *path, const char *value);
+char *secret_read(const char *path);
+int secret_remove(const char *path);
 
 /* A missing file gives an empty list. Returns 0 on success, -1 (errno set). */
 int profiles_load(const char *path, profile_list *out);

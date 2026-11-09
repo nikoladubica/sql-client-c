@@ -1,7 +1,6 @@
-// Resizable splits for libui-ng: an NSSplitView wrapped as a libui
-// container control (libui-ng has no splitter of its own). Two shapes: a
-// sidebar (side by side, fixed sidebar width) and a top/bottom split
-// (divider at a fraction of the height).
+// Resizable panes for libui-ng: an NSSplitView wrapped as a libui container
+// control (libui-ng has no splitter of its own). Side by side (the sidebar)
+// or stacked (the SQL editor above its results).
 #import <Cocoa/Cocoa.h>
 
 #include "ui.h"
@@ -12,18 +11,17 @@
 #define SqlcSplit(this) ((SqlcSplit *) (this))
 
 static const CGFloat MIN_MAIN_WIDTH = 240;
+static const CGFloat GRAB_MARGIN = 3; /* extra grab area on each side of a thin divider */
 
 typedef struct SqlcSplit SqlcSplit;
 
 @interface SqlcSplitView : NSSplitView <NSSplitViewDelegate> {
 @public
-    BOOL stacked;        /* YES = top/bottom panes, NO = sidebar | main */
-    CGFloat wantedSize;  /* sidebar: first pane width to apply on the first layout */
-    CGFloat wantedFrac;  /* stacked: top pane's share of the height, 0..1 */
-    CGFloat minFirst;    /* minimum width/height of pane 0 */
-    CGFloat minSecond;   /* minimum width/height of pane 1 */
+    CGFloat wanted;      /* first pane's size to apply on the first layout;
+                            0 or less = half of the room */
+    CGFloat minFirst, minSecond;
     NSString *saveKey;   /* retained; nil = don't persist */
-    BOOL positioned;     /* initial position applied; saving is allowed */
+    BOOL positioned;     /* initial size applied; saving is allowed */
 }
 @end
 
@@ -33,14 +31,14 @@ typedef struct SqlcSplit SqlcSplit;
     [super dealloc];
 }
 
-/* Length along the axis the divider moves on. */
-- (CGFloat)extent {
-    return stacked ? NSHeight([self bounds]) : NSWidth([self bounds]);
+/* Size along the split direction: width side by side, height stacked. */
+- (CGFloat)lengthOf:(NSRect)r {
+    return [self isVertical] ? NSWidth(r) : NSHeight(r);
 }
 
 /* Room left for both panes once the divider is taken out. */
 - (CGFloat)paneSpace {
-    return [self extent] - [self dividerThickness];
+    return [self lengthOf:[self bounds]] - [self dividerThickness];
 }
 
 /* Clamp a divider position so that neither pane goes below its minimum. */
@@ -54,14 +52,13 @@ typedef struct SqlcSplit SqlcSplit;
 - (void)layout {
     [super layout];
     // Panes have no size until the first layout pass, so apply the starting
-    // position here, once. A stacked split waits until both minimums fit, so
-    // a tiny first pass can't pin the divider against one edge.
+    // size here, once - and only when both minimums fit, so a tiny first
+    // pass can't pin the divider against one edge.
     if (positioned) return;
     CGFloat space = [self paneSpace];
-    if (space <= 0) return;
-    if (stacked && space < minFirst + minSecond) return;
-    CGFloat pos = stacked ? floor(space * wantedFrac) : wantedSize;
-    [self setPosition:[self clampPosition:pos] ofDividerAtIndex:0];
+    if (space <= 0 || space < minFirst + minSecond) return;
+    CGFloat w = wanted > 0 ? wanted : floor(space / 2);
+    [self setPosition:[self clampPosition:w] ofDividerAtIndex:0];
     positioned = YES;
 }
 
@@ -73,7 +70,8 @@ typedef struct SqlcSplit SqlcSplit;
 }
 
 - (CGFloat)splitView:(NSSplitView *)sv constrainMaxCoordinate:(CGFloat)proposed ofSubviewAt:(NSInteger)i {
-    (void)sv; (void)i;
+    (void)i;
+    (void)sv;
     CGFloat max = [self paneSpace] - minSecond;
     return proposed > max ? max : proposed;
 }
@@ -83,21 +81,22 @@ typedef struct SqlcSplit SqlcSplit;
     return NO;
 }
 
+// A thin divider is a 1pt line: make it easier to grab.
+- (NSRect)splitView:(NSSplitView *)sv effectiveRect:(NSRect)proposed
+       forDrawnRect:(NSRect)drawn ofDividerAtIndex:(NSInteger)i {
+    (void)drawn; (void)i;
+    return [sv isVertical] ? NSInsetRect(proposed, -GRAB_MARGIN, 0)
+                           : NSInsetRect(proposed, 0, -GRAB_MARGIN);
+}
+
 - (void)splitViewDidResizeSubviews:(NSNotification *)n {
     (void)n;
     if (!positioned || saveKey == nil) return;
     NSArray *panes = [self arrangedSubviews];
     if ([panes count] < 1) return;
-    NSRect f = [[panes objectAtIndex:0] frame];
-    if (stacked) {
-        // Stored as a fraction so it fits any window height on the next launch.
-        CGFloat space = [self paneSpace];
-        CGFloat h = NSHeight(f);
-        if (space >= minFirst + minSecond && h >= minFirst && space - h >= minSecond)
-            [[NSUserDefaults standardUserDefaults] setDouble:h / space forKey:saveKey];
-    } else if (NSWidth(f) >= minFirst) {
-        [[NSUserDefaults standardUserDefaults] setDouble:NSWidth(f) forKey:saveKey];
-    }
+    CGFloat w = [self lengthOf:[[panes objectAtIndex:0] frame]];
+    if (w >= minFirst && [self paneSpace] - w >= minSecond)
+        [[NSUserDefaults standardUserDefaults] setDouble:w forKey:saveKey];
 }
 @end
 
@@ -174,10 +173,8 @@ static void pin(NSView *pane, NSView *child, NSLayoutAttribute attr, CGFloat ins
 }
 
 /* Put child in a plain pane view that fills it; the split view sizes the pane.
- * `before` / `after` inset the child at the start / end of the split axis
- * (left / right, or top / bottom when stacked). */
-static NSView *add_pane(SqlcSplit *s, int i, uiControl *child, BOOL stacked,
-                        CGFloat before, CGFloat after) {
+ * before/after: space between the child and the divider-facing edges. */
+static NSView *add_pane(SqlcSplit *s, int i, uiControl *child, CGFloat before, CGFloat after) {
     NSView *pane = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)];
     s->children[i] = child;
     uiControlSetParent(child, uiControl(s));
@@ -188,113 +185,84 @@ static NSView *add_pane(SqlcSplit *s, int i, uiControl *child, BOOL stacked,
     uiDarwinControlSetHuggingPriority(uiDarwinControl(child), NSLayoutPriorityDefaultLow, NSLayoutConstraintOrientationVertical);
 
     NSView *cv = (NSView *) uiControlHandle(child);
-    pin(pane, cv, NSLayoutAttributeLeading, stacked ? 0 : before);
-    pin(pane, cv, NSLayoutAttributeTrailing, stacked ? 0 : -after);
-    pin(pane, cv, NSLayoutAttributeTop, stacked ? before : 0);
-    pin(pane, cv, NSLayoutAttributeBottom, stacked ? -after : 0);
+    BOOL across = [s->split isVertical];
+    pin(pane, cv, NSLayoutAttributeLeading, across ? before : 0);
+    pin(pane, cv, NSLayoutAttributeTrailing, across ? -after : 0);
+    pin(pane, cv, NSLayoutAttributeTop, across ? 0 : before);
+    pin(pane, cv, NSLayoutAttributeBottom, across ? 0 : -after);
 
     [s->split addSubview:pane];
     [pane release]; /* retained by the split view */
     return pane;
 }
 
-/* pane's width (or height) >= min, so a window resize can't squash it either. */
-static void min_size(NSView *pane, NSLayoutAttribute attr, CGFloat min) {
-    [pane addConstraint:[NSLayoutConstraint constraintWithItem:pane attribute:attr
+static void min_size(NSView *pane, BOOL across, CGFloat min) {
+    [pane addConstraint:[NSLayoutConstraint constraintWithItem:pane
+                                                     attribute:across ? NSLayoutAttributeWidth : NSLayoutAttributeHeight
                                                      relatedBy:NSLayoutRelationGreaterThanOrEqual
                                                         toItem:nil attribute:NSLayoutAttributeNotAnAttribute
                                                     multiplier:1 constant:min]];
 }
 
-/* The shared part of both constructors; save_key may be NULL. */
-static SqlcSplit *new_split(uiControl *first, uiControl *second, BOOL stacked,
-                            CGFloat min_first, CGFloat min_second, const char *save_key) {
+static uiControl *new_split(BOOL across, uiControl *first, uiControl *second,
+                            int initial, int min_first, int min_second, const char *save_key) {
     SqlcSplit *s;
     uiDarwinNewControl(SqlcSplit, s);
     s->horzHuggingPri = NSLayoutPriorityDefaultLow;
     s->vertHuggingPri = NSLayoutPriorityDefaultLow;
 
     SqlcSplitView *sv = [[SqlcSplitView alloc] initWithFrame:NSZeroRect];
-    [sv setVertical:!stacked]; /* NSSplitView's "vertical" means a vertical divider */
+    [sv setVertical:across]; /* YES = side by side */
     [sv setDividerStyle:NSSplitViewDividerStyleThin];
     [sv setDelegate:sv];
-    sv->stacked = stacked;
     sv->minFirst = min_first;
     sv->minSecond = min_second;
-    if (save_key) sv->saveKey = [[NSString alloc] initWithUTF8String:save_key];
+    sv->wanted = initial;
+    if (save_key) {
+        sv->saveKey = [[NSString alloc] initWithUTF8String:save_key];
+        double saved = [[NSUserDefaults standardUserDefaults] doubleForKey:sv->saveKey];
+        if (saved >= min_first) sv->wanted = saved;
+    }
     s->split = sv;
 
     // A little space on each side of the divider, like a padded uiBox.
     CGFloat gap = uiDarwinPaddingAmount(NULL) / 2;
-    NSLayoutAttribute size = stacked ? NSLayoutAttributeHeight : NSLayoutAttributeWidth;
-    min_size(add_pane(s, 0, first, stacked, 0, gap), size, min_first);
-    min_size(add_pane(s, 1, second, stacked, gap, 0), size, min_second);
-    return s;
-}
+    NSView *a = add_pane(s, 0, first, 0, gap);
+    NSView *b = add_pane(s, 1, second, gap, 0);
+    min_size(a, across, min_first);
+    min_size(b, across, min_second);
 
-uiControl *sqlc_new_sidebar_split(uiControl *side, uiControl *main,
-                                  int initial_width, int min_width,
-                                  const char *save_key) {
-    SqlcSplit *s = new_split(side, main, NO, min_width, MIN_MAIN_WIDTH, save_key);
-    SqlcSplitView *sv = s->split;
-    sv->wantedSize = initial_width;
-    if (sv->saveKey) {
-        double saved = [[NSUserDefaults standardUserDefaults] doubleForKey:sv->saveKey];
-        if (saved >= min_width) sv->wantedSize = saved;
-    }
-
-    // When the window is resized, the sidebar keeps its width and the main
-    // pane absorbs the change.
+    // When the window is resized, the first pane keeps its size and the
+    // second one absorbs the change.
     [sv setHoldingPriority:NSLayoutPriorityDefaultLow + 10 forSubviewAtIndex:0];
     [sv setHoldingPriority:NSLayoutPriorityDefaultLow forSubviewAtIndex:1];
 
     return uiControl(s);
 }
 
-uiControl *sqlc_new_vertical_split(uiControl *top, uiControl *bottom,
-                                   double initial_fraction, int min_height,
-                                   const char *save_key) {
-    if (min_height < 1) min_height = 1;
-    SqlcSplit *s = new_split(top, bottom, YES, min_height, min_height, save_key);
-    SqlcSplitView *sv = s->split;
-    // A bad fraction (NaN, out of range) falls back to half.
-    double frac = initial_fraction > 0 && initial_fraction < 1 ? initial_fraction : 0.5;
-    if (sv->saveKey) {
-        // A stored 0 means "nothing saved"; anything outside (0, 1) is ignored.
-        // Layout clamps the result to both minimum heights anyway.
-        double saved = [[NSUserDefaults standardUserDefaults] doubleForKey:sv->saveKey];
-        if (saved > 0 && saved < 1) frac = saved;
-    }
-    sv->wantedFrac = frac;
-
-    // When the window is resized, both panes grow or shrink together.
-    [sv setHoldingPriority:NSLayoutPriorityDefaultLow forSubviewAtIndex:0];
-    [sv setHoldingPriority:NSLayoutPriorityDefaultLow forSubviewAtIndex:1];
-
-    return uiControl(s);
+uiControl *sqlc_new_sidebar_split(uiControl *side, uiControl *main,
+                                  int initial_width, int min_width,
+                                  const char *save_key) {
+    return new_split(YES, side, main, initial_width, min_width, MIN_MAIN_WIDTH, save_key);
 }
 
-/* Size of pane 0 along the split axis. */
-static int first_pane_size(uiControl *split) {
+uiControl *sqlc_new_stacked_split(uiControl *top, uiControl *bottom,
+                                  int initial_height, int min_top, int min_bottom,
+                                  const char *save_key) {
+    return new_split(NO, top, bottom, initial_height, min_top, min_bottom, save_key);
+}
+
+int sqlc_split_position(uiControl *split) {
     SqlcSplitView *sv = SqlcSplit(split)->split;
     NSArray *panes = [sv arrangedSubviews];
-    if (![panes count]) return 0;
-    NSRect f = [[panes objectAtIndex:0] frame];
-    return (int) (sv->stacked ? NSHeight(f) : NSWidth(f));
+    return [panes count] ? (int) [sv lengthOf:[[panes objectAtIndex:0] frame]] : 0;
 }
 
-/* Move the divider; the clamp keeps both panes at or above their minimums. */
-static void set_first_pane_size(uiControl *split, int size) {
+void sqlc_split_set_position(uiControl *split, int size) {
     SqlcSplitView *sv = SqlcSplit(split)->split;
     [sv setPosition:[sv clampPosition:size] ofDividerAtIndex:0];
     [[sv window] layoutIfNeeded];
 }
-
-int sqlc_split_sidebar_width(uiControl *split) { return first_pane_size(split); }
-void sqlc_split_set_sidebar_width(uiControl *split, int width) { set_first_pane_size(split, width); }
-
-int sqlc_split_top_height(uiControl *split) { return first_pane_size(split); }
-void sqlc_split_set_top_height(uiControl *split, int height) { set_first_pane_size(split, height); }
 
 void sqlc_table_fill_width(uiTable *t) {
     NSScrollView *sv = (NSScrollView *) uiControlHandle(uiControl(t));

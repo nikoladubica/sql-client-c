@@ -77,3 +77,10 @@ int sqlc_confirm(const char *title, const char *message, const char *ok_label) {
     [alert release];
     return ok;
 }
+
+void sqlc_button_set_small(uiButton *b) {
+    NSButton *btn = (NSButton *) uiControlHandle(uiControl(b));
+    [btn setControlSize:NSControlSizeSmall];
+    [btn setFont:[NSFont systemFontOfSize:[NSFont systemFontSizeForControlSize:NSControlSizeSmall]]];
+    [btn invalidateIntrinsicContentSize];
+}
