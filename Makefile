@@ -39,10 +39,12 @@ $(LIBUI_LIB): $(LIBUI_OBJ)
 GUI_BIN := sqlc-gui
 GUI_SRC := src/gui.c src/db.c src/profiles.c src/macos_menu.m src/splitview.m src/segmented.m \
            src/export.c src/export_db.c src/export_dialog.m src/table_menu.m \
-           src/ai.c src/ai_db.c src/json.c src/row_edit.c src/grid_edit.m
+           src/ai.c src/ai_db.c src/json.c src/row_edit.c src/grid_edit.m \
+           src/sql_tips.c src/loading.m
 GUI_HDR := src/db.h src/profiles.h src/macos_menu.h src/splitview.h src/segmented.h \
            src/export.h src/export_db.h src/export_dialog.h src/table_menu.h \
-           src/ai.h src/ai_db.h src/json.h src/row_edit.h src/grid_edit.h
+           src/ai.h src/ai_db.h src/json.h src/row_edit.h src/grid_edit.h \
+           src/sql_tips.h src/loading.h
 GUI_LIBS := $(LIBUI_LIB) -framework Foundation -framework AppKit -lobjc -lcurl
 
 gui: $(GUI_BIN)
@@ -60,12 +62,13 @@ gui-test: $(GUI_SRC) $(GUI_HDR) $(LIBUI_LIB)
 		$(BUILD)/sqlc-gui-test
 
 # Unit tests: saved-connections file format, export writers, the AI request /
-# response handling and the row-editing SQL (no database or network needed).
+# response handling, the row-editing SQL and the SQL tips (no database or network needed).
 TEST_CFLAGS := -std=c11 -Wall -Wextra -g -O0 -D_DARWIN_C_SOURCE -fsanitize=address,undefined -Isrc
 
 test: tests/profiles_test.c src/profiles.c src/profiles.h tests/export_test.c src/export.c src/export.h \
       tests/ai_test.c src/ai.c src/ai.h src/json.c src/json.h \
-      tests/row_edit_test.c src/row_edit.c src/row_edit.h
+      tests/row_edit_test.c src/row_edit.c src/row_edit.h \
+      tests/sql_tips_test.c src/sql_tips.c src/sql_tips.h
 	@mkdir -p $(BUILD)
 	$(CC) $(TEST_CFLAGS) -o $(BUILD)/profiles_test tests/profiles_test.c src/profiles.c
 	$(BUILD)/profiles_test $(BUILD)/test-profiles
@@ -75,6 +78,8 @@ test: tests/profiles_test.c src/profiles.c src/profiles.h tests/export_test.c sr
 	$(BUILD)/ai_test
 	$(CC) $(TEST_CFLAGS) $(CPPFLAGS) -o $(BUILD)/row_edit_test tests/row_edit_test.c src/row_edit.c
 	$(BUILD)/row_edit_test
+	$(CC) $(TEST_CFLAGS) -o $(BUILD)/sql_tips_test tests/sql_tips_test.c src/sql_tips.c
+	$(BUILD)/sql_tips_test
 
 # Export round trip against a real server: SQL re-import, XML and CSV checks.
 # Creates and drops the databases test_sqlc_export_src and test_sqlc_export_dst.

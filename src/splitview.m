@@ -275,3 +275,16 @@ void sqlc_table_fill_width(uiTable *t) {
     }
     [tv sizeLastColumnToFit];
 }
+
+void sqlc_table_set_enabled(uiTable *t, int enabled) {
+    NSScrollView *sv = (NSScrollView *) uiControlHandle(uiControl(t));
+    NSTableView *tv = [sv documentView];
+    if ([tv isKindOfClass:[NSTableView class]]) [tv setEnabled:enabled ? YES : NO];
+    [sv setAlphaValue:enabled ? 1.0 : 0.5];
+}
+
+void sqlc_window_layout_now(uiWindow *w, int redraw) {
+    NSWindow *win = (NSWindow *) uiControlHandle(uiControl(w));
+    [win layoutIfNeeded];
+    if (redraw) [[win contentView] setNeedsDisplay:YES];
+}

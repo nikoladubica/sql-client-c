@@ -42,4 +42,14 @@ void sqlc_split_set_position(uiControl *split, int size);
 /* Make a uiTable's last column grow/shrink with the table's width. */
 void sqlc_table_fill_width(uiTable *t);
 
+/* Lay the window's views out now, even before it is shown, and (redraw)
+ * repaint all of it. Splits place their divider on their first layout, so
+ * one whose first layout happens on screen leaves its starting divider
+ * drawn; laying them out before the window shows avoids that. */
+void sqlc_window_layout_now(uiWindow *w, int redraw);
+
+/* Enable or disable a uiTable for clicks, and dim it while disabled
+ * (libui-ng's uiControlDisable doesn't reach a table). */
+void sqlc_table_set_enabled(uiTable *t, int enabled);
+
 #endif

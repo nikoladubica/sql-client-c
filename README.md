@@ -10,11 +10,16 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
 
 ### GUI (`sqlc-gui`)
 
-- Connection bar (host, port, user, password, database) with options you can
-  set before connecting: **Hide views**, **No auto-rehash (-A)** and
-  **Tables only, load once**
-- **Saved connections**: save the connection fields under a name and pick it
-  from a dropdown next time (remembered passwords are saved with them)
+- **Welcome screen** before connecting: your saved connections on the left,
+  a new-connection form (host, port, user, password, database) in the middle,
+  with options you set before connecting: **Hide views**, **No auto-rehash (-A)**
+  and **Tables only, load once**. Once connected, the window switches to the
+  full layout, with a slim bar on top showing the connection and a **Disconnect** button
+- While connecting, the form and the list are disabled and a spinner turns
+  under the form, with a random SQL tip (one of 50, never the same one twice in a row);
+  **Load tables** / **Refresh tables** show the same spinner and a tip in the sidebar
+- **Saved connections**: save the form under a name and pick it from the list
+  next time, or double-click it to connect (remembered passwords are saved with them)
 - SQL editor with **Run** (button or ⌘↩); several statements at once
 - Editor above, results below, split in half; drag the divider between them
   to resize (neither side can be dragged away, and the position is remembered)
@@ -87,7 +92,26 @@ If you cloned without `--recursive`, the Makefile fetches the submodule for you
 ./sqlc-gui
 ```
 
-Fill in the connection fields, press **Connect**, type SQL and press **Run** (⌘↩).
+The window opens on a welcome screen with only two parts: the **Saved
+connections** list on the left and a connection form in the middle (Name,
+Host, Port, User, Password, Database, the options below and **Save**,
+**Delete** and **Connect**). Pick a saved connection or fill in the form,
+press **Connect**, then type SQL and press **Run** (⌘↩). While the connection
+opens (and the table list loads), the form and the list are disabled, and a
+spinner turns under the form with a SQL tip: one of 50 in `src/sql_tips.c`,
+picked at random and never the same as last time. On a fast local server it
+may only flash by. If the connection fails, an error appears and you stay on
+the welcome screen with the form enabled again.
+
+Once you're connected, the window switches to the full layout described
+below. A slim bar above it shows the connection
+(`Connected to user@host:port - database: db`, updated after `USE`),
+the **Hide views** option and **Disconnect**. **Disconnect** (disabled while a
+query is running) closes the connection and goes back to the welcome screen.
+It clears the results, the table list and the structure, but the editor keeps
+its text. An unsaved new row in a browsed table is discarded. To change
+**No auto-rehash (-A)** or **Tables only, load once**, disconnect, change
+them and connect again.
 
 A **Normal | AI | Structure** switch at the right end of a slim bar above the
 main area (right of the sidebar) picks what the area shows. In **Normal** and
@@ -112,6 +136,11 @@ The structure is loaded when you switch to it and whenever the sidebar
 selection changes while it's shown; with several tables selected it asks you
 to select one. **Show Structure** in a table's right-click menu switches to it.
 
+While the table list loads (**Load tables**, **Refresh tables**, or turning
+**Hide views** on or off), the list is dimmed and a spinner with a SQL tip shows
+above it in the sidebar. The tip wraps to as many lines as the sidebar's width
+needs. The list reloaded after each query doesn't show it.
+
 The sidebar selects several tables with Shift-click (a range) and ⌘-click
 (add or remove one); Ctrl-click is a right-click on a Mac. The selection is
 kept when the list is refreshed. Right-clicking a table selects just that
@@ -131,9 +160,12 @@ Connection options (all are saved with a connection):
   turns on **Hide views** and takes the place of **-A** while it's checked.
 
 To keep a connection, type a **Name** and press **Save**. Saved connections
-appear in the **Saved connections** dropdown; choosing one fills in the fields,
-and the last one you connected with is preselected on launch. **Delete** removes
-the selected one.
+appear in the welcome screen's **Saved connections** list, under
+**New connection** (which leaves the fields as they are and clears the Name).
+Clicking one fills in the form, and the last one you connected with is
+preselected on launch. Double-clicking one connects with it, if its password
+is remembered; otherwise, type the password and press **Connect**.
+**Delete** removes the selected one.
 
 Connections are stored in `~/Library/Application Support/sqlc/connections`
 (mode `0600`; override the folder with `SQLC_CONFIG_DIR`). With
@@ -312,6 +344,8 @@ with the same structure / `DROP … IF EXISTS` / data options:
 | `src/gui.c` | GUI (libui-ng) |
 | `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), which libui-ng lacks |
 | `src/splitview.m` | Resizable panes (sidebar, editor / results, columns / indexes): an `NSSplitView` wrapped as a libui control |
+| `src/loading.m` | The loading spinner with a tip under it (connecting, refreshing tables): an `NSProgressIndicator` and a wrapping label wrapped as a libui control |
+| `src/sql_tips.c` | The 50 SQL tips shown while connecting or loading tables, and the no-repeat random pick |
 | `src/segmented.m` | The Normal / AI / Structure switch: an `NSSegmentedControl` wrapped as a libui control |
 | `src/export.c` | Streaming SQL / CSV / XML writers (no database code) |
 | `src/export_db.c` | Export a table, the whole current database or selected tables as SQL, from a connection through those writers |
@@ -329,8 +363,8 @@ with the same structure / `DROP … IF EXISTS` / data options:
 `make test` runs the unit tests for the saved-connections file, the export
 writers' escaping/quoting, the database dump's header, comments, view
 ordering and table selection, Ask Claude's request/response handling, comment formatting and
-destructive-statement check, and the row editor's value checks and generated
-SQL (no database or network needed).
+destructive-statement check, the row editor's value checks and generated
+SQL, and the SQL tips' length, format and no-repeat pick (no database or network needed).
 
 `make export-test` exports an edge-case table in every format and checks the
 result: the SQL is re-imported into an empty database and compared with
@@ -345,8 +379,8 @@ table and database export, sidebar multi-select, `-A`, the context-menu actions 
 for destructive SQL from Claude, without calling the API, and row editing on
 scratch tables `edit_tmp` and `nopk_tmp`: cell edits, the calendar, invalid
 values, Set to NULL, adding, deleting several, Delete All Rows, a table without
-a primary key and a read-only view). It
-expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
+a primary key and a read-only view, and the welcome screen at launch and after
+**Disconnect**). It expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
 `customers` and `orders` plus a view.
 
 ## Limitations

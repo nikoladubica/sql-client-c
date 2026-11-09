@@ -1,9 +1,19 @@
 /*
  * sqlc-gui - a simple MySQL/MariaDB GUI built with libui-ng.
  *
- * Layout:
- *   [Saved connections v][Name][x] Remember password [Save][Delete]
- *   [Host][Port][User][Password][Database][Connect]
+ * Layout, two screens in one window (one shown at a time):
+ *
+ * Welcome, while not connected:
+ *   +-------------------+------------------------------+
+ *   | Saved connections |   Name / Host / Port / User  |
+ *   | New connection    |   Password / Database        |
+ *   | ...               |   options, [Save][Delete]    |
+ *   |                   |                  [Connect]   |
+ *   +-------------------+------------------------------+
+ *   status line
+ *
+ * Connected:
+ *   Connected to user@host:port - database: db  [x] Hide views [Disconnect]
  *   +-----------+------------------------------------+
  *   | Tables    | [ Query | Structure ]                |
  *   |           | Query: SQL editor, [Run]           |
@@ -25,6 +35,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdint.h>
 #include <time.h>
 
 #include <ui.h>
@@ -37,10 +48,12 @@
 #include "macos_menu.h"
 #include "segmented.h"
 #include "splitview.h"
+#include "sql_tips.h"
 #include "export.h"
 #include "export_db.h"
 #include "export_dialog.h"
 #include "grid_edit.h"
+#include "loading.h"
 #include "row_edit.h"
 #include "table_menu.h"
 #include "profiles.h"
@@ -153,9 +166,24 @@ static struct {
     uiWindow *win;
     uiEntry *host, *port, *user, *pass, *db;
 
-    /* saved connections; profile_box item 0 is "New connection",
-     * item i is profiles.items[i - 1] */
-    uiCombobox *profile_box;
+    /* the two screens: welcome (not connected) and the full layout */
+    uiControl *welcome;
+    uiControl *workspace;
+
+    /* saved connections, the welcome screen's list: row 0 is "New
+     * connection", row i is profiles.items[i - 1] */
+    uiBox *saved_box;        /* holds saved_table */
+    uiTable *saved_table;
+    set_model *saved_model;
+    db_outcome saved_data;   /* the list's rows (1 column) */
+    int profile_sel;         /* selected row, as above */
+    int filling_saved;       /* the list is being refilled: ignore its selection */
+    uiControl *form_col;     /* the form and its buttons, disabled while connecting */
+    uiControl *loading;      /* spinner + SQL tip under the form, see loading.h */
+    int connecting;          /* a connect job is running: the above are in use */
+    size_t last_tip;         /* index of the tip shown last time, or SIZE_MAX */
+    uiControl *side_loading; /* spinner + tip in the sidebar, while refreshing */
+    int refreshing;          /* a table-list job is running */
     uiEntry *profile_name;
     uiCheckbox *remember_pw;
     profile_list profiles;
@@ -164,6 +192,14 @@ static struct {
     uiCheckbox *hide_views;     /* views left out of the sidebar and SHOW TABLES */
     uiCheckbox *no_rehash;      /* -A: only load the table list on request */
     uiCheckbox *tables_once;    /* tables only, loaded on connect, then like -A */
+
+    /* the connected bar above the full layout */
+    uiLabel *conn_label;
+    uiCheckbox *hide_views_bar; /* mirrors hide_views, which stays the real one */
+    uiButton *disconnect_btn;
+    char *conn_user, *conn_host; /* what the connection was opened with */
+    unsigned int conn_port;
+
     uiMultilineEntry *editor;
     uiLabel *status;
 
@@ -243,11 +279,19 @@ static void update_edit_buttons(void) {
     else uiControlEnable(uiControl(e->reload_btn));
 }
 
+static void set_connecting(int on);
+static void set_refreshing(int on);
+
 static void set_busy(int busy) {
     app.busy = busy;
+    if (!busy) {
+        set_connecting(0);
+        set_refreshing(0);
+    }
     update_edit_buttons();
     if (busy) {
         uiControlDisable(uiControl(app.connect_btn));
+        uiControlDisable(uiControl(app.disconnect_btn));
         uiControlDisable(uiControl(app.run_btn));
         uiControlDisable(uiControl(app.load_tables_btn));
         uiControlDisable(uiControl(app.export_btn));
@@ -255,6 +299,7 @@ static void set_busy(int busy) {
         uiControlDisable(uiControl(app.st.refresh_btn));
     } else {
         uiControlEnable(uiControl(app.connect_btn));
+        uiControlEnable(uiControl(app.disconnect_btn));
         uiControlEnable(uiControl(app.run_btn));
         uiControlEnable(uiControl(app.load_tables_btn));
         uiControlEnable(uiControl(app.export_btn));
@@ -451,6 +496,84 @@ static void rebuild_sidebar(void) {
     if (selected_tables(&keep, &nkeep) != 0) nkeep = 0; /* out of memory: drop it */
     rebuild_sidebar_keeping(keep, nkeep);
     free_names(keep, nkeep);
+}
+
+/* ---------- welcome screen / connected layout ---------- */
+
+/* The connected bar's Hide views follows the real checkbox (welcome form). */
+static void sync_bar_hide_views(void) {
+    uiCheckboxSetChecked(app.hide_views_bar, uiCheckboxChecked(app.hide_views));
+    if (uiControlEnabled(uiControl(app.hide_views))) uiControlEnable(uiControl(app.hide_views_bar));
+    else uiControlDisable(uiControl(app.hide_views_bar));
+}
+
+/* "Connected to user@host:port - database: db", kept up to date after each job. */
+static void update_conn_label(void) {
+    if (!app.conn) return;
+    char port[16] = "";
+    if (app.conn_port) snprintf(port, sizeof port, ":%u", app.conn_port);
+    char buf[1024];
+    snprintf(buf, sizeof buf, "Connected to %s%s%s%s - %s%s",
+             app.conn_user ? app.conn_user : "", app.conn_user && *app.conn_user ? "@" : "",
+             app.conn_host ? app.conn_host : "", port,
+             app.current_db ? "database: " : "no database selected",
+             app.current_db ? app.current_db : "");
+    uiLabelSetText(app.conn_label, buf);
+}
+
+/* Start a loading indicator with a random SQL tip, never the last one shown. */
+static void start_loading_with_tip(uiControl *loading) {
+    app.last_tip = sql_tip_pick(app.last_tip, (unsigned long)arc4random());
+    const char *tip = sql_tip(app.last_tip);
+    char buf[SQL_TIP_MAX_LEN + 16];
+    snprintf(buf, sizeof buf, "Tip: %s", tip ? tip : "");
+    sqlc_loading_start(loading, tip ? buf : NULL);
+}
+
+/* While a connection is being opened: the welcome form and saved list are
+ * disabled, and a spinner with a random SQL tip (a different one each time)
+ * shows under the form. Off again from set_busy(0), whatever the outcome. */
+static void set_connecting(int on) {
+    if (on == app.connecting) return;
+    app.connecting = on;
+    if (app.saved_table) sqlc_table_set_enabled(app.saved_table, !on);
+    if (!on) {
+        uiControlEnable(app.form_col);
+        sqlc_loading_stop(app.loading);
+        return;
+    }
+    uiControlDisable(app.form_col);
+    start_loading_with_tip(app.loading);
+}
+
+/* While the table list loads (Load / Refresh tables, Hide views): the list
+ * is dimmed and a spinner with a SQL tip shows above it in the sidebar.
+ * Off again from set_busy(0); the list is rebuilt enabled afterwards. */
+static void set_refreshing(int on) {
+    if (on == app.refreshing) return;
+    app.refreshing = on;
+    if (app.side_table) sqlc_table_set_enabled(app.side_table, !on);
+    if (!on) {
+        sqlc_loading_stop(app.side_loading);
+        uiControlHide(app.side_loading);
+        return;
+    }
+    uiControlShow(app.side_loading);
+    start_loading_with_tip(app.side_loading);
+}
+
+/* Welcome screen while not connected, the full layout once connected. */
+static void show_screen(void) {
+    if (app.conn) {
+        update_conn_label();
+        sync_bar_hide_views();
+        uiControlHide(app.welcome);
+        uiControlShow(app.workspace);
+        sqlc_window_layout_now(app.win, 1); /* no divider drawn where it was */
+    } else {
+        uiControlHide(app.workspace);
+        uiControlShow(app.welcome);
+    }
 }
 
 /* ---------- worker thread ---------- */
@@ -751,6 +874,8 @@ static void start_job(job *j) {
     pthread_t th;
     app.job_kind = j->kind;
     set_busy(1);
+    if (j->kind == JOB_CONNECT) set_connecting(1);
+    else if (j->kind == JOB_TABLES) set_refreshing(1);
     if (pthread_create(&th, NULL, worker, j) != 0) {
         set_busy(0);
         set_status("Could not start worker thread");
@@ -1039,6 +1164,12 @@ static void job_done(void *data) {
         }
         if (app.conn) mysql_close(app.conn);
         app.conn = j->conn;
+        free(app.conn_user);
+        free(app.conn_host);
+        app.conn_user = j->user; /* the connection's, for the connected bar */
+        app.conn_host = j->host;
+        j->user = j->host = NULL;
+        app.conn_port = j->port;
         remember_last_profile(j->profile);
         set_status("Connected to %s (server %s)%s%s%s",
                    mysql_get_host_info(app.conn), mysql_get_server_info(app.conn),
@@ -1053,6 +1184,7 @@ static void job_done(void *data) {
         free(app.browsing);
         app.browsing = NULL;
         structure_message("");
+        show_screen(); /* off the welcome screen */
     } else if (j->kind == JOB_STRUCTURE) {
         structure_done(j);
     } else if (j->kind == JOB_ALTER) {
@@ -1146,6 +1278,7 @@ static void job_done(void *data) {
         free(app.current_db);
         app.current_db = j->current_db;
         j->current_db = NULL;
+        update_conn_label(); /* the database may have changed via USE */
     }
 
     /* Refresh the sidebar (the database may have changed via USE). */
@@ -1198,7 +1331,7 @@ static void on_connect(uiButton *b, void *data) {
     free(port);
     if (!j->host[0]) { free(j->host); j->host = strdup("localhost"); }
     if (!j->dbname[0]) { free(j->dbname); j->dbname = NULL; }
-    int sel = uiComboboxSelected(app.profile_box);
+    int sel = app.profile_sel;
     if (sel > 0 && (size_t)sel <= app.profiles.n)
         j->profile = strdup(app.profiles.items[sel - 1].name);
     j->load_tables = load_on_connect();
@@ -1210,7 +1343,7 @@ static void on_connect(uiButton *b, void *data) {
 /* Returns 1 if the query was started. browse: the table it shows (for editing). */
 static int run_query(const char *sql, const char *browse) {
     if (app.busy) return 0;
-    if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return 0; }
+    if (!app.conn) { set_status("Not connected - connect from the welcome screen first."); return 0; }
 
     const char *p = sql;
     while (isspace((unsigned char)*p)) p++;
@@ -1398,12 +1531,13 @@ static void on_ask_claude(uiButton *b, void *data) {
 
 static void on_ask_claude_menu(uiMenuItem *m, uiWindow *w, void *data) {
     (void)m; (void)w; (void)data;
-    show_mode(MODE_AI);
+    show_mode(MODE_AI); /* on the welcome screen: shown once connected */
+    if (!app.conn) set_status("Not connected - connect from the welcome screen first.");
 }
 
 static void load_tables_now(void) {
     if (app.busy) return;
-    if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return; }
+    if (!app.conn) { set_status("Not connected - connect from the welcome screen first."); return; }
     job *j = calloc(1, sizeof *j);
     if (!j) return;
     j->kind = JOB_TABLES;
@@ -1514,7 +1648,7 @@ static void export_tables_flow(char **names, size_t n);
  * selected table (SQL / CSV / XML), or the selected tables into one SQL file. */
 static void export_sidebar_selection(void) {
     if (app.busy) return;
-    if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return; }
+    if (!app.conn) { set_status("Not connected - connect from the welcome screen first."); return; }
     char **names = NULL;
     size_t n = 0;
     if (selected_tables(&names, &n) != 0) { set_status("Out of memory"); return; }
@@ -1600,7 +1734,7 @@ static void export_tables_flow(char **names, size_t n) {
 
 static void export_database_flow(void) {
     if (app.busy) return;
-    if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return; }
+    if (!app.conn) { set_status("Not connected - connect from the welcome screen first."); return; }
     if (!app.current_db) {
         uiMsgBoxError(app.win, "Export Database",
                       "No database selected. Pick one in the Database field and connect, "
@@ -1625,8 +1759,16 @@ static void on_hide_views(uiCheckbox *c, void *data) {
     (void)c; (void)data;
     /* Views are filtered on the server, so turning this off needs a reload
      * to bring them back. Filter what we have meanwhile (or if busy). */
+    sync_bar_hide_views();
     rebuild_sidebar();
     if (app.tables_loaded) load_tables_now();
+}
+
+/* The connected bar's copy of Hide views: drives the real one. */
+static void on_hide_views_bar(uiCheckbox *c, void *data) {
+    (void)data;
+    uiCheckboxSetChecked(app.hide_views, uiCheckboxChecked(c));
+    on_hide_views(app.hide_views, NULL);
 }
 
 /* "Tables only, load once" implies Hide views and replaces -A: lock both. */
@@ -1643,6 +1785,7 @@ static void sync_tables_once(int reload) {
         uiControlEnable(uiControl(app.hide_views));
         uiControlEnable(uiControl(app.no_rehash));
     }
+    sync_bar_hide_views();
 }
 
 static void on_tables_once(uiCheckbox *c, void *data) {
@@ -2280,21 +2423,65 @@ static int save_profiles_file(void) {
     return -1;
 }
 
-/* Refill the dropdown and select the profile called name (or "New connection"). */
-static void fill_profile_box(const char *name) {
-    uiComboboxClear(app.profile_box);
-    uiComboboxAppend(app.profile_box, "New connection");
-    int sel = 0;
-    for (size_t i = 0; i < app.profiles.n; i++) {
-        uiComboboxAppend(app.profile_box, app.profiles.items[i].name);
-        if (name && strcmp(app.profiles.items[i].name, name) == 0) sel = (int)i + 1;
+static void on_saved_selection(uiTable *t, void *data);
+static void on_saved_double_click(uiTable *t, int row, void *data);
+
+static void fill_saved_list_now(const char *name) {
+    if (app.saved_table) {
+        uiBoxDelete(app.saved_box, uiBoxNumChildren(app.saved_box) - 1);
+        uiControlDestroy(uiControl(app.saved_table));
+        app.saved_table = NULL;
     }
-    uiComboboxSetSelected(app.profile_box, sel);
+    free_set_model(app.saved_model);
+    app.saved_model = NULL;
+    db_outcome_free(&app.saved_data);
+    app.profile_sel = 0;
+
+    size_t n = app.profiles.n + 1; /* "New connection" first */
+    if (n > (size_t)INT_MAX) return;
+    db_set *s = calloc(1, sizeof *s);
+    if (!s) return;
+    app.saved_data.sets = s; /* from here on db_outcome_free cleans up */
+    app.saved_data.nsets = 1;
+    s->has_rows = 1;
+    s->ncols = 1;
+    s->names = calloc(1, sizeof *s->names);
+    s->numeric = calloc(1, sizeof *s->numeric);
+    s->cells = calloc(n, sizeof *s->cells);
+    if (!s->names || !s->numeric || !s->cells) { db_outcome_free(&app.saved_data); return; }
+    s->nrows = n;
+    s->names[0] = strdup("Saved connections");
+    s->cells[0] = strdup("New connection");
+    for (size_t i = 0; i < app.profiles.n; i++) {
+        s->cells[i + 1] = strdup(app.profiles.items[i].name);
+        if (name && strcmp(app.profiles.items[i].name, name) == 0) app.profile_sel = (int)i + 1;
+    }
+    if (!s->names[0]) { db_outcome_free(&app.saved_data); return; }
+
+    app.saved_model = new_set_model(s);
+    if (!app.saved_model) { db_outcome_free(&app.saved_data); return; }
+    app.saved_table = new_grid(app.saved_model);
+    uiTableSetSelectionMode(app.saved_table, uiTableSelectionModeOne);
+    sqlc_table_fill_width(app.saved_table); /* column follows the list's width */
+    uiTableOnSelectionChanged(app.saved_table, on_saved_selection, NULL);
+    uiTableOnRowDoubleClicked(app.saved_table, on_saved_double_click, NULL);
+    uiBoxAppend(app.saved_box, uiControl(app.saved_table), 1);
+    int row = app.profile_sel;
+    uiTableSelection sel = { .NumRows = 1, .Rows = &row };
+    uiTableSetSelection(app.saved_table, &sel);
 }
 
-/* Fill the connection fields from the selected dropdown item. */
+/* Refill the saved-connections list and select the profile called name (or
+ * "New connection"). Doesn't touch the form. */
+static void fill_saved_list(const char *name) {
+    app.filling_saved = 1; /* selecting from code calls on_saved_selection */
+    fill_saved_list_now(name);
+    app.filling_saved = 0;
+}
+
+/* Fill the connection fields from the selected saved connection. */
 static void apply_selected_profile(void) {
-    int sel = uiComboboxSelected(app.profile_box);
+    int sel = app.profile_sel;
     if (sel <= 0 || (size_t)sel > app.profiles.n) {
         uiEntrySetText(app.profile_name, "");
         return;
@@ -2317,9 +2504,38 @@ static void apply_selected_profile(void) {
     uiEntrySetText(app.pass, p->remember_password && p->password ? p->password : "");
 }
 
-static void on_profile_selected(uiCombobox *c, void *data) {
-    (void)c; (void)data;
+/* The selected row of the saved-connections list, or -1. */
+static int saved_selected_row(uiTable *t) {
+    uiTableSelection *sel = uiTableGetSelection(t);
+    if (!sel) return -1;
+    int row = sel->NumRows == 1 ? sel->Rows[0] : -1;
+    uiFreeTableSelection(sel);
+    return row >= 0 && (size_t)row <= app.profiles.n ? row : -1;
+}
+
+static void on_saved_selection(uiTable *t, void *data) {
+    (void)data;
+    if (app.filling_saved) return;
+    int row = saved_selected_row(t);
+    if (row < 0 || row == app.profile_sel) return;
+    app.profile_sel = row;
     apply_selected_profile();
+}
+
+/* Double-click a saved connection: connect with it, when it has what it needs. */
+static void on_saved_double_click(uiTable *t, int row, void *data) {
+    (void)t; (void)data;
+    if (row <= 0 || (size_t)row > app.profiles.n || app.busy) return;
+    if (row != app.profile_sel) {
+        app.profile_sel = row;
+        apply_selected_profile();
+    }
+    if (!app.profiles.items[row - 1].remember_password) {
+        set_status("Type the password for \"%s\", then press Connect.",
+                   app.profiles.items[row - 1].name);
+        return;
+    }
+    on_connect(app.connect_btn, NULL);
 }
 
 static char *trimmed_entry(uiEntry *e) {
@@ -2366,7 +2582,7 @@ static void on_save_profile(uiButton *b, void *data) {
     } else {
         profiles_set_last(&app.profiles, name);
         if (save_profiles_file() == 0) {
-            fill_profile_box(name);
+            fill_saved_list(name);
             uiCheckboxSetChecked(app.remember_pw, p.remember_password);
             set_status("%s connection \"%s\".", existed ? "Updated" : "Saved", name);
         }
@@ -2377,7 +2593,7 @@ static void on_save_profile(uiButton *b, void *data) {
 
 static void on_delete_profile(uiButton *b, void *data) {
     (void)b; (void)data;
-    int sel = uiComboboxSelected(app.profile_box);
+    int sel = app.profile_sel;
     if (sel <= 0 || (size_t)sel > app.profiles.n) {
         set_status("Pick a saved connection to delete.");
         return;
@@ -2392,7 +2608,7 @@ static void on_delete_profile(uiButton *b, void *data) {
 #endif
     profiles_remove(&app.profiles, name);
     if (save_profiles_file() == 0) set_status("Deleted connection \"%s\".", name);
-    fill_profile_box(NULL);
+    fill_saved_list(NULL);
     uiEntrySetText(app.profile_name, "");
     free(name);
 }
@@ -2409,8 +2625,39 @@ static void load_profiles(void) {
     if (app.profiles_file && profiles_load(app.profiles_file, &app.profiles) != 0)
         set_status("Could not read saved connections from %s: %s",
                    app.profiles_file, strerror(errno));
-    fill_profile_box(app.profiles.last);
+    fill_saved_list(app.profiles.last);
     apply_selected_profile();
+}
+
+/* Close the connection and go back to the welcome screen. The editor keeps
+ * its text; the results, table list and structure belonged to the server. */
+static void on_disconnect(uiButton *b, void *data) {
+    (void)b; (void)data;
+    if (app.busy || !app.conn) return; /* the worker may be using it */
+    int had_new_row = app.edit.new_row >= 0;
+    mysql_close(app.conn);
+    app.conn = NULL;
+    free(app.conn_user);
+    free(app.conn_host);
+    app.conn_user = app.conn_host = NULL;
+    app.conn_port = 0;
+
+    clear_results();
+    db_outcome_free(&app.tables_raw);
+    app.tables_loaded = 0;
+    uiButtonSetText(app.load_tables_btn, "Load tables");
+    rebuild_sidebar_keeping(NULL, 0);
+    free(app.browsing);
+    app.browsing = NULL;
+    free(app.pending_browse);
+    app.pending_browse = NULL;
+    free(app.current_db);
+    app.current_db = NULL;
+    structure_message("");
+
+    show_screen();
+    set_status(had_new_row ? "Disconnected - the unsaved new row was discarded."
+                           : "Disconnected.");
 }
 
 #ifdef SQLC_AUTOTEST
@@ -2545,15 +2792,16 @@ static void autotest_next(void) {
             int rc = profiles_load(app.profiles_file, &back);
             profile *p = rc == 0 ? profiles_find(&back, "autotest") : NULL;
             printf("[profiles] saved: %s, db: %s, hide_views: %d, no_auto_rehash: %d, "
-                   "last: %s, dropdown items: %d\n",
+                   "last: %s, list rows: %zu, selected row: %d\n",
                    p ? "yes" : "no", p ? p->database : "-", p ? p->hide_views : -1,
-                   p ? p->no_auto_rehash : -1,
-                   back.last ? back.last : "-", uiComboboxNumItems(app.profile_box));
+                   p ? p->no_auto_rehash : -1, back.last ? back.last : "-",
+                   app.saved_data.nsets ? app.saved_data.sets[0].nrows : 0, app.profile_sel);
             profiles_free(&back);
         }
         on_delete_profile(NULL, NULL);
-        printf("[profiles] after delete: %zu saved, dropdown items: %d\n",
-               app.profiles.n, uiComboboxNumItems(app.profile_box));
+        printf("[profiles] after delete: %zu saved, list rows: %zu, selected row: %d\n",
+               app.profiles.n, app.saved_data.nsets ? app.saved_data.sets[0].nrows : 0,
+               app.profile_sel);
         /* sidebar divider: min width, and the table column follows it */
         sqlc_split_set_position(app.split, 400);
         printf("[sidebar] width 400 -> %d, column %d\n",
@@ -2981,6 +3229,13 @@ static void autotest_next(void) {
         on_run_menu();
         printf("[structure] cmd-return on Structure: busy %d, results page shown %d\n",
                app.busy, uiControlVisible(app.query_split));
+        /* Disconnect: back to the welcome screen, nothing of the server left */
+        on_disconnect(app.disconnect_btn, NULL);
+        printf("[welcome] after disconnect: connected %d, welcome shown %d, layout shown %d, "
+               "sidebar rows %zu, result sets %zu\n",
+               app.conn != NULL, uiControlVisible(app.welcome), uiControlVisible(app.workspace),
+               app.side_data.nsets ? app.side_data.sets[0].nrows : 0, app.shown.nsets);
+        autotest_status("disconnect");
         fflush(stdout);
         if (on_should_quit(NULL)) uiQuit();
         break;
@@ -2990,6 +3245,8 @@ static void autotest_next(void) {
 static void autotest_start(void *data) {
     (void)data;
     const char *db = getenv("SQLC_TEST_DB");
+    printf("[welcome] at launch: welcome shown %d, layout shown %d\n",
+           uiControlVisible(app.welcome), uiControlVisible(app.workspace));
     uiEntrySetText(app.db, db ? db : "");
     on_connect(app.connect_btn, NULL);
 }
@@ -3008,13 +3265,6 @@ static int on_should_quit(void *data) {
 }
 
 /* ---------- layout ---------- */
-
-static uiBox *labeled(const char *label, uiControl *c) {
-    uiBox *b = uiNewVerticalBox();
-    uiBoxAppend(b, uiControl(uiNewLabel(label)), 0);
-    uiBoxAppend(b, c, 0);
-    return b;
-}
 
 static void build_window(void) {
     uiMenu *file = uiNewMenu("File");
@@ -3037,28 +3287,10 @@ static void build_window(void) {
     uiBoxSetPadded(root, 1);
     uiWindowSetChild(app.win, uiControl(root));
 
-    /* saved connections */
-    uiBox *saved = uiNewHorizontalBox();
-    uiBoxSetPadded(saved, 1);
-    app.profile_box = uiNewCombobox();
-    uiComboboxOnSelected(app.profile_box, on_profile_selected, NULL);
-    app.profile_name = uiNewEntry();
-    app.remember_pw = uiNewCheckbox("Remember password");
-    uiCheckboxSetChecked(app.remember_pw, 1);
-    uiButton *save_btn = uiNewButton("Save");
-    uiButtonOnClicked(save_btn, on_save_profile, NULL);
-    uiButton *delete_btn = uiNewButton("Delete");
-    uiButtonOnClicked(delete_btn, on_delete_profile, NULL);
-    uiBoxAppend(saved, uiControl(labeled("Saved connections", uiControl(app.profile_box))), 1);
-    uiBoxAppend(saved, uiControl(labeled("Name", uiControl(app.profile_name))), 1);
-    uiBoxAppend(saved, uiControl(labeled(" ", uiControl(app.remember_pw))), 0);
-    uiBoxAppend(saved, uiControl(labeled(" ", uiControl(save_btn))), 0);
-    uiBoxAppend(saved, uiControl(labeled(" ", uiControl(delete_btn))), 0);
-    uiBoxAppend(root, uiControl(saved), 0);
+    /* ----- welcome screen: saved connections | new connection form ----- */
+    app.saved_box = uiNewVerticalBox(); /* fill_saved_list puts the list in it */
 
-    /* connection bar */
-    uiBox *bar = uiNewHorizontalBox();
-    uiBoxSetPadded(bar, 1);
+    app.profile_name = uiNewEntry();
     app.host = uiNewEntry();  uiEntrySetText(app.host, "localhost");
     app.port = uiNewEntry();  uiEntrySetText(app.port, "3306");
     app.user = uiNewEntry();
@@ -3066,28 +3298,82 @@ static void build_window(void) {
     app.db   = uiNewEntry();
     const char *login = getenv("USER");
     if (login) uiEntrySetText(app.user, login);
-    app.connect_btn = uiNewButton("Connect");
-    uiButtonOnClicked(app.connect_btn, on_connect, NULL);
-    /* connection options, settable before connecting (saved with profiles) */
+    app.remember_pw = uiNewCheckbox("Remember password");
+    uiCheckboxSetChecked(app.remember_pw, 1);
+    /* connection options, set before connecting (saved with profiles) */
     app.hide_views = uiNewCheckbox("Hide views");
     uiCheckboxOnToggled(app.hide_views, on_hide_views, NULL);
     app.no_rehash = uiNewCheckbox("No auto-rehash (-A)");
     app.tables_once = uiNewCheckbox("Tables only, load once");
     uiCheckboxOnToggled(app.tables_once, on_tables_once, NULL);
 
-    uiBoxAppend(bar, uiControl(labeled("Host", uiControl(app.host))), 1);
-    uiBoxAppend(bar, uiControl(labeled("Port", uiControl(app.port))), 0);
-    uiBoxAppend(bar, uiControl(labeled("User", uiControl(app.user))), 1);
-    uiBoxAppend(bar, uiControl(labeled("Password", uiControl(app.pass))), 1);
-    uiBoxAppend(bar, uiControl(labeled("Database", uiControl(app.db))), 1);
-    uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.hide_views))), 0);
-    uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.no_rehash))), 0);
-    uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.tables_once))), 0);
-    /* small, at the right edge, level with the fields */
-    sqlc_button_set_small(app.connect_btn);
-    uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.connect_btn))), 0);
-    uiBoxAppend(root, uiControl(bar), 0);
-    uiBoxAppend(root, uiControl(uiNewHorizontalSeparator()), 0);
+    uiForm *form = uiNewForm();
+    uiFormSetPadded(form, 1);
+    uiFormAppend(form, "Name", uiControl(app.profile_name), 0);
+    uiFormAppend(form, "Host", uiControl(app.host), 0);
+    uiFormAppend(form, "Port", uiControl(app.port), 0);
+    uiFormAppend(form, "User", uiControl(app.user), 0);
+    uiFormAppend(form, "Password", uiControl(app.pass), 0);
+    uiFormAppend(form, "Database", uiControl(app.db), 0);
+    uiFormAppend(form, "", uiControl(app.remember_pw), 0);
+    uiFormAppend(form, "", uiControl(app.hide_views), 0);
+    uiFormAppend(form, "", uiControl(app.no_rehash), 0);
+    uiFormAppend(form, "", uiControl(app.tables_once), 0);
+
+    uiBox *form_buttons = uiNewHorizontalBox();
+    uiBoxSetPadded(form_buttons, 1);
+    uiButton *save_btn = uiNewButton("Save");
+    uiButtonOnClicked(save_btn, on_save_profile, NULL);
+    uiButton *delete_btn = uiNewButton("Delete");
+    uiButtonOnClicked(delete_btn, on_delete_profile, NULL);
+    app.connect_btn = uiNewButton("Connect");
+    uiButtonOnClicked(app.connect_btn, on_connect, NULL);
+    uiBoxAppend(form_buttons, uiControl(save_btn), 0);
+    uiBoxAppend(form_buttons, uiControl(delete_btn), 0);
+    uiBoxAppend(form_buttons, uiControl(uiNewHorizontalBox()), 1); /* pushes Connect right */
+    uiBoxAppend(form_buttons, uiControl(app.connect_btn), 0);
+
+    /* the form in the middle: empty stretchy boxes around it */
+    uiBox *form_col = uiNewVerticalBox();
+    uiBoxSetPadded(form_col, 1);
+    uiBoxAppend(form_col, uiControl(uiNewVerticalBox()), 1);
+    uiBoxAppend(form_col, uiControl(uiNewLabel("Connect to a MySQL or MariaDB server")), 0);
+    uiBoxAppend(form_col, uiControl(form), 0);
+    uiBoxAppend(form_col, uiControl(form_buttons), 0);
+    /* spinner + tip while connecting; takes its space all the time, so the
+     * form doesn't move when it starts */
+    app.loading = sqlc_new_loading();
+    uiBoxAppend(form_col, app.loading, 0);
+    uiBoxAppend(form_col, uiControl(uiNewVerticalBox()), 1);
+    app.form_col = uiControl(form_col);
+    uiBox *center = uiNewHorizontalBox();
+    uiBoxAppend(center, uiControl(uiNewHorizontalBox()), 1);
+    uiBoxAppend(center, uiControl(form_col), 1);
+    uiBoxAppend(center, uiControl(uiNewHorizontalBox()), 1);
+
+    app.welcome = sqlc_new_sidebar_split(uiControl(app.saved_box), uiControl(center),
+                                         240, 160, "WelcomeListWidth");
+    uiBoxAppend(root, app.welcome, 1);
+
+    /* ----- full layout, once connected ----- */
+    uiBox *workspace = uiNewVerticalBox();
+    uiBoxSetPadded(workspace, 1);
+
+    /* connected bar: where we are, Hide views (it filters the live sidebar),
+     * Disconnect */
+    uiBox *bar = uiNewHorizontalBox();
+    uiBoxSetPadded(bar, 1);
+    app.conn_label = uiNewLabel("");
+    app.hide_views_bar = uiNewCheckbox("Hide views");
+    uiCheckboxOnToggled(app.hide_views_bar, on_hide_views_bar, NULL);
+    app.disconnect_btn = uiNewButton("Disconnect");
+    uiButtonOnClicked(app.disconnect_btn, on_disconnect, NULL);
+    sqlc_button_set_small(app.disconnect_btn);
+    uiBoxAppend(bar, uiControl(app.conn_label), 1);
+    uiBoxAppend(bar, uiControl(app.hide_views_bar), 0);
+    uiBoxAppend(bar, uiControl(app.disconnect_btn), 0);
+    uiBoxAppend(workspace, uiControl(bar), 0);
+    uiBoxAppend(workspace, uiControl(uiNewHorizontalSeparator()), 0);
 
     /* main area: sidebar | editor + results, with a draggable divider */
     app.side_box = uiNewVerticalBox();
@@ -3098,6 +3384,11 @@ static void build_window(void) {
     app.export_btn = uiNewButton("Export\xE2\x80\xA6");
     uiButtonOnClicked(app.export_btn, on_export, NULL);
     uiBoxAppend(app.side_box, uiControl(app.export_btn), 0);
+    /* spinner + tip while the list loads; before the list, which
+     * rebuild_sidebar_keeping replaces as the box's last child */
+    app.side_loading = sqlc_new_loading();
+    uiControlHide(app.side_loading);
+    uiBoxAppend(app.side_box, app.side_loading, 0);
 
     /* right side: a slim bar with the Normal | AI | Structure switch at its
      * right edge, above one page at a time */
@@ -3114,7 +3405,9 @@ static void build_window(void) {
 
     app.split = sqlc_new_sidebar_split(uiControl(app.side_box), uiControl(main_box),
                                        220, 120, "SidebarWidth");
-    uiBoxAppend(root, app.split, 1);
+    uiBoxAppend(workspace, app.split, 1);
+    app.workspace = uiControl(workspace);
+    uiBoxAppend(root, app.workspace, 1); /* shown until main() has laid it out */
 
     /* Normal / AI page: the query pane above, results below, with a draggable
      * divider. The query pane has two views in the same space, one shown at
@@ -3199,8 +3492,15 @@ static void build_window(void) {
     uiBoxAppend(root, uiControl(app.status), 0);
 
     app.edit.new_row = -1;
+    app.last_tip = SIZE_MAX; /* no tip shown yet */
     rebuild_sidebar();
     load_profiles();
+    /* Lay out the full layout once while the window is still off screen, so
+     * its splits place their dividers (restoring the saved sizes) before
+     * anything is drawn, then switch to the welcome screen. */
+    uiControlHide(app.welcome);
+    sqlc_window_layout_now(app.win, 0);
+    show_screen();
 }
 
 int main(void) {
@@ -3241,6 +3541,10 @@ int main(void) {
         free_set_model(app.st.cols_model);
         free_set_model(app.st.idx_model);
         db_outcome_free(&app.st.data);
+        free_set_model(app.saved_model);
+        db_outcome_free(&app.saved_data);
+        free(app.conn_user);
+        free(app.conn_host);
         profiles_free(&app.profiles);
         free(app.profiles_file);
         if (app.conn) mysql_close(app.conn);
