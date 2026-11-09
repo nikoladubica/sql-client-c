@@ -9,6 +9,7 @@
 #include "table_menu.h"
 
 static NSString *const titles[TABLE_MENU_COUNT] = {
+    @"Show Structure",
     @"Copy Table Name",
     @"Rename Table…",
     @"Truncate Table…",

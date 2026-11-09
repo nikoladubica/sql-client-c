@@ -16,6 +16,7 @@ static char *dup_or_empty(const char *s) { return strdup(s ? s : ""); }
 
 static void profile_clear(profile *p) {
     free(p->name); free(p->host); free(p->user); free(p->database);
+    if (p->password) { memset(p->password, 0, strlen(p->password)); free(p->password); }
     memset(p, 0, sizeof *p);
 }
 
@@ -25,30 +26,33 @@ static int profile_copy(profile *dst, const profile *src) {
     dst->host = dup_or_empty(src->host);
     dst->user = dup_or_empty(src->user);
     dst->database = dup_or_empty(src->database);
+    dst->password = dup_or_empty(src->remember_password ? src->password : NULL);
     dst->port = src->port;
     dst->remember_password = src->remember_password;
     dst->hide_views = src->hide_views;
     dst->no_auto_rehash = src->no_auto_rehash;
     dst->tables_once = src->tables_once;
-    if (!dst->name || !dst->host || !dst->user || !dst->database) {
+    if (!dst->name || !dst->host || !dst->user || !dst->database || !dst->password) {
         profile_clear(dst);
         return -1;
     }
     return 0;
 }
 
-char *profiles_path(void) {
+char *config_path(const char *file) {
     const char *dir = getenv("SQLC_CONFIG_DIR");
     char buf[4096];
     if (dir && *dir) {
-        snprintf(buf, sizeof buf, "%s/connections", dir);
+        snprintf(buf, sizeof buf, "%s/%s", dir, file);
     } else {
         const char *home = getenv("HOME");
         if (!home || !*home) { errno = ENOENT; return NULL; }
-        snprintf(buf, sizeof buf, "%s/Library/Application Support/sqlc/connections", home);
+        snprintf(buf, sizeof buf, "%s/Library/Application Support/sqlc/%s", home, file);
     }
     return strdup(buf);
 }
+
+char *profiles_path(void) { return config_path("connections"); }
 
 int profile_name_valid(const char *name) {
     if (!name || !*name) return 0;
@@ -150,7 +154,8 @@ int profiles_load(const char *path, profile_list *out) {
     size_t cap = 0;
     while (rc == 0 && getline(&line, &cap, f) != -1) {
         line[strcspn(line, "\r\n")] = '\0';
-        char *s = trim(line);
+        char *s = line; /* leading space only: a password may end in spaces */
+        while (isspace((unsigned char)*s)) s++;
         if (!*s || *s == '#' || *s == ';') continue;
 
         if (*s == '[') {
@@ -168,7 +173,12 @@ int profiles_load(const char *path, profile_list *out) {
         char *eq = strchr(s, '=');
         if (!eq) continue;
         *eq = '\0';
-        const char *key = trim(s), *val = eq + 1; /* value kept verbatim */
+        const char *key = trim(s);
+        if (strcmp(key, "password") == 0) { /* verbatim, spaces and all */
+            if (have) rc = set_str(&cur.password, eq + 1);
+            continue;
+        }
+        const char *val = trim(eq + 1);
 
         if (!have) {
             if (strcmp(key, "last") == 0) rc = profiles_set_last(out, trim(eq + 1));
@@ -230,7 +240,8 @@ static int mkdir_parents(const char *path) {
     return 0;
 }
 
-int profiles_save(const char *path, const profile_list *pl) {
+/* Write a 0600 file atomically: fill(f, data) writes the contents. */
+static int write_private(const char *path, void (*fill)(FILE *, const void *), const void *data) {
     if (mkdir_parents(path) != 0) return -1;
 
     char tmp[4096];
@@ -243,20 +254,7 @@ int profiles_save(const char *path, const profile_list *pl) {
     FILE *f = fdopen(fd, "w");
     if (!f) { close(fd); unlink(tmp); return -1; }
 
-    fprintf(f, "# sqlc saved connections. Passwords are kept in the macOS Keychain.\n");
-    if (pl->last) put_value(f, "last", pl->last);
-    for (size_t i = 0; i < pl->n; i++) {
-        const profile *p = &pl->items[i];
-        fprintf(f, "\n[%s]\n", p->name);
-        put_value(f, "host", p->host);
-        fprintf(f, "port=%u\n", p->port ? p->port : 3306);
-        put_value(f, "user", p->user);
-        put_value(f, "database", p->database);
-        fprintf(f, "remember_password=%d\n", p->remember_password ? 1 : 0);
-        fprintf(f, "hide_views=%d\n", p->hide_views ? 1 : 0);
-        fprintf(f, "no_auto_rehash=%d\n", p->no_auto_rehash ? 1 : 0);
-        fprintf(f, "tables_once=%d\n", p->tables_once ? 1 : 0);
-    }
+    fill(f, data);
 
     int err = ferror(f) || fflush(f) != 0 || fsync(fd) != 0;
     int saved = errno;
@@ -268,4 +266,57 @@ int profiles_save(const char *path, const profile_list *pl) {
         return -1;
     }
     return 0;
+}
+
+static void fill_profiles(FILE *f, const void *data) {
+    const profile_list *pl = data;
+    fprintf(f, "# sqlc saved connections (remembered passwords included; keep this file private).\n");
+    if (pl->last) put_value(f, "last", pl->last);
+    for (size_t i = 0; i < pl->n; i++) {
+        const profile *p = &pl->items[i];
+        fprintf(f, "\n[%s]\n", p->name);
+        put_value(f, "host", p->host);
+        fprintf(f, "port=%u\n", p->port ? p->port : 3306);
+        put_value(f, "user", p->user);
+        put_value(f, "database", p->database);
+        fprintf(f, "remember_password=%d\n", p->remember_password ? 1 : 0);
+        if (p->remember_password && p->password && *p->password)
+            put_value(f, "password", p->password);
+        fprintf(f, "hide_views=%d\n", p->hide_views ? 1 : 0);
+        fprintf(f, "no_auto_rehash=%d\n", p->no_auto_rehash ? 1 : 0);
+        fprintf(f, "tables_once=%d\n", p->tables_once ? 1 : 0);
+    }
+}
+
+int profiles_save(const char *path, const profile_list *pl) {
+    return write_private(path, fill_profiles, pl);
+}
+
+/* ---------- single secrets ---------- */
+
+static void fill_secret(FILE *f, const void *data) {
+    for (const char *v = data; v && *v; v++)
+        if (*v != '\n' && *v != '\r') fputc(*v, f);
+    fputc('\n', f);
+}
+
+int secret_write(const char *path, const char *value) {
+    return write_private(path, fill_secret, value);
+}
+
+char *secret_read(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n = getline(&line, &cap, f);
+    fclose(f);
+    if (n <= 0) { free(line); return NULL; }
+    line[strcspn(line, "\r\n")] = '\0';
+    if (!*line) { free(line); return NULL; }
+    return line;
+}
+
+int secret_remove(const char *path) {
+    return unlink(path) == 0 || errno == ENOENT ? 0 : -1;
 }
