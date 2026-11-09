@@ -33,7 +33,6 @@
 #include "ai.h"
 #include "ai_db.h"
 #include "db.h"
-#include "keychain.h"
 #include "macos_menu.h"
 #include "splitview.h"
 #include "export.h"
@@ -45,6 +44,7 @@
 #include "profiles.h"
 
 #define GUI_MAX_ROWS 10000 /* rows kept per result set in the grid */
+#define AI_KEY_FILE "claude-api-key" /* in the config folder, mode 0600 */
 #define AI_SCHEMA_BYTES (200u * 1024) /* schema text sent to Claude, at most about */
 
 /* ---------- table models backed by a db_set ---------- */
@@ -1165,8 +1165,8 @@ static void on_run(uiButton *b, void *data) {
 /* ---------- Ask Claude ---------- */
 
 static const char AI_KEY_MESSAGE[] =
-    "Paste your Anthropic API key (from console.anthropic.com). It is stored in your "
-    "login Keychain.\n\n"
+    "Paste your Anthropic API key (from console.anthropic.com). It is saved in "
+    "sqlc's settings folder (~/Library/Application Support/sqlc), readable only by you.\n\n"
     "When you ask Claude, sqlc sends your request, the server version and the current "
     "database's table and column names, types and keys to the Claude API. Row data is "
     "never sent.";
@@ -1181,19 +1181,25 @@ static char *prompt_api_key(void) {
     while (e > p && isspace((unsigned char)e[-1])) *--e = '\0';
     if (!*p) { free(key); return NULL; }
     memmove(key, p, strlen(p) + 1);
-    char err[256];
-    if (keychain_set_item(KEYCHAIN_AI_SERVICE, KEYCHAIN_AI_ACCOUNT, key, err, sizeof err) != 0)
+    char *path = config_path(AI_KEY_FILE);
+    if (!path || secret_write(path, key) != 0) {
+        char err[600];
+        snprintf(err, sizeof err, "Could not write %s: %s", path ? path : "(no config path)",
+                 strerror(errno));
         show_error("Could not save the API key", err); /* still usable this time */
-    else
-        set_status("Claude API key saved in the Keychain.");
+    } else {
+        set_status("Claude API key saved in %s.", path);
+    }
+    free(path);
     return key;
 }
 
-/* The Keychain key, else $ANTHROPIC_API_KEY, else ask for one. */
+/* The saved key, else $ANTHROPIC_API_KEY, else ask for one. */
 static char *api_key(void) {
-    char *key = keychain_get_item(KEYCHAIN_AI_SERVICE, KEYCHAIN_AI_ACCOUNT);
-    if (key && *key) return key;
-    free(key);
+    char *path = config_path(AI_KEY_FILE);
+    char *key = path ? secret_read(path) : NULL;
+    free(path);
+    if (key) return key;
     const char *env = getenv("ANTHROPIC_API_KEY");
     if (env && *env) return strdup(env);
     return prompt_api_key();
@@ -1207,8 +1213,10 @@ static void on_set_api_key(uiMenuItem *m, uiWindow *w, void *data) {
 
 static void on_remove_api_key(uiMenuItem *m, uiWindow *w, void *data) {
     (void)m; (void)w; (void)data;
-    keychain_delete_item(KEYCHAIN_AI_SERVICE, KEYCHAIN_AI_ACCOUNT);
-    set_status("Claude API key removed from the Keychain.");
+    char *path = config_path(AI_KEY_FILE);
+    if (path && secret_remove(path) == 0) set_status("Claude API key removed.");
+    else set_status("Could not remove the Claude API key: %s", strerror(errno));
+    free(path);
 }
 
 static void on_ask_claude(uiButton *b, void *data) {
@@ -2013,9 +2021,7 @@ static void apply_selected_profile(void) {
     sync_tables_once(0);
     rebuild_sidebar();
 
-    char *pw = p->remember_password ? keychain_get(p->name) : NULL;
-    uiEntrySetText(app.pass, pw ? pw : "");
-    if (pw) { memset(pw, 0, strlen(pw)); free(pw); }
+    uiEntrySetText(app.pass, p->remember_password && p->password ? p->password : "");
 }
 
 static void on_profile_selected(uiCombobox *c, void *data) {
@@ -2059,23 +2065,8 @@ static void on_save_profile(uiButton *b, void *data) {
         .no_auto_rehash = uiCheckboxChecked(app.no_rehash),
         .tables_once = uiCheckboxChecked(app.tables_once),
     };
+    p.password = p.remember_password ? entry_dup(app.pass) : NULL;
     int existed = profiles_find(&app.profiles, name) != NULL;
-
-    if (p.remember_password) {
-        char *pw = entry_dup(app.pass);
-        char err[512] = "";
-        if (pw && keychain_set(name, pw, err, sizeof err) != 0) {
-            char msg[700];
-            snprintf(msg, sizeof msg,
-                     "The password could not be stored in the Keychain (%s). "
-                     "The connection is saved without it.", err);
-            uiMsgBoxError(app.win, "Keychain", msg);
-            p.remember_password = 0;
-        }
-        if (pw) { memset(pw, 0, strlen(pw)); free(pw); }
-    } else {
-        keychain_delete(name);
-    }
 
     if (profiles_put(&app.profiles, &p) < 0) {
         set_status("Out of memory");
@@ -2088,6 +2079,7 @@ static void on_save_profile(uiButton *b, void *data) {
         }
     }
     free(p.name); free(p.host); free(p.user); free(p.database);
+    if (p.password) { memset(p.password, 0, strlen(p.password)); free(p.password); }
 }
 
 static void on_delete_profile(uiButton *b, void *data) {
@@ -2101,11 +2093,10 @@ static void on_delete_profile(uiButton *b, void *data) {
     if (!name) return;
     char msg[300];
     snprintf(msg, sizeof msg, "Delete the saved connection \"%s\"? "
-             "Its saved password is removed from the Keychain too.", name);
+             "Its saved password is deleted too.", name);
 #ifndef SQLC_AUTOTEST
     if (!sqlc_confirm("Delete saved connection?", msg, "Delete")) { free(name); return; }
 #endif
-    keychain_delete(name);
     profiles_remove(&app.profiles, name);
     if (save_profiles_file() == 0) set_status("Deleted connection \"%s\".", name);
     fill_profile_box(NULL);
@@ -2726,6 +2717,8 @@ static void build_window(void) {
     uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.hide_views))), 0);
     uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.no_rehash))), 0);
     uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.tables_once))), 0);
+    /* small, at the right edge, level with the fields */
+    sqlc_button_set_small(app.connect_btn);
     uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.connect_btn))), 0);
     uiBoxAppend(root, uiControl(bar), 0);
     uiBoxAppend(root, uiControl(uiNewHorizontalSeparator()), 0);

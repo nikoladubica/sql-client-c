@@ -14,7 +14,7 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
   set before connecting: **Hide views**, **No auto-rehash (-A)** and
   **Tables only, load once**
 - **Saved connections**: save the connection fields under a name and pick it
-  from a dropdown next time (passwords go in the macOS Keychain)
+  from a dropdown next time (remembered passwords are saved with them)
 - SQL editor with **Run** (button or ⌘↩); several statements at once
 - **Ask Claude**: describe the query you need in plain language and Claude
   writes the SQL into the editor, with an explanation as `--` comments, for you
@@ -100,10 +100,10 @@ the selected one.
 
 Connections are stored in `~/Library/Application Support/sqlc/connections`
 (mode `0600`; override the folder with `SQLC_CONFIG_DIR`). With
-**Remember password** ticked, the password is stored in your login Keychain
-(service `sqlc`), never in that file. The first time an item is read, macOS may
-ask whether `sqlc-gui` may use it (and again after a rebuild, since the binary
-changes).
+**Remember password** ticked, the password is saved in that file too, in plain
+text: only your user account can read it, but anyone with access to your
+account (or a backup of that folder) can. Leave it unticked for connections
+whose password you'd rather type each time.
 
 ### Ask Claude (AI query assistant)
 
@@ -114,10 +114,10 @@ explanation as `--` comments, then the SQL. **Nothing runs until you press Run**
 so read it first and edit it if needed.
 
 - **API key**: the first time, sqlc asks for an
-  [Anthropic API key](https://console.anthropic.com/) and stores it in your login
-  Keychain (service `sqlc-ai`). Change or remove it under **AI › Set Claude API
-  Key…** / **AI › Remove Claude API Key**. If no key is in the Keychain,
-  `ANTHROPIC_API_KEY` from the environment is used.
+  [Anthropic API key](https://console.anthropic.com/) and saves it in
+  `~/Library/Application Support/sqlc/claude-api-key` (mode `0600`). Change or
+  remove it under **AI › Set Claude API Key…** / **AI › Remove Claude API Key**.
+  If no key is saved, `ANTHROPIC_API_KEY` from the environment is used.
 - **What is sent**: your request, the server version, the current database's
   name, and its schema: table and view names, column names and types,
   NULL-ability, keys and foreign keys. **Row data is never sent.** Very large
