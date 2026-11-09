@@ -24,6 +24,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <time.h>
 
 #include <ui.h>
@@ -362,14 +363,17 @@ static void show_outcome(db_outcome *out, const db_outcome *meta) {
 static void on_table_double_click(uiTable *t, int row, void *data);
 static void on_side_selection(uiTable *t, void *data);
 static const char *selected_table(int *is_view_out);
+static size_t selected_count(void);
+static int selected_tables(char ***names_out, size_t *n_out);
+static void free_names(char **names, size_t n);
 static unsigned on_table_menu_open(int row, void *data);
 static void on_table_menu_action(table_menu_item item, int row, void *data);
 
 static int is_view(const char *type) { return type && strstr(type, "VIEW") != NULL; }
 
 /* Rebuild the visible table list from tables_raw and the "Hide views" box,
- * selecting the table named keep (if it's in the list). */
-static void rebuild_sidebar_keeping(const char *keep) {
+ * selecting the nkeep tables named in keep (those still in the list). */
+static void rebuild_sidebar_keeping(char *const *keep, size_t nkeep) {
     if (app.side_table) {
         uiBoxDelete(app.side_box, uiBoxNumChildren(app.side_box) - 1);
         uiControlDestroy(uiControl(app.side_table));
@@ -382,7 +386,6 @@ static void rebuild_sidebar_keeping(const char *keep) {
     app.side_index = NULL;
 
     int hide = uiCheckboxChecked(app.hide_views);
-    int keep_row = -1;
     const db_set *raw = app.tables_raw.nsets ? &app.tables_raw.sets[0] : NULL;
     size_t n = raw ? raw->nrows : 0;
 
@@ -403,7 +406,6 @@ static void rebuild_sidebar_keeping(const char *keep) {
         char buf[512];
         snprintf(buf, sizeof buf, is_view(type) ? "%s  (view)" : "%s", name);
         s->cells[s->nrows] = strdup(buf);
-        if (keep && strcmp(keep, name) == 0) keep_row = (int)s->nrows;
         app.side_index[s->nrows] = r;
         s->nrows++;
     }
@@ -412,23 +414,43 @@ static void rebuild_sidebar_keeping(const char *keep) {
 
     app.side_model = new_set_model(s);
     app.side_table = new_grid(app.side_model);
+    /* Shift-click selects a range, Command-click adds or removes a row */
+    uiTableSetSelectionMode(app.side_table, uiTableSelectionModeZeroOrMany);
     sqlc_table_fill_width(app.side_table); /* column follows the sidebar width */
     uiTableOnRowDoubleClicked(app.side_table, on_table_double_click, NULL);
     uiTableOnSelectionChanged(app.side_table, on_side_selection, NULL);
     sqlc_table_set_context_menu(app.side_table, on_table_menu_open, on_table_menu_action, NULL);
     uiBoxAppend(app.side_box, uiControl(app.side_table), 1);
-    if (keep_row >= 0) {
-        uiTableSelection sel = { .NumRows = 1, .Rows = &keep_row };
-        uiTableSetSelection(app.side_table, &sel);
+    if (nkeep == 0 || s->nrows == 0 || s->nrows > (size_t)INT_MAX) return;
+
+    /* the visible rows whose table is in keep */
+    const char **names = calloc(s->nrows, sizeof *names);
+    unsigned char *kept = calloc(s->nrows, 1);
+    int *rows = calloc(s->nrows, sizeof *rows);
+    if (names && kept && rows) {
+        for (size_t v = 0; v < s->nrows; v++) names[v] = db_cell(raw, app.side_index[v], 0);
+        if (export_select_names(s->nrows, names, nkeep, (const char *const *)keep, kept, NULL) >= 0) {
+            int nrows = 0;
+            for (size_t v = 0; v < s->nrows; v++)
+                if (kept[v]) rows[nrows++] = (int)v;
+            if (nrows) {
+                uiTableSelection sel = { .NumRows = nrows, .Rows = rows };
+                uiTableSetSelection(app.side_table, &sel);
+            }
+        }
     }
+    free(rows);
+    free(kept);
+    free(names);
 }
 
 /* The same, keeping the current selection (tables_raw must be unchanged). */
 static void rebuild_sidebar(void) {
-    const char *was = selected_table(NULL);
-    char *keep = was ? strdup(was) : NULL;
-    rebuild_sidebar_keeping(keep);
-    free(keep);
+    char **keep = NULL;
+    size_t nkeep = 0;
+    if (selected_tables(&keep, &nkeep) != 0) nkeep = 0; /* out of memory: drop it */
+    rebuild_sidebar_keeping(keep, nkeep);
+    free_names(keep, nkeep);
 }
 
 /* ---------- worker thread ---------- */
@@ -462,6 +484,8 @@ typedef struct {
     export_opts xopts;
     unsigned long long rows;
     export_db_stats db_stats; /* JOB_EXPORT_DB */
+    char **names;             /* ... only these tables/views (malloc'd), if nnames */
+    size_t nnames;
     /* JOB_AI */
     char *task, *api_key;
     ai_result ai;
@@ -495,6 +519,7 @@ static void job_free(job *j) {
     free(j->table);
     free(j->path);
     free(j->new_name);
+    free_names(j->names, j->nnames);
     free(j->task);
     if (j->api_key) { memset(j->api_key, 0, strlen(j->api_key)); free(j->api_key); }
     ai_result_free(&j->ai);
@@ -640,6 +665,7 @@ static void export_progress(unsigned long long rows, void *data) {
 /* Database export progress: same hop, with the table being written. */
 typedef struct {
     char *table;
+    const char *what;         /* "database" or "tables" (static strings) */
     size_t index, count;
     unsigned long long rows;
 } db_export_progress;
@@ -647,19 +673,19 @@ typedef struct {
 static void show_db_export_progress(void *data) {
     db_export_progress *p = data;
     if (app.busy)
-        set_status("Exporting database... %s (%zu of %zu), %llu rows",
-                   p->table, p->index, p->count, p->rows);
+        set_status("Exporting %s... %s (%zu of %zu), %llu rows",
+                   p->what, p->table, p->index, p->count, p->rows);
     free(p->table);
     free(p);
 }
 
 static void db_export_progress_cb(const char *table, size_t index, size_t count,
                                   unsigned long long rows, void *data) {
-    (void)data;
     db_export_progress *p = malloc(sizeof *p);
     if (!p) return;
     p->table = strdup(table ? table : "");
     if (!p->table) { free(p); return; }
+    p->what = data ? (const char *)data : "database"; /* a string literal */
     p->index = index;
     p->count = count;
     p->rows = rows;
@@ -704,8 +730,13 @@ static void *worker(void *data) {
         j->ok = export_table(j->conn, j->table, j->is_view, j->fmt, &j->xopts, j->path,
                              export_progress, NULL, &j->rows, &j->error) == 0;
     } else if (j->kind == JOB_EXPORT_DB) {
-        j->ok = export_database(j->conn, &j->xopts, j->path, db_export_progress_cb, NULL,
-                                &j->db_stats, &j->error) == 0;
+        if (j->nnames)
+            j->ok = export_tables(j->conn, (const char *const *)j->names, j->nnames, &j->xopts,
+                                  j->path, db_export_progress_cb, (void *)"tables",
+                                  &j->db_stats, &j->error) == 0;
+        else
+            j->ok = export_database(j->conn, &j->xopts, j->path, db_export_progress_cb, NULL,
+                                    &j->db_stats, &j->error) == 0;
     } else {
         j->ok = 1; /* JOB_TABLES: just the refresh below */
     }
@@ -852,6 +883,13 @@ static void start_structure(const char *table) {
 static void structure_sync(void) {
     if (app.mode != MODE_STRUCTURE) return;
     if (!app.conn) { structure_message("Not connected."); return; }
+    size_t nsel = selected_count();
+    if (nsel > 1) {
+        char msg[128];
+        snprintf(msg, sizeof msg, "%zu tables selected - select one to see its structure.", nsel);
+        structure_message(msg);
+        return;
+    }
     const char *name = selected_table(NULL);
     if (!name) {
         if (!app.st.table)
@@ -979,13 +1017,17 @@ static void job_done(void *data) {
 
     /* The sidebar's selection, to keep when its list is replaced below
      * (following a rename). Not across connections. */
-    char *keep = NULL;
+    char **keep = NULL;
+    size_t nkeep = 0;
     if (j->load_tables && j->kind != JOB_CONNECT) {
-        const char *sel = selected_table(NULL);
-        if (sel && j->kind == JOB_ALTER && j->ok && j->alter == ALTER_RENAME &&
-            strcmp(sel, j->table) == 0)
-            sel = j->new_name;
-        keep = sel ? strdup(sel) : NULL;
+        if (selected_tables(&keep, &nkeep) != 0) nkeep = 0;
+        if (j->kind == JOB_ALTER && j->ok && j->alter == ALTER_RENAME) {
+            for (size_t i = 0; i < nkeep; i++) {
+                if (strcmp(keep[i], j->table) != 0) continue;
+                char *renamed = strdup(j->new_name);
+                if (renamed) { free(keep[i]); keep[i] = renamed; }
+            }
+        }
     }
 
     if (j->kind == JOB_CONNECT) {
@@ -1048,15 +1090,24 @@ static void job_done(void *data) {
         }
     } else if (j->kind == JOB_EXPORT_DB) {
         const export_db_stats *st = &j->db_stats;
-        if (j->ok) {
+        if (j->ok && j->nnames) {
+            set_status("Exported %zu selected table%s from %s: %zu table%s, %zu view%s, %llu row%s "
+                       "to %s (%.2f s)%s",
+                       j->nnames, j->nnames == 1 ? "" : "s",
+                       j->table, st->tables, st->tables == 1 ? "" : "s",
+                       st->views, st->views == 1 ? "" : "s",
+                       st->rows, st->rows == 1 ? "" : "s", j->path, j->seconds,
+                       st->skipped ? " - some objects skipped, see the file" : "");
+        } else if (j->ok) {
             set_status("Exported database %s: %zu table%s, %zu view%s, %llu row%s to %s (%.2f s)%s",
                        j->table, st->tables, st->tables == 1 ? "" : "s",
                        st->views, st->views == 1 ? "" : "s",
                        st->rows, st->rows == 1 ? "" : "s", j->path, j->seconds,
                        st->skipped ? " - some objects skipped, see the file" : "");
         } else {
-            set_status("Database export failed: %s", j->error ? j->error : "unknown error");
-            show_error("Database export failed", j->error ? j->error : "");
+            const char *title = j->nnames ? "Export failed" : "Database export failed";
+            set_status("%s: %s", title, j->error ? j->error : "unknown error");
+            show_error(title, j->error ? j->error : "");
         }
     } else if (j->kind == JOB_TABLES) {
         const db_set *t = j->tables.nsets ? &j->tables.sets[0] : NULL;
@@ -1106,8 +1157,8 @@ static void job_done(void *data) {
     }
     uiButtonSetText(app.load_tables_btn, app.tables_loaded ? "Refresh tables" : "Load tables");
     /* Only when the list changed, so the selection survives e.g. an export. */
-    if (j->kind == JOB_CONNECT || j->load_tables) rebuild_sidebar_keeping(keep);
-    free(keep);
+    if (j->kind == JOB_CONNECT || j->load_tables) rebuild_sidebar_keeping(keep, nkeep);
+    free_names(keep, nkeep);
 
     job_free(j);
     /* a double-click that came while the structure was loading */
@@ -1388,13 +1439,59 @@ static void start_export(const char *table, int is_view, export_format fmt,
 
 static const char *table_at_row(int row, int *is_view_out);
 
-/* The table selected in the sidebar, or NULL (pointer into tables_raw). */
+/* The table selected in the sidebar when exactly one row is selected, else
+ * NULL (pointer into tables_raw). */
 static const char *selected_table(int *is_view_out) {
     if (!app.side_table || !app.side_data.nsets) return NULL;
     uiTableSelection *sel = uiTableGetSelection(app.side_table);
-    int row = sel && sel->NumRows > 0 ? sel->Rows[0] : -1;
+    int row = sel && sel->NumRows == 1 ? sel->Rows[0] : -1;
     uiFreeTableSelection(sel);
     return table_at_row(row, is_view_out);
+}
+
+/* How many sidebar rows are selected. */
+static size_t selected_count(void) {
+    if (!app.side_table || !app.side_data.nsets) return 0;
+    uiTableSelection *sel = uiTableGetSelection(app.side_table);
+    size_t n = sel && sel->NumRows > 0 ? (size_t)sel->NumRows : 0;
+    uiFreeTableSelection(sel);
+    return n;
+}
+
+static void free_names(char **names, size_t n) {
+    for (size_t i = 0; names && i < n; i++) free(names[i]);
+    free(names);
+}
+
+/* Copies of the names of every selected sidebar table, in list order:
+ * *names_out (malloc'd array of malloc'd strings, free with free_names) and
+ * *n_out, NULL and 0 when nothing is selected. Returns 0, or -1 if out of
+ * memory (nothing to free then). */
+static int selected_tables(char ***names_out, size_t *n_out) {
+    *names_out = NULL;
+    *n_out = 0;
+    if (!app.side_table || !app.side_data.nsets) return 0;
+    uiTableSelection *sel = uiTableGetSelection(app.side_table);
+    if (!sel) return 0;
+    size_t nrows = sel->NumRows > 0 ? (size_t)sel->NumRows : 0;
+    char **names = nrows ? calloc(nrows, sizeof *names) : NULL;
+    size_t n = 0;
+    int rc = 0;
+    if (nrows && !names) rc = -1;
+    for (size_t i = 0; names && i < nrows; i++) {
+        const char *t = table_at_row(sel->Rows[i], NULL);
+        if (!t) continue;
+        if (!(names[n] = strdup(t))) { rc = -1; break; }
+        n++;
+    }
+    uiFreeTableSelection(sel);
+    if (rc != 0 || n == 0) {
+        free_names(names, n);
+        return rc;
+    }
+    *names_out = names;
+    *n_out = n;
+    return 0;
 }
 
 /* Options dialog + save panel, then the export job. */
@@ -1410,28 +1507,39 @@ static void export_table_flow(const char *table, int view) {
     free(t);
 }
 
-static void export_selected_table(void) {
+static void export_database_flow(void);
+static void export_tables_flow(char **names, size_t n);
+
+/* Export…: the whole database with nothing selected in the sidebar, the one
+ * selected table (SQL / CSV / XML), or the selected tables into one SQL file. */
+static void export_sidebar_selection(void) {
     if (app.busy) return;
     if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return; }
-    int view = 0;
-    const char *name = selected_table(&view);
-    if (!name) {
-        uiMsgBoxError(app.win, "Export",
-                      app.tables_loaded ? "Select a table in the sidebar first."
-                                        : "Load the table list and select a table first.");
-        return;
+    char **names = NULL;
+    size_t n = 0;
+    if (selected_tables(&names, &n) != 0) { set_status("Out of memory"); return; }
+    if (n == 0) {
+        export_database_flow();
+    } else if (n == 1) {
+        int view = 0;
+        const char *name = selected_table(&view);
+        export_table_flow(name ? name : names[0], view);
+    } else {
+        export_tables_flow(names, n); /* takes names */
+        names = NULL;
+        n = 0;
     }
-    export_table_flow(name, view);
+    free_names(names, n);
 }
 
 static void on_export(uiButton *b, void *data) {
     (void)b; (void)data;
-    export_selected_table();
+    export_sidebar_selection();
 }
 
 static void on_export_menu(uiMenuItem *m, uiWindow *w, void *data) {
     (void)m; (void)w; (void)data;
-    export_selected_table();
+    export_sidebar_selection();
 }
 
 /* Export the current database (all tables, then views) on the worker thread. */
@@ -1450,6 +1558,46 @@ static void start_export_db(const char *db, const export_opts *opts, const char 
     start_job(j);
 }
 
+/* Export the n named tables/views of database db into one SQL file on the
+ * worker thread. Takes names (malloc'd, see selected_tables) in every case. */
+static void start_export_tables(const char *db, char **names, size_t n,
+                                const export_opts *opts, const char *path) {
+    job *j = app.busy || !app.conn || !n ? NULL : calloc(1, sizeof *j);
+    if (!j) { free_names(names, n); return; }
+    j->kind = JOB_EXPORT_DB;
+    j->conn = app.conn;
+    j->names = names;
+    j->nnames = n;
+    j->table = strdup(db);
+    j->path = strdup(path);
+    j->fmt = EXPORT_SQL;
+    j->xopts = *opts;
+    if (!j->table || !j->path) { job_free(j); return; }
+    set_status("Exporting %zu tables from %s...", n, db);
+    start_job(j);
+}
+
+/* Options dialog + save panel for the selected tables. Takes names. */
+static void export_tables_flow(char **names, size_t n) {
+    if (!app.current_db) {
+        free_names(names, n);
+        uiMsgBoxError(app.win, "Export",
+                      "No database selected. Pick one in the Database field and connect, "
+                      "or run USE <database>; first.");
+        return;
+    }
+    char *db = strdup(app.current_db); /* the dialog runs a modal loop; keep our own copy */
+    if (!db) { free_names(names, n); return; }
+    export_opts opts;
+    char *path = NULL;
+    if (sqlc_export_database_dialog(db, n, &opts, &path))
+        start_export_tables(db, names, n, &opts, path);
+    else
+        free_names(names, n);
+    free(path);
+    free(db);
+}
+
 static void export_database_flow(void) {
     if (app.busy) return;
     if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return; }
@@ -1463,7 +1611,7 @@ static void export_database_flow(void) {
     if (!db) return;
     export_opts opts;
     char *path = NULL;
-    if (sqlc_export_database_dialog(db, &opts, &path)) start_export_db(db, &opts, path);
+    if (sqlc_export_database_dialog(db, 0, &opts, &path)) start_export_db(db, &opts, path);
     free(path);
     free(db);
 }
@@ -2737,6 +2885,30 @@ static void autotest_next(void) {
         break;
     case 41: {
         autotest_print("cleanup");
+        /* sidebar multi-select: two rows, kept across a rebuild, and the
+         * Structure page asks for one */
+        {
+            int a = autotest_row("customers"), b = autotest_row("orders");
+            int two[2] = { a < b ? a : b, a < b ? b : a };
+            if (two[0] >= 0) {
+                uiTableSelection sel2 = { .NumRows = 2, .Rows = two };
+                uiTableSetSelection(app.side_table, &sel2);
+            }
+            rebuild_sidebar();
+            char **names = NULL;
+            size_t n = 0;
+            int rc = selected_tables(&names, &n);
+            printf("[multi] selected: %zu (rc %d):", n, rc);
+            for (size_t i = 0; i < n; i++) printf(" [%s]", names[i]);
+            printf(", single: %s\n", selected_table(NULL) ? selected_table(NULL) : "-");
+            free_names(names, n);
+            show_mode(MODE_STRUCTURE);
+            char *title = uiLabelText(app.st.title);
+            printf("[multi] structure: %s, loading: %s\n", title,
+                   app.busy && app.job_kind == JOB_STRUCTURE ? "yes" : "no");
+            uiFreeText(title);
+            show_mode(MODE_NORMAL);
+        }
         /* Structure page: select a table, switch to it */
         int row = autotest_row("orders");
         uiTableSelection sel = { .NumRows = 1, .Rows = &row };
@@ -2846,7 +3018,7 @@ static uiBox *labeled(const char *label, uiControl *c) {
 
 static void build_window(void) {
     uiMenu *file = uiNewMenu("File");
-    uiMenuItemOnClicked(uiMenuAppendItem(file, "Export Table\xE2\x80\xA6"), on_export_menu, NULL);
+    uiMenuItemOnClicked(uiMenuAppendItem(file, "Export\xE2\x80\xA6"), on_export_menu, NULL);
     uiMenuItemOnClicked(uiMenuAppendItem(file, "Export Database\xE2\x80\xA6"), on_export_db_menu, NULL);
     uiMenuAppendSeparator(file);
     uiMenuAppendQuitItem(file);

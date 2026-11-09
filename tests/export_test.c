@@ -241,19 +241,27 @@ static void test_sql_in_dump(void) {
 
 static void test_dump_header_footer(void) {
     start();
-    export_sql_dump_header(out, "shop", 2, 1);
+    export_sql_dump_header(out, "shop", 2, 1, 0);
     EXPECT("-- sqlc export of database `shop`: 2 tables, 1 view\n\n"
            "SET NAMES utf8mb4;\n"
            "SET @OLD_TIME_ZONE=@@TIME_ZONE, TIME_ZONE='+00:00';\n"
            "SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO';\n"
            "SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0;\n\n");
     start();
-    export_sql_dump_header(out, "x", 1, 0);
+    export_sql_dump_header(out, "x", 1, 0, 0);
     CHECK(strncmp(finish(), "-- sqlc export of database `x`: 1 table, 0 views\n", 49) == 0);
     /* a line break in a name must not end the comment and start SQL */
     start();
-    export_sql_dump_header(out, "a`b\nSELECT 1;", 0, 2);
+    export_sql_dump_header(out, "a`b\nSELECT 1;", 0, 2, 0);
     CHECK(strncmp(finish(), "-- sqlc export of database `a``b?SELECT 1;`: 0 tables, 2 views\n", 63) == 0);
+    /* a dump of selected objects says so */
+    start();
+    export_sql_dump_header(out, "shop", 3, 0, 1);
+    CHECK(strncmp(finish(), "-- sqlc export of selected tables from database `shop`: 3 tables, 0 views\n\n"
+                            "SET NAMES utf8mb4;\n", 92) == 0);
+    start();
+    export_sql_dump_header(out, "s\nq", 1, 1, 1);
+    CHECK(strncmp(finish(), "-- sqlc export of selected tables from database `s?q`: 1 table, 1 view\n", 70) == 0);
     start();
     export_sql_dump_footer(out);
     EXPECT("SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;\n"
@@ -352,6 +360,79 @@ static void test_view_order(void) {
     EXPECT_ORDER(1, n1, d1, "a");
 }
 
+/* keep[] as "0110" */
+static const char *keep_str(size_t n, const unsigned char *keep) {
+    static char s[64];
+    for (size_t i = 0; i < n && i + 1 < sizeof s; i++) s[i] = keep[i] ? '1' : '0';
+    s[n < sizeof s ? n : sizeof s - 1] = '\0';
+    return s;
+}
+
+static void test_select_names(void) {
+    const char *names[] = { "orders", "customers", "a`b", "caf\xC3\xA9", NULL, "Orders", "v" };
+    size_t n = sizeof names / sizeof *names;
+    unsigned char keep[7];
+    size_t missing = 99;
+
+    /* nothing selected: nothing kept, nothing missing */
+    memset(keep, 1, sizeof keep);
+    CHECK(export_select_names(n, names, 0, NULL, keep, &missing) == 0);
+    CHECK(strcmp(keep_str(n, keep), "0000000") == 0 && missing == 99);
+
+    /* exact, case-sensitive; odd characters and non-ASCII; selection order irrelevant */
+    const char *s1[] = { "v", "a`b", "caf\xC3\xA9", "orders" };
+    CHECK(export_select_names(n, names, 4, s1, keep, &missing) == 0);
+    CHECK(strcmp(keep_str(n, keep), "1011001") == 0);
+    CHECK(missing == 99);
+
+    /* duplicates in the selection */
+    const char *s2[] = { "Orders", "Orders" };
+    CHECK(export_select_names(n, names, 2, s2, keep, NULL) == 0);
+    CHECK(strcmp(keep_str(n, keep), "0000010") == 0);
+
+    /* a name that is gone: the first missing one is reported, the rest kept */
+    const char *s3[] = { "customers", "gone", "ORDERS", "v" };
+    CHECK(export_select_names(n, names, 4, s3, keep, &missing) == 1);
+    CHECK(missing == 1);
+    CHECK(strcmp(keep_str(n, keep), "0100001") == 0);
+
+    /* a NULL or empty selected name is not found (the NULL name never matches) */
+    const char *s4[] = { NULL };
+    CHECK(export_select_names(n, names, 1, s4, keep, &missing) == 1 && missing == 0);
+    CHECK(strcmp(keep_str(n, keep), "0000000") == 0);
+    const char *s5[] = { "" };
+    CHECK(export_select_names(n, names, 1, s5, keep, &missing) == 1 && missing == 0);
+
+    /* no objects at all */
+    const char *s6[] = { "t" };
+    CHECK(export_select_names(0, NULL, 1, s6, keep, &missing) == 1 && missing == 0);
+
+    /* equal names in the list (not possible in one schema, but robust) */
+    const char *dup[] = { "t", "u", "t" };
+    unsigned char k3[3];
+    CHECK(export_select_names(3, dup, 1, s6, k3, NULL) == 0);
+    CHECK(strcmp(keep_str(3, k3), "101") == 0);
+}
+
+static void test_dump_basename(void) {
+    char b[64];
+    export_dump_basename(b, sizeof b, "shop", 0);
+    CHECK(strcmp(b, "shop") == 0);
+    export_dump_basename(b, sizeof b, "shop", 3);
+    CHECK(strcmp(b, "shop-3-tables") == 0);
+    export_dump_basename(b, sizeof b, "shop", 1);
+    CHECK(strcmp(b, "shop-1-table") == 0);
+    export_dump_basename(b, sizeof b, NULL, 2);
+    CHECK(strcmp(b, "database-2-tables") == 0);
+    export_dump_basename(b, sizeof b, "", 0);
+    CHECK(strcmp(b, "database") == 0);
+    export_dump_basename(b, 8, "a_long_database_name", 12);
+    CHECK(strcmp(b, "a_long_") == 0);
+    b[0] = 'x';
+    export_dump_basename(b, 0, "shop", 0); /* no room: untouched */
+    CHECK(b[0] == 'x');
+}
+
 int main(void) {
     test_sql_escaping();
     test_csv_escaping();
@@ -363,6 +444,8 @@ int main(void) {
     test_dump_header_footer();
     test_object_kind();
     test_view_order();
+    test_select_names();
+    test_dump_basename();
     free(buf);
     if (failures) { fprintf(stderr, "export_test: %d failure(s)\n", failures); return 1; }
     printf("export_test: all checks passed\n");

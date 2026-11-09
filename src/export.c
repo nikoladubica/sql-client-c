@@ -367,8 +367,10 @@ export_obj_kind export_object_kind(const char *table_type) {
     return EXPORT_OBJ_SKIP;
 }
 
-void export_sql_dump_header(FILE *f, const char *db, size_t ntables, size_t nviews) {
-    fputs("-- sqlc export of database ", f);
+void export_sql_dump_header(FILE *f, const char *db, size_t ntables, size_t nviews,
+                            int selection) {
+    fputs(selection ? "-- sqlc export of selected tables from database "
+                    : "-- sqlc export of database ", f);
     export_sql_comment_ident(f, db ? db : "");
     fprintf(f, ": %zu table%s, %zu view%s\n\n", ntables, ntables == 1 ? "" : "s",
             nviews, nviews == 1 ? "" : "s");
@@ -386,6 +388,58 @@ void export_sql_dump_skipped(FILE *f, const char *name, const char *table_type) 
     for (const char *c = table_type ? table_type : "unknown type"; *c; c++)
         putc((unsigned char)*c < 0x20 ? '?' : *c, f);
     fputs("): not exported\n\n", f);
+}
+
+typedef struct {
+    const char *name;
+    size_t index;
+} named_index;
+
+static int cmp_named(const void *a, const void *b) {
+    return strcmp(((const named_index *)a)->name, ((const named_index *)b)->name);
+}
+
+int export_select_names(size_t n, const char *const *names, size_t nsel,
+                        const char *const *sel, unsigned char *keep, size_t *missing) {
+    if (n) memset(keep, 0, n);
+    if (nsel == 0) return 0;
+    /* names sorted (with their positions), then one binary search per selected name */
+    named_index *sorted = malloc((n ? n : 1) * sizeof *sorted);
+    if (!sorted) return -1;
+    size_t m = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!names[i]) continue;
+        sorted[m].name = names[i];
+        sorted[m].index = i;
+        m++;
+    }
+    qsort(sorted, m, sizeof *sorted, cmp_named);
+    int rc = 0;
+    for (size_t k = 0; k < nsel; k++) {
+        named_index key = { .name = sel[k] ? sel[k] : "", .index = 0 };
+        named_index *hit = m ? bsearch(&key, sorted, m, sizeof *sorted, cmp_named) : NULL;
+        if (!hit || !sel[k]) {
+            if (rc == 0) {
+                rc = 1;
+                if (missing) *missing = k;
+            }
+            continue;
+        }
+        /* equal names sit next to each other: keep them all */
+        size_t at = (size_t)(hit - sorted), lo = at, hi = at;
+        while (lo > 0 && strcmp(sorted[lo - 1].name, key.name) == 0) lo--;
+        while (hi + 1 < m && strcmp(sorted[hi + 1].name, key.name) == 0) hi++;
+        for (size_t i = lo; i <= hi; i++) keep[sorted[i].index] = 1;
+    }
+    free(sorted);
+    return rc;
+}
+
+void export_dump_basename(char *buf, size_t size, const char *db, size_t nselected) {
+    if (!size) return;
+    if (!db || !*db) db = "database";
+    if (nselected == 0) snprintf(buf, size, "%s", db);
+    else snprintf(buf, size, "%s-%zu-table%s", db, nselected, nselected == 1 ? "" : "s");
 }
 
 /* `name` with backticks doubled, as a string (malloc'd), or NULL. */

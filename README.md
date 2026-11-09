@@ -29,16 +29,19 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
   sidebar, with its engine, row estimate and collation; switching keeps the
   query, its results and the selection
 - Sidebar listing the tables in the current database, with a **Load tables** /
-  **Refresh tables** button; drag its right edge to resize it (the width is remembered)
+  **Refresh tables** button; drag its right edge to resize it (the width is remembered).
+  Shift-click selects a range of tables, ⌘-click adds or removes one (on a Mac,
+  Ctrl-click is a right-click)
 - Double-click a table to browse it (`SELECT * ... LIMIT 1000`), then **edit its
   rows in place**: double-click a cell to change it (with a calendar for dates),
   **+** adds a row, **−** deletes the selected rows, **Reload**, **Delete All Rows…**
 - Right-click a table for **Show Structure**, **Copy Table Name**, **Rename**, **Truncate**, **Delete**
   and **Export** (Truncate and Delete always ask first; Cancel is the default)
-- **Export** a table as SQL, CSV or XML (select it, then **Export…** in the
-  sidebar or **File › Export Table…**)
+- **Export…** in the sidebar (or **File › Export…**) exports what is selected:
+  one table as SQL, CSV or XML, several tables as one SQL file, or, with
+  nothing selected, the whole database
 - **Export the whole database** as one SQL file, every table's structure and
-  data and then the views (**File › Export Database…**)
+  data and then the views (also **File › Export Database…**, whatever is selected)
 - Queries run on a background thread, so the window never freezes
 - Shows the first 10,000 rows per result set
 
@@ -106,8 +109,13 @@ browse, a reload) switches to **Normal** to show its results.
 the table selected in the sidebar: its columns above, its indexes below, with
 a draggable divider (its position is remembered) and a **Refresh** button.
 The structure is loaded when you switch to it and whenever the sidebar
-selection changes while it's shown; **Show Structure** in a table's
-right-click menu switches to it. ⌘↩ runs nothing while Structure is shown
+selection changes while it's shown; with several tables selected it asks you
+to select one. **Show Structure** in a table's right-click menu switches to it.
+
+The sidebar selects several tables with Shift-click (a range) and ⌘-click
+(add or remove one); Ctrl-click is a right-click on a Mac. The selection is
+kept when the list is refreshed. Right-clicking a table selects just that
+table and its menu acts on it, and double-clicking browses the table clicked. ⌘↩ runs nothing while Structure is shown
 (the editor is hidden); switch to **Normal** to run SQL.
 
 Connection options (all are saved with a connection):
@@ -195,8 +203,16 @@ with a toolbar below it.
 
 ### Export
 
-Select a table in the sidebar and press **Export…** (or **File › Export Table…**),
-pick a format and options, then where to save (defaults to `<table>.<ext>`).
+**Export…** in the sidebar (or **File › Export…**) exports the sidebar selection:
+
+- **Nothing selected**: the whole database, as **File › Export Database…**
+  (see [Whole database](#whole-database)).
+- **One table or view**: a format dialog (SQL, CSV or XML, below).
+- **Several** (Shift-click, ⌘-click): one SQL file with just those, see
+  [Selected tables](#selected-tables). There is no CSV or XML form for several
+  tables; export them one at a time for that.
+
+For one table, pick a format and options, then where to save (defaults to `<table>.<ext>`).
 Rows are streamed to the file on a background thread, so big tables don't
 freeze the window; the file only appears once the export has finished.
 
@@ -230,6 +246,21 @@ and data as for a table; there is no CSV or XML form.
   `mysql db < db.sql`.
 - The status bar shows which table is being written and the row count.
   Nothing is changed on the server (`SELECT` and `SHOW` only).
+
+#### Selected tables
+
+With two or more tables or views selected in the sidebar, **Export…** writes
+them to one SQL file the same way, defaulting to `<database>-<n>-tables.sql`,
+with the same structure / `DROP … IF EXISTS` / data options:
+
+- The same header and footer (`utf8mb4`, UTC, `FOREIGN_KEY_CHECKS=0`, then
+  restored); the opening comment says it is a selection of the database.
+- The selected tables by name, then the selected views, each after the
+  selected views it uses. Tables or views they depend on are not added: select
+  them too if the file has to load into an empty database.
+- A selected table that no longer exists (dropped or renamed since the list
+  was loaded) stops the export before any file is written; refresh the list
+  and select again.
 
 ## CLI usage
 
@@ -283,8 +314,8 @@ and data as for a table; there is no CSV or XML form.
 | `src/splitview.m` | Resizable panes (sidebar, editor / results, columns / indexes): an `NSSplitView` wrapped as a libui control |
 | `src/segmented.m` | The Normal / AI / Structure switch: an `NSSegmentedControl` wrapped as a libui control |
 | `src/export.c` | Streaming SQL / CSV / XML writers (no database code) |
-| `src/export_db.c` | Export a table, or the whole current database as SQL, from a connection through those writers |
-| `src/export_dialog.m` | Native export options dialogs (table and database) and save panel |
+| `src/export_db.c` | Export a table, the whole current database or selected tables as SQL, from a connection through those writers |
+| `src/export_dialog.m` | Native export options dialogs (table, database or selected tables) and save panel |
 | `src/table_menu.m` | Sidebar right-click menu, rename and API-key prompts, confirmations, clipboard |
 | `src/row_edit.c` | Row editing without UI: column kinds, value checks, `UPDATE` / `INSERT` / `DELETE` SQL |
 | `src/grid_edit.m` | In-place cell editor for the results grid (text field, calendar popover, cell menu) |
@@ -296,8 +327,8 @@ and data as for a table; there is no CSV or XML form.
 ## Development
 
 `make test` runs the unit tests for the saved-connections file, the export
-writers' escaping/quoting, the database dump's header, comments and view
-ordering, Ask Claude's request/response handling, comment formatting and
+writers' escaping/quoting, the database dump's header, comments, view
+ordering and table selection, Ask Claude's request/response handling, comment formatting and
 destructive-statement check, and the row editor's value checks and generated
 SQL (no database or network needed).
 
@@ -309,7 +340,7 @@ with Python. It creates and drops `test_sqlc_export_src` and `test_sqlc_export_d
 `make gui-test` builds the GUI with sanitizers and runs a scripted smoke test
 (connect, multi-statement results, views filter, double-click, row cap,
 the editor/results divider's minimum heights, the Normal / AI / Structure switch,
-table and database export, `-A`, the context-menu actions on a scratch table `ctx_tmp`, and
+table and database export, sidebar multi-select, `-A`, the context-menu actions on a scratch table `ctx_tmp`, and
 "Tables only, load once" with a scratch table `once_tmp`, and the Run warning
 for destructive SQL from Claude, without calling the API, and row editing on
 scratch tables `edit_tmp` and `nopk_tmp`: cell edits, the calendar, invalid
@@ -329,7 +360,7 @@ expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
   edited, not the results of your own queries; it shows the first 1000 rows.
   There's no syntax highlighting, and it always runs the whole editor (not just
   the selection). A running query can't be cancelled yet.
-- Database export is SQL only and GUI only. Tables are read one after
+- Database and multi-table export are SQL only and GUI only. Tables are read one after
   another, not in one transaction, so a database that is being written to
   during the export isn't captured as a consistent snapshot. Views keep their
   `DEFINER`, as `SHOW CREATE VIEW` writes it; loading them as another user

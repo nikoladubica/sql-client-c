@@ -67,4 +67,21 @@ int export_database(MYSQL *conn, const export_opts *opts, const char *path,
                     export_db_progress_fn progress, void *data,
                     export_db_stats *stats, char **err);
 
+/*
+ * The same for some objects of the current database: the n tables and views
+ * named in names (n >= 1), written exactly as export_database writes them -
+ * tables in name order, then the selected views, each after the selected
+ * views it uses (views it uses that are not selected are not added). Same
+ * header (saying it is a selection, see export_sql_dump_header), footer and
+ * options. A selected sequence or other object is left out with a comment.
+ *
+ * A name that is not in the database (dropped or renamed since the list was
+ * loaded) fails the export before the file is created. Read-only on the
+ * server, as export_database. Returns 0, or -1 with *err set (malloc'd).
+ */
+int export_tables(MYSQL *conn, const char *const *names, size_t n,
+                  const export_opts *opts, const char *path,
+                  export_db_progress_fn progress, void *data,
+                  export_db_stats *stats, char **err);
+
 #endif

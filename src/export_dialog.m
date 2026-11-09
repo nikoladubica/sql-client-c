@@ -154,18 +154,30 @@ int sqlc_export_dialog(const char *table, int is_view,
     return 1;
 }
 
-int sqlc_export_database_dialog(const char *db, export_opts *opts, char **path) {
+int sqlc_export_database_dialog(const char *db, size_t nselected, export_opts *opts,
+                                char **path) {
     if (!have_last_db) {
         last_db_opts = export_default_opts();
         have_last_db = 1;
     }
     NSString *name = [NSString stringWithUTF8String:db];
     if (!name) name = @"database";
+    char base[512];
+    export_dump_basename(base, sizeof base, db, nselected);
+    NSString *file = [NSString stringWithUTF8String:base];
+    if (!file) file = nselected ? [NSString stringWithFormat:@"database-%zu-tables", nselected]
+                                : @"database";
 
     NSAlert *alert = [[NSAlert alloc] init];
-    [alert setMessageText:[NSString stringWithFormat:@"Export database “%@”", name]];
-    [alert setInformativeText:@"One SQL file with every table, then the views. "
-                               "Choose what to include, then where to save it."];
+    if (nselected) {
+        [alert setMessageText:[NSString stringWithFormat:@"Export %zu tables from “%@”", nselected, name]];
+        [alert setInformativeText:@"One SQL file with the selected tables, then the selected views. "
+                                   "Choose what to include, then where to save it."];
+    } else {
+        [alert setMessageText:[NSString stringWithFormat:@"Export database “%@”", name]];
+        [alert setInformativeText:@"One SQL file with every table, then the views. "
+                                   "Choose what to include, then where to save it."];
+    }
     NSButton *ok = [alert addButtonWithTitle:@"Export…"];
     [alert addButtonWithTitle:@"Cancel"];
 
@@ -196,7 +208,7 @@ int sqlc_export_database_dialog(const char *db, export_opts *opts, char **path) 
     if (!confirmed) return 0;
     last_db_opts = o;
 
-    if (!save_panel(name, EXPORT_SQL, path)) return 0;
+    if (!save_panel(file, EXPORT_SQL, path)) return 0;
     *opts = o;
     return 1;
 }

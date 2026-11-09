@@ -337,9 +337,11 @@ static void table_progress(unsigned long long rows, void *data) {
     p->fn(p->table, p->index, p->count, rows, p->data);
 }
 
-int export_database(MYSQL *conn, const export_opts *opts_in, const char *path,
-                    export_db_progress_fn progress, void *data,
-                    export_db_stats *stats_out, char **err) {
+/* export_database (nsel == 0) and export_tables (the nsel names in sel). */
+static int dump(MYSQL *conn, const char *const *sel, size_t nsel,
+                const export_opts *opts_in, const char *path,
+                export_db_progress_fn progress, void *data,
+                export_db_stats *stats_out, char **err) {
     export_opts opts = opts_in ? *opts_in : export_default_opts();
     opts.sql_in_dump = 1;
     export_db_stats stats = { 0 };
@@ -362,6 +364,35 @@ int export_database(MYSQL *conn, const export_opts *opts_in, const char *path,
     if (!db) { *err = strdup("No database selected"); goto done; }
 
     if (!(objs = list_objects(conn, &nobjs, err))) goto done;
+    if (nsel) { /* only the selected objects: drop the others from the list */
+        const char **names = calloc(nobjs ? nobjs : 1, sizeof *names);
+        unsigned char *keep = calloc(nobjs ? nobjs : 1, 1);
+        size_t missing = 0;
+        int src = -1;
+        if (names && keep) {
+            for (size_t i = 0; i < nobjs; i++) names[i] = objs[i].name;
+            src = export_select_names(nobjs, names, nsel, sel, keep, &missing);
+        }
+        if (src == 0) {
+            size_t k = 0;
+            for (size_t i = 0; i < nobjs; i++) {
+                if (keep[i]) { objs[k++] = objs[i]; continue; }
+                free(objs[i].name);
+                free(objs[i].type);
+                free(objs[i].create);
+            }
+            nobjs = k;
+        } else if (src > 0) {
+            *err = fmt_error("Table %s not found in database %s (dropped or renamed?) - "
+                             "reload the table list and select again",
+                             sel[missing] ? sel[missing] : "", db);
+        } else {
+            *err = strdup("Out of memory");
+        }
+        free(keep);
+        free(names);
+        if (*err) goto done;
+    }
     for (size_t i = 0; i < nobjs; i++) {
         if (objs[i].kind == EXPORT_OBJ_TABLE) ntables++;
         else if (objs[i].kind == EXPORT_OBJ_VIEW && opts.sql_structure) nviews++;
@@ -391,7 +422,7 @@ int export_database(MYSQL *conn, const export_opts *opts_in, const char *path,
     }
 
     if (!(f = open_temp(path, &tmp, err))) goto done;
-    export_sql_dump_header(f, db, ntables, nviews);
+    export_sql_dump_header(f, db, ntables, nviews, nsel != 0);
 
     db_progress dp = { .fn = progress, .data = data, .count = ntables + nviews };
     size_t index = 0;
@@ -450,4 +481,22 @@ done:
     if (stats_out) *stats_out = stats;
     if (rc != 0 && !*err) *err = strdup("Export failed");
     return rc;
+}
+
+int export_database(MYSQL *conn, const export_opts *opts, const char *path,
+                    export_db_progress_fn progress, void *data,
+                    export_db_stats *stats, char **err) {
+    return dump(conn, NULL, 0, opts, path, progress, data, stats, err);
+}
+
+int export_tables(MYSQL *conn, const char *const *names, size_t n,
+                  const export_opts *opts, const char *path,
+                  export_db_progress_fn progress, void *data,
+                  export_db_stats *stats, char **err) {
+    if (n == 0) {
+        *err = strdup("No tables selected");
+        if (stats) memset(stats, 0, sizeof *stats);
+        return -1;
+    }
+    return dump(conn, names, n, opts, path, progress, data, stats, err);
 }
