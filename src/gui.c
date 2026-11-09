@@ -125,8 +125,14 @@ static struct {
     uiMultilineEntry *editor;
     uiLabel *status;
 
+    /* Query pane: Normal view (SQL editor + run row) or AI view (Ask Claude),
+     * one at a time in the same space, picked with view_box */
+    uiCombobox *view_box;    /* VIEW_NORMAL / VIEW_AI */
+    uiControl *normal_view;  /* editor + run row */
+    uiControl *ai_view;      /* request + Ask Claude */
+
     /* Ask Claude: describe a query, get SQL in the editor */
-    uiEntry *ai_task;
+    uiMultilineEntry *ai_task;
     uiButton *ai_btn;
     int ai_in_editor;        /* the editor holds Claude's SQL, not run yet */
 
@@ -188,6 +194,28 @@ static void set_busy(int busy) {
         uiControlEnable(uiControl(app.export_btn));
         uiControlEnable(uiControl(app.ai_btn));
     }
+}
+
+/* ---------- query pane views ---------- */
+
+enum { VIEW_NORMAL, VIEW_AI }; /* view_box items, in this order */
+
+static int in_ai_view(void) {
+    return app.ai_view && uiControlVisible(app.ai_view);
+}
+
+/* Shows one view of the query pane, in place, and keeps the switcher in step
+ * (uiComboboxSetSelected doesn't call on_view_selected). */
+static void show_view(int view) {
+    if (view == VIEW_AI) {
+        uiControlHide(app.normal_view);
+        uiControlShow(app.ai_view);
+    } else {
+        uiControlHide(app.ai_view);
+        uiControlShow(app.normal_view);
+    }
+    if (uiComboboxSelected(app.view_box) != view)
+        uiComboboxSetSelected(app.view_box, view);
 }
 
 /* Load the table list on connect? Not with -A, but "Tables only, load once" does. */
@@ -412,6 +440,7 @@ static void remember_last_profile(const char *name);
 static void autotest_next(void);
 static int on_should_quit(void *data);
 #endif
+static void ask_claude_now(void);
 
 /* JOB_AI on the worker thread: schema, then the Claude API call. */
 static void ask_claude(job *j) {
@@ -599,6 +628,7 @@ static void job_done(void *data) {
                 app.ai_in_editor = 1;
                 free(app.browsing);
                 app.browsing = NULL;
+                show_view(VIEW_NORMAL); /* the SQL is in the editor: show it */
             }
             free(text);
             if (j->ai.sql && *j->ai.sql)
@@ -742,6 +772,10 @@ static int confirm_ai_sql(const char *sql) {
 }
 
 static void on_run_menu(void) {
+    if (in_ai_view()) { /* the editor is hidden: ⌘↩ sends the request instead */
+        ask_claude_now();
+        return;
+    }
     char *sql = uiMultilineEntryText(app.editor);
     if (app.busy || !app.conn || confirm_ai_sql(sql ? sql : "")) {
         if (run_sql(sql ? sql : "")) { /* the user's own SQL: no longer browsing a table */
@@ -807,11 +841,13 @@ static void on_remove_api_key(uiMenuItem *m, uiWindow *w, void *data) {
     set_status("Claude API key removed from the Keychain.");
 }
 
-static void on_ask_claude(uiButton *b, void *data) {
-    (void)b; (void)data;
+static void ask_claude_now(void) {
     if (app.busy) return;
     if (!app.conn) { set_status("Connect first, so Claude can see the database's tables."); return; }
-    char *task = entry_dup(app.ai_task);
+    char *t = uiMultilineEntryText(app.ai_task);
+    char *task = strdup(t ? t : "");
+    uiFreeText(t);
+    if (!task) return;
     const char *p = task;
     while (isspace((unsigned char)*p)) p++;
     if (!*p) {
@@ -830,6 +866,21 @@ static void on_ask_claude(uiButton *b, void *data) {
     j->api_key = key;
     set_status("Asking Claude...");
     start_job(j);
+}
+
+static void on_ask_claude(uiButton *b, void *data) {
+    (void)b; (void)data;
+    ask_claude_now();
+}
+
+static void on_view_selected(uiCombobox *c, void *data) {
+    (void)data;
+    show_view(uiComboboxSelected(c));
+}
+
+static void on_ask_claude_menu(uiMenuItem *m, uiWindow *w, void *data) {
+    (void)m; (void)w; (void)data;
+    show_view(VIEW_AI);
 }
 
 static void load_tables_now(void) {
@@ -955,6 +1006,7 @@ static void on_table_double_click(uiTable *t, int row, void *data) {
     if (!sql) return;
     uiMultilineEntrySetText(app.editor, sql);
     app.ai_in_editor = 0;
+    show_view(VIEW_NORMAL); /* the editor's text was replaced: show what runs */
     if (run_sql(sql)) {
         free(app.browsing);
         app.browsing = strdup(name);
@@ -1449,6 +1501,14 @@ static void autotest_next(void) {
         run_sql("DROP TABLE once_tmp;");
         break;
     case 22: {
+        /* the query pane's Normal / AI switcher swaps the views in place */
+        show_view(VIEW_AI);
+        printf("[view] AI: ai view %d, editor view %d, switcher %d\n", uiControlVisible(app.ai_view),
+               uiControlVisible(app.normal_view), uiComboboxSelected(app.view_box));
+        show_view(VIEW_NORMAL);
+        printf("[view] Normal: ai view %d, editor view %d, switcher %d\n",
+               uiControlVisible(app.ai_view), uiControlVisible(app.normal_view),
+               uiComboboxSelected(app.view_box));
         /* Claude's SQL (no network here: as if Ask Claude had filled the
          * editor): a destructive statement asks first; the test cancels. */
         ai_result r = { .explanation = strdup("Deletes every customer."),
@@ -1509,6 +1569,8 @@ static void build_window(void) {
     uiMenuAppendSeparator(file);
     uiMenuAppendQuitItem(file);
     uiMenu *ai = uiNewMenu("AI");
+    uiMenuItemOnClicked(uiMenuAppendItem(ai, "Ask Claude"), on_ask_claude_menu, NULL);
+    uiMenuAppendSeparator(ai);
     uiMenuItemOnClicked(uiMenuAppendItem(ai, "Set Claude API Key\xE2\x80\xA6"), on_set_api_key, NULL);
     uiMenuItemOnClicked(uiMenuAppendItem(ai, "Remove Claude API Key"), on_remove_api_key, NULL);
     uiOnShouldQuit(on_should_quit, NULL);
@@ -1588,27 +1650,31 @@ static void build_window(void) {
                                        220, 120, "SidebarWidth");
     uiBoxAppend(root, app.split, 1);
 
-    /* Ask Claude: describe it, get SQL (with an explanation) in the editor */
-    uiBox *ai_row = uiNewHorizontalBox();
-    uiBoxSetPadded(ai_row, 1);
-    app.ai_task = uiNewEntry();
-    app.ai_btn = uiNewButton("Ask Claude");
-    uiButtonOnClicked(app.ai_btn, on_ask_claude, NULL);
-    uiBoxAppend(ai_row, uiControl(app.ai_task), 1);
-    uiBoxAppend(ai_row, uiControl(app.ai_btn), 0);
-    uiBoxAppend(right, uiControl(labeled("Ask Claude - describe the query you need "
-                                         "(e.g. top 10 customers by total order value last month)",
-                                         uiControl(ai_row))), 0);
-
-    /* Editor (+ run row) above, results below, with a draggable divider.
-     * In one uiBox their heights came only from libui's "stretchy children
-     * are equal" constraint, so a results grid could squeeze the editor away. */
+    /* Query pane above, results below, with a draggable divider. In one uiBox
+     * their heights came only from libui's "stretchy children are equal"
+     * constraint, so a results grid could squeeze the editor away.
+     * The query pane has two views in the same space, one shown at a time:
+     * Normal (SQL editor + run row) and AI (Ask Claude). */
     uiBox *editor_pane = uiNewVerticalBox();
     uiBoxSetPadded(editor_pane, 1);
 
+    uiBox *view_row = uiNewHorizontalBox();
+    uiBoxSetPadded(view_row, 1);
+    app.view_box = uiNewCombobox();
+    uiComboboxAppend(app.view_box, "Normal");    /* VIEW_NORMAL */
+    uiComboboxAppend(app.view_box, "AI");        /* VIEW_AI */
+    uiComboboxSetSelected(app.view_box, VIEW_NORMAL);
+    uiComboboxOnSelected(app.view_box, on_view_selected, NULL);
+    uiBoxAppend(view_row, uiControl(uiNewLabel("View:")), 0);
+    uiBoxAppend(view_row, uiControl(app.view_box), 0);
+    uiBoxAppend(editor_pane, uiControl(view_row), 0);
+
+    /* Normal view: the SQL editor and the run row */
+    uiBox *normal = uiNewVerticalBox();
+    uiBoxSetPadded(normal, 1);
     app.editor = uiNewNonWrappingMultilineEntry();
     uiMultilineEntrySetText(app.editor, "SHOW TABLES;");
-    uiBoxAppend(editor_pane, uiControl(app.editor), 1);
+    uiBoxAppend(normal, uiControl(app.editor), 1);
 
     uiBox *run_row = uiNewHorizontalBox();
     uiBoxSetPadded(run_row, 1);
@@ -1616,7 +1682,28 @@ static void build_window(void) {
     uiButtonOnClicked(app.run_btn, on_run, NULL);
     uiBoxAppend(run_row, uiControl(app.run_btn), 0);
     uiBoxAppend(run_row, uiControl(uiNewLabel("Double-click a table to browse it.")), 0);
-    uiBoxAppend(editor_pane, uiControl(run_row), 0);
+    uiBoxAppend(normal, uiControl(run_row), 0);
+    app.normal_view = uiControl(normal);
+    uiBoxAppend(editor_pane, app.normal_view, 1);
+
+    /* AI view: describe it, get SQL (with an explanation) in the editor */
+    uiBox *ai_box = uiNewVerticalBox();
+    uiBoxSetPadded(ai_box, 1);
+    uiBoxAppend(ai_box, uiControl(uiNewLabel("Describe the query you need (e.g. top 10 customers "
+                                             "by total order value last month)")), 0);
+    app.ai_task = uiNewMultilineEntry();
+    uiBoxAppend(ai_box, uiControl(app.ai_task), 1);
+    uiBox *ai_row = uiNewHorizontalBox();
+    uiBoxSetPadded(ai_row, 1);
+    app.ai_btn = uiNewButton("Ask Claude (\xE2\x8C\x98\xE2\x86\xA9)"); /* "Ask Claude (⌘↩)" */
+    uiButtonOnClicked(app.ai_btn, on_ask_claude, NULL);
+    uiBoxAppend(ai_row, uiControl(app.ai_btn), 0);
+    uiBoxAppend(ai_row, uiControl(uiNewLabel("The SQL appears in the editor (Normal view); "
+                                             "nothing runs until you press Run.")), 0);
+    uiBoxAppend(ai_box, uiControl(ai_row), 0);
+    app.ai_view = uiControl(ai_box);
+    uiControlHide(app.ai_view);
+    uiBoxAppend(editor_pane, app.ai_view, 1);
 
     app.results_box = uiNewVerticalBox(); /* the pane stays, empty, until a query runs */
     app.editor_split = sqlc_new_vertical_split(uiControl(editor_pane), uiControl(app.results_box),

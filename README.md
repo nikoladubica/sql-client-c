@@ -76,12 +76,18 @@ If you cloned without `--recursive`, the Makefile fetches the submodule for you
 
 Fill in the connection fields, press **Connect**, type SQL and press **Run** (⌘↩).
 
-The query editor (with the **Run** button) takes the top half of the main
-area and the results the bottom half; the results pane is there, empty, before
+The query pane takes the top half of the main area and the results the bottom
+half; the results pane is there, empty, before
 the first query. Drag the divider between them to give either side more room.
 Each side keeps at least 100 points, so a large result can't push the editor
 out of view, and the position is saved (as a share of the height) and restored
 on the next launch.
+
+A **View** switcher at the top of the query pane picks what the pane shows, in
+place: **Normal** is the SQL editor with the **Run** button, **AI** is
+[Ask Claude](#ask-claude-ai-query-assistant). Only one is shown at a time; the
+results pane below doesn't change when you switch. Double-clicking a table
+in the sidebar switches back to **Normal**, since it replaces the editor's text.
 
 Connection options (all are saved with a connection):
 
@@ -109,11 +115,15 @@ changes).
 
 ### Ask Claude (AI query assistant)
 
-Type what you need in the **Ask Claude** field above the editor (for example
-*top 10 customers by total order value last month*) and press **Ask Claude**.
-Claude's answer replaces the editor's text: your request and Claude's
-explanation as `--` comments, then the SQL. **Nothing runs until you press Run**,
-so read it first and edit it if needed.
+Switch the query pane to the **AI** view (the **View** switcher, or
+**AI › Ask Claude**), describe what you need (for example *top 10 customers by
+total order value last month*) and press **Ask Claude** (or ⌘↩, which asks
+Claude instead of running while the AI view is shown). Claude's answer replaces
+the editor's text, and the pane switches back to the **Normal** view to show
+it: your request and Claude's explanation as `--` comments, then the SQL.
+**Nothing runs until you press Run**, so read it first and edit it if needed.
+Your request stays in the AI view, so you can refine it and ask again. If the
+request fails, the pane stays in the AI view.
 
 - **API key**: the first time, sqlc asks for an
   [Anthropic API key](https://console.anthropic.com/) and stores it in your login
