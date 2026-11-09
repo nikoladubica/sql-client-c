@@ -7,6 +7,7 @@
 
 /* Items of the sidebar's context menu, in menu order. */
 typedef enum {
+    TABLE_MENU_STRUCTURE,
     TABLE_MENU_COPY_NAME,
     TABLE_MENU_RENAME,
     TABLE_MENU_TRUNCATE,

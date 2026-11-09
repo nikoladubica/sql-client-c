@@ -19,11 +19,18 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
 - **Ask Claude**: describe the query you need in plain language and Claude
   writes the SQL into the editor, with an explanation as `--` comments, for you
   to review and run (needs an Anthropic API key)
-- Results grid, with one tab per result set, plus "Query OK" and error pages
+- Results grid, with one tab per result set, plus "Query OK" and error pages;
+  drag the line between the editor and the results to resize them (remembered)
+- **Query** / **Structure** tabs: Structure shows the columns (type, null, key,
+  default, extra, collation, comment) and indexes of the table selected in the
+  sidebar, with its engine, row estimate and collation; switching tabs keeps
+  the query, its results and the selection
 - Sidebar listing the tables in the current database, with a **Load tables** /
   **Refresh tables** button; drag its right edge to resize it (the width is remembered)
-- Double-click a table to browse it (`SELECT * ... LIMIT 1000`)
-- Right-click a table for **Copy Table Name**, **Rename**, **Truncate**, **Delete**
+- Double-click a table to browse it (`SELECT * ... LIMIT 1000`), then **edit its
+  rows in place**: double-click a cell to change it (with a calendar for dates),
+  **+** adds a row, **−** deletes the selected rows, **Reload**, **Delete All Rows…**
+- Right-click a table for **Show Structure**, **Copy Table Name**, **Rename**, **Truncate**, **Delete**
   and **Export** (Truncate and Delete always ask first; Cancel is the default)
 - **Export** a table as SQL, CSV or XML (select it, then **Export…** in the
   sidebar or **File › Export Table…**)
@@ -126,6 +133,33 @@ so read it first and edit it if needed.
 - Errors (no or invalid key, network, rate limits, overload) are shown in a
   dialog and the status bar.
 
+### Editing rows
+
+Double-click a table in the sidebar to browse it; its grid can then be edited,
+with a toolbar below it.
+
+- **Edit a cell**: double-click it, type, and press **Return** to save
+  (`UPDATE`), **Tab** / **Shift-Tab** to save and move to the next / previous
+  column, or **Escape** to cancel. Clicking elsewhere also saves.
+- The editor follows the column type: numbers are checked before saving,
+  dates (`DATE`) and date-times (`DATETIME`, `TIMESTAMP`) show a calendar under
+  the field (the clock too for date-times), and you can still type the value
+  (`2024-1-5` becomes `2024-01-05`, `2024-01-05 9:30` becomes
+  `2024-01-05 09:30:00`). For non-text columns, an empty value means `NULL`.
+- Right-click a cell for **Set to NULL**, **Copy Value** and **Delete Row…**.
+- **+** adds a row under the last one: type into its cells (empty ones show
+  `(default)` and get the column's default) and press **Return** to `INSERT` it.
+  The row is then read back, so auto-increment ids and defaults show up.
+- **−** deletes the selected rows (⌘-click or ⇧-click selects several) after
+  asking; they're deleted in one transaction.
+- **Reload** reads the table again; **Delete All Rows…** truncates it (asks
+  first).
+- If the server refuses a change (wrong type, constraint, duplicate key), the
+  error is shown and the editor reopens with what you typed, so you can fix it.
+- Rows are found by their primary key. Without one, they're matched on all
+  their values (except float and binary columns), one row at a time.
+  Binary and generated columns can't be edited, and views are read-only.
+
 ### Export
 
 Select a table in the sidebar and press **Export…** (or **File › Export Table…**),
@@ -192,11 +226,13 @@ freeze the window; the file only appears once the export has finished.
 | `src/main.c`, `src/complete.c` | CLI and its tab completion |
 | `src/gui.c` | GUI (libui-ng) |
 | `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), which libui-ng lacks |
-| `src/splitview.m` | Resizable sidebar: an `NSSplitView` wrapped as a libui control |
+| `src/splitview.m` | Resizable panes (sidebar, editor / results, columns / indexes): an `NSSplitView` wrapped as a libui control |
 | `src/export.c` | Streaming SQL / CSV / XML writers (no database code) |
 | `src/export_db.c` | Export a table from a connection through those writers |
 | `src/export_dialog.m` | Native export options dialog and save panel |
 | `src/table_menu.m` | Sidebar right-click menu, rename and API-key prompts, confirmations, clipboard |
+| `src/row_edit.c` | Row editing without UI: column kinds, value checks, `UPDATE` / `INSERT` / `DELETE` SQL |
+| `src/grid_edit.m` | In-place cell editor for the results grid (text field, calendar popover, cell menu) |
 | `src/ai.c` | Ask Claude: request body, Claude API call (libcurl), reply parsing, editor text, destructive-statement check |
 | `src/ai_db.c` | Current database's schema as text for the prompt |
 | `src/json.c` | Small JSON builder and parser used by `ai.c` |
@@ -206,7 +242,8 @@ freeze the window; the file only appears once the export has finished.
 
 `make test` runs the unit tests for the saved-connections file, the export
 writers' escaping/quoting, and Ask Claude's request/response handling,
-comment formatting and destructive-statement check (no database or network needed).
+comment formatting and destructive-statement check, and the row editor's value
+checks and generated SQL (no database or network needed).
 
 `make export-test` exports an edge-case table in every format and checks the
 result: the SQL is re-imported into an empty database and compared with
@@ -217,7 +254,10 @@ with Python. It creates and drops `test_sqlc_export_src` and `test_sqlc_export_d
 (connect, multi-statement results, views filter, double-click, row cap,
 export, `-A`, the context-menu actions on a scratch table `ctx_tmp`, and
 "Tables only, load once" with a scratch table `once_tmp`, and the Run warning
-for destructive SQL from Claude, without calling the API). It
+for destructive SQL from Claude, without calling the API, and row editing on
+scratch tables `edit_tmp` and `nopk_tmp`: cell edits, the calendar, invalid
+values, Set to NULL, adding, deleting several, Delete All Rows, a table without
+a primary key and a read-only view). It
 expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
 `customers` and `orders` plus a view.
 
@@ -228,9 +268,10 @@ expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
 - A `;` at the end of a line inside a quoted string ends the statement early.
 - Column widths are counted in bytes, so non-ASCII text may misalign.
 - No `\G` vertical output, TLS options or prepared statements yet.
-- GUI: the grid is read-only, there's no syntax highlighting, and it always
-  runs the whole editor (not just the selection). A running query can't be
-  cancelled yet.
+- GUI: only a browsed table's grid (double-click in the sidebar) can be
+  edited, not the results of your own queries; it shows the first 1000 rows.
+  There's no syntax highlighting, and it always runs the whole editor (not just
+  the selection). A running query can't be cancelled yet.
 - Ask Claude is GUI only (no `sqlc` CLI command yet), and the window is busy
   (Run disabled) until Claude answers; a request can't be cancelled.
 
