@@ -16,6 +16,8 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
 - **Saved connections**: save the connection fields under a name and pick it
   from a dropdown next time (passwords go in the macOS Keychain)
 - SQL editor with **Run** (button or ⌘↩); several statements at once
+- Editor above, results below, split in half; drag the divider between them
+  to resize (neither side can be dragged away, and the position is remembered)
 - **Ask Claude**: describe the query you need in plain language and Claude
   writes the SQL into the editor, with an explanation as `--` comments, for you
   to review and run (needs an Anthropic API key)
@@ -73,6 +75,13 @@ If you cloned without `--recursive`, the Makefile fetches the submodule for you
 ```
 
 Fill in the connection fields, press **Connect**, type SQL and press **Run** (⌘↩).
+
+The query editor (with the **Run** button) takes the top half of the main
+area and the results the bottom half; the results pane is there, empty, before
+the first query. Drag the divider between them to give either side more room.
+Each side keeps at least 100 points, so a large result can't push the editor
+out of view, and the position is saved (as a share of the height) and restored
+on the next launch.
 
 Connection options (all are saved with a connection):
 
@@ -192,7 +201,7 @@ freeze the window; the file only appears once the export has finished.
 | `src/main.c`, `src/complete.c` | CLI and its tab completion |
 | `src/gui.c` | GUI (libui-ng) |
 | `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), which libui-ng lacks |
-| `src/splitview.m` | Resizable sidebar: an `NSSplitView` wrapped as a libui control |
+| `src/splitview.m` | Resizable sidebar and editor/results divider: `NSSplitView`s wrapped as libui controls |
 | `src/export.c` | Streaming SQL / CSV / XML writers (no database code) |
 | `src/export_db.c` | Export a table from a connection through those writers |
 | `src/export_dialog.m` | Native export options dialog and save panel |
@@ -215,7 +224,7 @@ with Python. It creates and drops `test_sqlc_export_src` and `test_sqlc_export_d
 
 `make gui-test` builds the GUI with sanitizers and runs a scripted smoke test
 (connect, multi-statement results, views filter, double-click, row cap,
-export, `-A`, the context-menu actions on a scratch table `ctx_tmp`, and
+the editor/results divider's minimum heights, export, `-A`, the context-menu actions on a scratch table `ctx_tmp`, and
 "Tables only, load once" with a scratch table `once_tmp`, and the Run warning
 for destructive SQL from Claude, without calling the API). It
 expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables

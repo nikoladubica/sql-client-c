@@ -139,6 +139,7 @@ static struct {
 
     /* sidebar: list of tables in the current database */
     uiControl *split;        /* sidebar | editor + results */
+    uiControl *editor_split; /* editor + run row / results, draggable 50/50 */
     uiBox *side_box;
     uiTable *side_table;
     set_model *side_model;
@@ -1317,6 +1318,16 @@ static void autotest_next(void) {
         sqlc_split_set_sidebar_width(app.split, 5000);
         printf("[sidebar] width 5000 -> %d (window leaves room for the editor)\n",
                sqlc_split_sidebar_width(app.split));
+        /* editor/results divider: a 20000-row grid must not squeeze the
+         * editor away, and drags are clamped to 100 points per pane */
+        printf("[editor split] top %d after a big result (min 100)\n",
+               sqlc_split_top_height(app.editor_split));
+        sqlc_split_set_top_height(app.editor_split, 10);
+        printf("[editor split] top 10 -> %d (min 100)\n", sqlc_split_top_height(app.editor_split));
+        sqlc_split_set_top_height(app.editor_split, 5000);
+        printf("[editor split] top 5000 -> %d (results keep 100)\n",
+               sqlc_split_top_height(app.editor_split));
+        sqlc_split_set_top_height(app.editor_split, 300);
         /* export the selected sidebar table (the dialog is skipped) */
         {
             int r0 = 0;
@@ -1589,9 +1600,15 @@ static void build_window(void) {
                                          "(e.g. top 10 customers by total order value last month)",
                                          uiControl(ai_row))), 0);
 
+    /* Editor (+ run row) above, results below, with a draggable divider.
+     * In one uiBox their heights came only from libui's "stretchy children
+     * are equal" constraint, so a results grid could squeeze the editor away. */
+    uiBox *editor_pane = uiNewVerticalBox();
+    uiBoxSetPadded(editor_pane, 1);
+
     app.editor = uiNewNonWrappingMultilineEntry();
     uiMultilineEntrySetText(app.editor, "SHOW TABLES;");
-    uiBoxAppend(right, uiControl(app.editor), 1);
+    uiBoxAppend(editor_pane, uiControl(app.editor), 1);
 
     uiBox *run_row = uiNewHorizontalBox();
     uiBoxSetPadded(run_row, 1);
@@ -1599,10 +1616,12 @@ static void build_window(void) {
     uiButtonOnClicked(app.run_btn, on_run, NULL);
     uiBoxAppend(run_row, uiControl(app.run_btn), 0);
     uiBoxAppend(run_row, uiControl(uiNewLabel("Double-click a table to browse it.")), 0);
-    uiBoxAppend(right, uiControl(run_row), 0);
+    uiBoxAppend(editor_pane, uiControl(run_row), 0);
 
-    app.results_box = uiNewVerticalBox();
-    uiBoxAppend(right, uiControl(app.results_box), 1);
+    app.results_box = uiNewVerticalBox(); /* the pane stays, empty, until a query runs */
+    app.editor_split = sqlc_new_vertical_split(uiControl(editor_pane), uiControl(app.results_box),
+                                               0.5, 100, "EditorSplitFraction");
+    uiBoxAppend(right, app.editor_split, 1);
 
     app.status = uiNewLabel("Not connected.");
     uiBoxAppend(root, uiControl(app.status), 0);
