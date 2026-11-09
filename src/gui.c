@@ -34,6 +34,7 @@
 #include "ai_db.h"
 #include "db.h"
 #include "macos_menu.h"
+#include "segmented.h"
 #include "splitview.h"
 #include "export.h"
 #include "export_db.h"
@@ -119,8 +120,10 @@ static uiTable *new_grid(set_model *sm) {
 
 /* ---------- app state ---------- */
 
-/* Pages of the main area's tab. */
-enum { MODE_QUERY, MODE_STRUCTURE };
+/* What the main area shows, picked with the Normal | AI | Structure switch
+ * (its segments, in this order). Normal and AI share the query/results
+ * split and swap only its top pane; Structure is a page of its own. */
+enum { MODE_NORMAL, MODE_AI, MODE_STRUCTURE };
 
 /* The Structure page: columns and indexes of one table. */
 typedef struct {
@@ -163,16 +166,16 @@ static struct {
     uiMultilineEntry *editor;
     uiLabel *status;
 
-    /* main area: Query | Structure */
-    uiTab *mode_tab;
-    uiControl *query_split;  /* query pane above, results below, draggable */
+    /* main area: the Normal | AI | Structure switch above one page */
+    uiControl *mode_switch;  /* segmented, see segmented.h */
+    int mode;                /* MODE_*, what's shown */
+    uiControl *query_split;  /* Normal / AI page: query pane above, results below */
+    uiControl *structure_view; /* Structure page: columns above, indexes below */
     structure_page st;
 
-    /* Query pane: Normal view (SQL editor + run row) or AI view (Ask Claude),
-     * one at a time in the same space, picked with view_box */
-    uiCombobox *view_box;    /* VIEW_NORMAL / VIEW_AI */
-    uiControl *normal_view;  /* editor + run row */
-    uiControl *ai_view;      /* request + Ask Claude */
+    /* the query split's top pane: one of these at a time, in the same space */
+    uiControl *normal_view;  /* SQL editor + run row (MODE_NORMAL) */
+    uiControl *ai_view;      /* request + Ask Claude (MODE_AI) */
 
     /* Ask Claude: describe a query, get SQL in the editor */
     uiMultilineEntry *ai_task;
@@ -257,28 +260,6 @@ static void set_busy(int busy) {
         uiControlEnable(uiControl(app.ai_btn));
         uiControlEnable(uiControl(app.st.refresh_btn));
     }
-}
-
-/* ---------- query pane views ---------- */
-
-enum { VIEW_NORMAL, VIEW_AI }; /* view_box items, in this order */
-
-static int in_ai_view(void) {
-    return app.ai_view && uiControlVisible(app.ai_view);
-}
-
-/* Shows one view of the query pane, in place, and keeps the switcher in step
- * (uiComboboxSetSelected doesn't call on_view_selected). */
-static void show_view(int view) {
-    if (view == VIEW_AI) {
-        uiControlHide(app.normal_view);
-        uiControlShow(app.ai_view);
-    } else {
-        uiControlHide(app.ai_view);
-        uiControlShow(app.normal_view);
-    }
-    if (uiComboboxSelected(app.view_box) != view)
-        uiComboboxSetSelected(app.view_box, view);
 }
 
 /* Load the table list on connect? Not with -A, but "Tables only, load once" does. */
@@ -869,7 +850,7 @@ static void start_structure(const char *table) {
 /* On the Structure page, show the table selected in the sidebar (loading
  * it if it isn't the one shown). Called whenever that might have changed. */
 static void structure_sync(void) {
-    if (uiTabSelected(app.mode_tab) != MODE_STRUCTURE) return;
+    if (app.mode != MODE_STRUCTURE) return;
     if (!app.conn) { structure_message("Not connected."); return; }
     const char *name = selected_table(NULL);
     if (!name) {
@@ -883,14 +864,34 @@ static void structure_sync(void) {
     start_structure(name);
 }
 
+/* Shows one mode of the main area and keeps the switch in step (setting it
+ * from code doesn't call on_mode_changed). The results stay as they are
+ * across Normal / AI; Structure loads the selected table if needed. */
 static void show_mode(int mode) {
-    if (uiTabSelected(app.mode_tab) != mode) uiTabSetSelected(app.mode_tab, mode);
-    structure_sync(); /* uiTabSetSelected doesn't call on_mode_selected */
+    if (mode != MODE_AI && mode != MODE_STRUCTURE) mode = MODE_NORMAL;
+    app.mode = mode;
+    if (mode == MODE_STRUCTURE) {
+        uiControlHide(app.query_split);
+        uiControlShow(app.structure_view);
+    } else {
+        if (mode == MODE_AI) {
+            uiControlHide(app.normal_view);
+            uiControlShow(app.ai_view);
+        } else {
+            uiControlHide(app.ai_view);
+            uiControlShow(app.normal_view);
+        }
+        uiControlHide(app.structure_view);
+        uiControlShow(app.query_split);
+    }
+    if (sqlc_segmented_selected(app.mode_switch) != mode)
+        sqlc_segmented_set_selected(app.mode_switch, mode);
+    structure_sync();
 }
 
-static void on_mode_selected(uiTab *t, void *data) {
-    (void)t; (void)data;
-    structure_sync();
+static void on_mode_changed(uiControl *seg, int index, void *data) {
+    (void)seg; (void)data;
+    show_mode(index);
 }
 
 static int sync_queued;
@@ -1025,11 +1026,10 @@ static void job_done(void *data) {
             char *text = ai_format(j->task, &j->ai);
             if (text) {
                 uiMultilineEntrySetText(app.editor, text);
-                show_mode(MODE_QUERY);
                 app.ai_in_editor = 1;
                 free(app.browsing);
                 app.browsing = NULL;
-                show_view(VIEW_NORMAL); /* the SQL is in the editor: show it */
+                show_mode(MODE_NORMAL); /* the SQL is in the editor: show it */
             }
             free(text);
             if (j->ai.sql && *j->ai.sql)
@@ -1179,7 +1179,8 @@ static int run_query(const char *sql, const char *browse) {
     j->hide_views = j->eo.hide_views;
     set_status("Running...");
     start_job(j);
-    show_mode(MODE_QUERY); /* that's where the results go */
+    /* that's where the results go (AI shows them too: stay there) */
+    if (app.mode == MODE_STRUCTURE) show_mode(MODE_NORMAL);
     return 1;
 }
 
@@ -1193,7 +1194,7 @@ static int browse_table(const char *name) {
     if (sql) {
         uiMultilineEntrySetText(app.editor, sql);
         app.ai_in_editor = 0;
-        show_view(VIEW_NORMAL); /* the editor's text was replaced: show what runs */
+        show_mode(MODE_NORMAL); /* the editor's text was replaced: show what runs */
         started = run_query(sql, copy);
         if (started) {
             free(app.browsing);
@@ -1231,8 +1232,12 @@ static int confirm_ai_sql(const char *sql) {
 }
 
 static void on_run_menu(void) {
-    if (in_ai_view()) { /* the editor is hidden: ⌘↩ sends the request instead */
+    if (app.mode == MODE_AI) { /* the editor is hidden: ⌘↩ sends the request instead */
         ask_claude_now();
+        return;
+    }
+    if (app.mode == MODE_STRUCTURE) { /* the editor is hidden: don't run it unseen */
+        set_status("Switch to Normal to run SQL (\xE2\x8C\x98\xE2\x86\xA9 runs the editor there).");
         return;
     }
     char *sql = uiMultilineEntryText(app.editor);
@@ -1340,15 +1345,9 @@ static void on_ask_claude(uiButton *b, void *data) {
     ask_claude_now();
 }
 
-static void on_view_selected(uiCombobox *c, void *data) {
-    (void)data;
-    show_view(uiComboboxSelected(c));
-}
-
 static void on_ask_claude_menu(uiMenuItem *m, uiWindow *w, void *data) {
     (void)m; (void)w; (void)data;
-    show_mode(MODE_QUERY); /* the AI view is part of the Query page */
-    show_view(VIEW_AI);
+    show_mode(MODE_AI);
 }
 
 static void load_tables_now(void) {
@@ -2564,14 +2563,18 @@ static void autotest_next(void) {
         run_sql("DROP TABLE once_tmp;");
         break;
     case 23: {
-        /* the query pane's Normal / AI switcher swaps the views in place */
-        show_view(VIEW_AI);
-        printf("[view] AI: ai view %d, editor view %d, switcher %d\n", uiControlVisible(app.ai_view),
-               uiControlVisible(app.normal_view), uiComboboxSelected(app.view_box));
-        show_view(VIEW_NORMAL);
-        printf("[view] Normal: ai view %d, editor view %d, switcher %d\n",
+        /* the Normal / AI / Structure switch: Normal and AI swap the query
+         * pane in place above the same results; Structure replaces both */
+        show_mode(MODE_AI);
+        printf("[view] AI: ai view %d, editor view %d, results %d, structure %d, switch %d\n",
                uiControlVisible(app.ai_view), uiControlVisible(app.normal_view),
-               uiComboboxSelected(app.view_box));
+               uiControlVisible(app.query_split), uiControlVisible(app.structure_view),
+               sqlc_segmented_selected(app.mode_switch));
+        show_mode(MODE_NORMAL);
+        printf("[view] Normal: ai view %d, editor view %d, results %d, structure %d, switch %d\n",
+               uiControlVisible(app.ai_view), uiControlVisible(app.normal_view),
+               uiControlVisible(app.query_split), uiControlVisible(app.structure_view),
+               sqlc_segmented_selected(app.mode_switch));
         /* Claude's SQL (no network here: as if Ask Claude had filled the
          * editor): a destructive statement asks first; the test cancels. */
         ai_result r = { .explanation = strdup("Deletes every customer."),
@@ -2739,7 +2742,9 @@ static void autotest_next(void) {
         uiTableSelection sel = { .NumRows = 1, .Rows = &row };
         uiTableSetSelection(app.side_table, &sel);
         show_mode(MODE_STRUCTURE);
-        printf("[structure] tab: %d, loading: %s\n", uiTabSelected(app.mode_tab),
+        printf("[structure] switch: %d, page shown: %d, query page shown: %d, loading: %s\n",
+               sqlc_segmented_selected(app.mode_switch), uiControlVisible(app.structure_view),
+               uiControlVisible(app.query_split),
                app.busy && app.job_kind == JOB_STRUCTURE ? "yes" : "no");
         break;
     }
@@ -2785,8 +2790,8 @@ static void autotest_next(void) {
     }
     case 45:
         autotest_print("browse after structure");
-        printf("[structure] tab: %s, browsing: %s, sidebar selection kept: %s\n",
-               uiTabSelected(app.mode_tab) == MODE_QUERY ? "Query" : "Structure",
+        printf("[structure] mode: %s, browsing: %s, sidebar selection kept: %s\n",
+               app.mode == MODE_NORMAL ? "Normal" : app.mode == MODE_AI ? "AI" : "Structure",
                app.browsing ? app.browsing : "-",
                selected_table(NULL) ? selected_table(NULL) : "-");
         /* the editor / results divider */
@@ -2798,6 +2803,12 @@ static void autotest_next(void) {
         printf("[split] dragged to the bottom: editor %d (results keep their minimum)\n",
                sqlc_split_position(app.query_split));
         sqlc_split_set_position(app.query_split, 200);
+        /* ⌘↩ on Structure runs nothing (the editor is hidden), only a hint;
+         * customers' structure is already shown, so nothing loads either */
+        show_mode(MODE_STRUCTURE);
+        on_run_menu();
+        printf("[structure] cmd-return on Structure: busy %d, results page shown %d\n",
+               app.busy, uiControlVisible(app.query_split));
         fflush(stdout);
         if (on_should_quit(NULL)) uiQuit();
         break;
@@ -2916,32 +2927,28 @@ static void build_window(void) {
     uiButtonOnClicked(app.export_btn, on_export, NULL);
     uiBoxAppend(app.side_box, uiControl(app.export_btn), 0);
 
-    /* right side: Query | Structure */
-    app.mode_tab = uiNewTab();
-    uiTabOnSelected(app.mode_tab, on_mode_selected, NULL);
+    /* right side: a slim bar with the Normal | AI | Structure switch at its
+     * right edge, above one page at a time */
+    uiBox *main_box = uiNewVerticalBox();
+    uiBoxSetPadded(main_box, 1);
+    uiBox *switch_row = uiNewHorizontalBox();
+    uiBoxSetPadded(switch_row, 1);
+    static const char *const modes[] = { "Normal", "AI", "Structure" }; /* MODE_* order */
+    app.mode_switch = sqlc_new_segmented(modes, 3);
+    sqlc_segmented_on_changed(app.mode_switch, on_mode_changed, NULL);
+    uiBoxAppend(switch_row, uiControl(uiNewHorizontalBox()), 1); /* pushes it right */
+    uiBoxAppend(switch_row, app.mode_switch, 0);
+    uiBoxAppend(main_box, uiControl(switch_row), 0);
 
-    app.split = sqlc_new_sidebar_split(uiControl(app.side_box), uiControl(app.mode_tab),
+    app.split = sqlc_new_sidebar_split(uiControl(app.side_box), uiControl(main_box),
                                        220, 120, "SidebarWidth");
     uiBoxAppend(root, app.split, 1);
 
-    /* Query page: the query pane above, results below, with a draggable
+    /* Normal / AI page: the query pane above, results below, with a draggable
      * divider. The query pane has two views in the same space, one shown at
      * a time: Normal (SQL editor + run row) and AI (Ask Claude). */
-    uiBox *query = uiNewVerticalBox();
-    uiBoxSetPadded(query, 1);
     uiBox *editor_pane = uiNewVerticalBox();
     uiBoxSetPadded(editor_pane, 1);
-
-    uiBox *view_row = uiNewHorizontalBox();
-    uiBoxSetPadded(view_row, 1);
-    app.view_box = uiNewCombobox();
-    uiComboboxAppend(app.view_box, "Normal");    /* VIEW_NORMAL */
-    uiComboboxAppend(app.view_box, "AI");        /* VIEW_AI */
-    uiComboboxSetSelected(app.view_box, VIEW_NORMAL);
-    uiComboboxOnSelected(app.view_box, on_view_selected, NULL);
-    uiBoxAppend(view_row, uiControl(uiNewLabel("View:")), 0);
-    uiBoxAppend(view_row, uiControl(app.view_box), 0);
-    uiBoxAppend(editor_pane, uiControl(view_row), 0);
 
     /* Normal view: the SQL editor and the run row */
     uiBox *normal = uiNewVerticalBox();
@@ -2985,8 +2992,7 @@ static void build_window(void) {
     app.results_box = uiNewVerticalBox(); /* the pane stays, empty, until a query runs */
     app.query_split = sqlc_new_stacked_split(uiControl(editor_pane), uiControl(app.results_box),
                                              0, 100, 100, "QueryEditorHeight");
-    uiBoxAppend(query, app.query_split, 1);
-    uiTabAppend(app.mode_tab, "Query", uiControl(query));
+    uiBoxAppend(main_box, app.query_split, 1);
 
     /* Structure page */
     uiBox *structure = uiNewVerticalBox();
@@ -3012,7 +3018,10 @@ static void build_window(void) {
     uiBoxAppend(idx_pane, uiControl(app.st.idx_box), 1);
     uiBoxAppend(structure, sqlc_new_stacked_split(uiControl(cols_pane), uiControl(idx_pane),
                                                   280, 80, 80, "StructureColumnsHeight"), 1);
-    uiTabAppend(app.mode_tab, "Structure", uiControl(structure));
+    app.structure_view = uiControl(structure);
+    uiControlHide(app.structure_view);
+    uiBoxAppend(main_box, app.structure_view, 1);
+    app.mode = MODE_NORMAL;
 
     app.status = uiNewLabel("Not connected.");
     uiBoxAppend(root, uiControl(app.status), 0);

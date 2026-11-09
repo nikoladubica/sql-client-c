@@ -22,10 +22,12 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
   writes the SQL into the editor, with an explanation as `--` comments, for you
   to review and run (needs an Anthropic API key)
 - Results grid, with one tab per result set, plus "Query OK" and error pages
-- **Query** / **Structure** tabs: Structure shows the columns (type, null, key,
-  default, extra, collation, comment) and indexes of the table selected in the
-  sidebar, with its engine, row estimate and collation; switching tabs keeps
-  the query, its results and the selection
+- **Normal** / **AI** / **Structure** switch at the top right of the main
+  area: Normal is the SQL editor above the results, AI is Ask Claude above the
+  same results, and Structure shows the columns (type, null, key, default,
+  extra, collation, comment) above the indexes of the table selected in the
+  sidebar, with its engine, row estimate and collation; switching keeps the
+  query, its results and the selection
 - Sidebar listing the tables in the current database, with a **Load tables** /
   **Refresh tables** button; drag its right edge to resize it (the width is remembered)
 - Double-click a table to browse it (`SELECT * ... LIMIT 1000`), then **edit its
@@ -84,19 +86,29 @@ If you cloned without `--recursive`, the Makefile fetches the submodule for you
 
 Fill in the connection fields, press **Connect**, type SQL and press **Run** (⌘↩).
 
-On the **Query** tab, the query pane takes the top half and the results the
-bottom half; the results pane is there, empty, before the first query. Drag
+A **Normal | AI | Structure** switch at the right end of a slim bar above the
+main area (right of the sidebar) picks what the area shows. In **Normal** and
+**AI**, the query pane takes the top half and the results the bottom half; the results pane is there, empty, before the first query. Drag
 the divider between them to give either side more room. Each side keeps at
 least 100 points, so a large result can't push the editor out of view. The
 editor's height is saved and restored on the next launch, clamped so that
 both panes still fit; when the window is resized, the editor keeps its height
 and the results take the difference.
 
-A **View** switcher at the top of the query pane picks what the pane shows, in
-place: **Normal** is the SQL editor with the **Run** button, **AI** is
-[Ask Claude](#ask-claude-ai-query-assistant). Only one is shown at a time; the
-results pane below doesn't change when you switch. Double-clicking a table
-in the sidebar switches back to **Normal**, since it replaces the editor's text.
+**Normal** shows the SQL editor with the **Run** button in the query pane, and
+**AI** shows [Ask Claude](#ask-claude-ai-query-assistant) in its place; the
+results pane below doesn't change when you switch between the two.
+Double-clicking a table in the sidebar switches to **Normal**, since it
+replaces the editor's text, and running a query from **Structure** (a table
+browse, a reload) switches to **Normal** to show its results.
+
+**Structure** replaces the query pane and the results with the structure of
+the table selected in the sidebar: its columns above, its indexes below, with
+a draggable divider (its position is remembered) and a **Refresh** button.
+The structure is loaded when you switch to it and whenever the sidebar
+selection changes while it's shown; **Show Structure** in a table's
+right-click menu switches to it. ⌘↩ runs nothing while Structure is shown
+(the editor is hidden); switch to **Normal** to run SQL.
 
 Connection options (all are saved with a connection):
 
@@ -124,15 +136,15 @@ whose password you'd rather type each time.
 
 ### Ask Claude (AI query assistant)
 
-On the **Query** tab, switch the query pane to the **AI** view (the **View**
-switcher, or **AI › Ask Claude**, which also brings the Query tab forward), describe what you need (for example *top 10 customers by
+Switch the main area to **AI** (the **Normal | AI | Structure** switch, or
+**AI › Ask Claude**), describe what you need (for example *top 10 customers by
 total order value last month*) and press **Ask Claude** (or ⌘↩, which asks
-Claude instead of running while the AI view is shown). Claude's answer replaces
-the editor's text, and the pane switches back to the **Normal** view to show
+Claude instead of running while AI is shown). Claude's answer replaces
+the editor's text, and the switch goes back to **Normal** to show
 it: your request and Claude's explanation as `--` comments, then the SQL.
 **Nothing runs until you press Run**, so read it first and edit it if needed.
-Your request stays in the AI view, so you can refine it and ask again. If the
-request fails, the pane stays in the AI view.
+Your request stays in the AI pane, so you can refine it and ask again. If the
+request fails, the switch stays on **AI**.
 
 - **API key**: the first time, sqlc asks for an
   [Anthropic API key](https://console.anthropic.com/) and saves it in
@@ -269,6 +281,7 @@ and data as for a table; there is no CSV or XML form.
 | `src/gui.c` | GUI (libui-ng) |
 | `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), which libui-ng lacks |
 | `src/splitview.m` | Resizable panes (sidebar, editor / results, columns / indexes): an `NSSplitView` wrapped as a libui control |
+| `src/segmented.m` | The Normal / AI / Structure switch: an `NSSegmentedControl` wrapped as a libui control |
 | `src/export.c` | Streaming SQL / CSV / XML writers (no database code) |
 | `src/export_db.c` | Export a table, or the whole current database as SQL, from a connection through those writers |
 | `src/export_dialog.m` | Native export options dialogs (table and database) and save panel |
@@ -295,7 +308,7 @@ with Python. It creates and drops `test_sqlc_export_src` and `test_sqlc_export_d
 
 `make gui-test` builds the GUI with sanitizers and runs a scripted smoke test
 (connect, multi-statement results, views filter, double-click, row cap,
-the editor/results divider's minimum heights, the Normal / AI view switcher,
+the editor/results divider's minimum heights, the Normal / AI / Structure switch,
 table and database export, `-A`, the context-menu actions on a scratch table `ctx_tmp`, and
 "Tables only, load once" with a scratch table `once_tmp`, and the Run warning
 for destructive SQL from Claude, without calling the API, and row editing on
