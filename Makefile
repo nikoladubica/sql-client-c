@@ -37,10 +37,10 @@ $(LIBUI_LIB): $(LIBUI_OBJ)
 
 # ---- GUI: sqlc-gui ----
 GUI_BIN := sqlc-gui
-GUI_SRC := src/gui.c src/db.c src/profiles.c src/macos_menu.m src/splitview.m \
+GUI_SRC := src/gui.c src/db.c src/profiles.c src/macos_menu.m src/splitview.m src/segmented.m \
            src/export.c src/export_db.c src/export_dialog.m src/table_menu.m \
            src/ai.c src/ai_db.c src/json.c src/row_edit.c src/grid_edit.m
-GUI_HDR := src/db.h src/profiles.h src/macos_menu.h src/splitview.h \
+GUI_HDR := src/db.h src/profiles.h src/macos_menu.h src/splitview.h src/segmented.h \
            src/export.h src/export_db.h src/export_dialog.h src/table_menu.h \
            src/ai.h src/ai_db.h src/json.h src/row_edit.h src/grid_edit.h
 GUI_LIBS := $(LIBUI_LIB) -framework Foundation -framework AppKit -lobjc -lcurl

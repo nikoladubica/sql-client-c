@@ -17,7 +17,8 @@ typedef struct SqlcSplit SqlcSplit;
 
 @interface SqlcSplitView : NSSplitView <NSSplitViewDelegate> {
 @public
-    CGFloat wanted;      /* first pane's size to apply on the first layout */
+    CGFloat wanted;      /* first pane's size to apply on the first layout;
+                            0 or less = half of the room */
     CGFloat minFirst, minSecond;
     NSString *saveKey;   /* retained; nil = don't persist */
     BOOL positioned;     /* initial size applied; saving is allowed */
@@ -35,19 +36,30 @@ typedef struct SqlcSplit SqlcSplit;
     return [self isVertical] ? NSWidth(r) : NSHeight(r);
 }
 
+/* Room left for both panes once the divider is taken out. */
+- (CGFloat)paneSpace {
+    return [self lengthOf:[self bounds]] - [self dividerThickness];
+}
+
+/* Clamp a divider position so that neither pane goes below its minimum. */
+- (CGFloat)clampPosition:(CGFloat)pos {
+    CGFloat max = [self paneSpace] - minSecond;
+    if (pos > max) pos = max;
+    if (pos < minFirst) pos = minFirst;
+    return pos;
+}
+
 - (void)layout {
     [super layout];
     // Panes have no size until the first layout pass, so apply the starting
-    // size here, once.
-    CGFloat len = [self lengthOf:[self bounds]];
-    if (!positioned && len > 0) {
-        CGFloat w = wanted;
-        CGFloat max = len - minSecond - [self dividerThickness];
-        if (w > max) w = max;
-        if (w < minFirst) w = minFirst;
-        [self setPosition:w ofDividerAtIndex:0];
-        positioned = YES;
-    }
+    // size here, once - and only when both minimums fit, so a tiny first
+    // pass can't pin the divider against one edge.
+    if (positioned) return;
+    CGFloat space = [self paneSpace];
+    if (space <= 0 || space < minFirst + minSecond) return;
+    CGFloat w = wanted > 0 ? wanted : floor(space / 2);
+    [self setPosition:[self clampPosition:w] ofDividerAtIndex:0];
+    positioned = YES;
 }
 
 // Constraints already enforce these; the delegate keeps the drag itself from
@@ -59,7 +71,8 @@ typedef struct SqlcSplit SqlcSplit;
 
 - (CGFloat)splitView:(NSSplitView *)sv constrainMaxCoordinate:(CGFloat)proposed ofSubviewAt:(NSInteger)i {
     (void)i;
-    CGFloat max = [self lengthOf:[sv bounds]] - minSecond - [sv dividerThickness];
+    (void)sv;
+    CGFloat max = [self paneSpace] - minSecond;
     return proposed > max ? max : proposed;
 }
 
@@ -82,7 +95,7 @@ typedef struct SqlcSplit SqlcSplit;
     NSArray *panes = [self arrangedSubviews];
     if ([panes count] < 1) return;
     CGFloat w = [self lengthOf:[[panes objectAtIndex:0] frame]];
-    if (w >= minFirst)
+    if (w >= minFirst && [self paneSpace] - w >= minSecond)
         [[NSUserDefaults standardUserDefaults] setDouble:w forKey:saveKey];
 }
 @end
@@ -247,7 +260,7 @@ int sqlc_split_position(uiControl *split) {
 
 void sqlc_split_set_position(uiControl *split, int size) {
     SqlcSplitView *sv = SqlcSplit(split)->split;
-    [sv setPosition:size ofDividerAtIndex:0];
+    [sv setPosition:[sv clampPosition:size] ofDividerAtIndex:0];
     [[sv window] layoutIfNeeded];
 }
 

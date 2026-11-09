@@ -24,6 +24,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <time.h>
 
 #include <ui.h>
@@ -34,6 +35,7 @@
 #include "ai_db.h"
 #include "db.h"
 #include "macos_menu.h"
+#include "segmented.h"
 #include "splitview.h"
 #include "export.h"
 #include "export_db.h"
@@ -119,8 +121,10 @@ static uiTable *new_grid(set_model *sm) {
 
 /* ---------- app state ---------- */
 
-/* Pages of the main area's tab. */
-enum { MODE_QUERY, MODE_STRUCTURE };
+/* What the main area shows, picked with the Normal | AI | Structure switch
+ * (its segments, in this order). Normal and AI share the query/results
+ * split and swap only its top pane; Structure is a page of its own. */
+enum { MODE_NORMAL, MODE_AI, MODE_STRUCTURE };
 
 /* The Structure page: columns and indexes of one table. */
 typedef struct {
@@ -163,13 +167,19 @@ static struct {
     uiMultilineEntry *editor;
     uiLabel *status;
 
-    /* main area: Query | Structure */
-    uiTab *mode_tab;
-    uiControl *query_split;  /* editor above, results below */
+    /* main area: the Normal | AI | Structure switch above one page */
+    uiControl *mode_switch;  /* segmented, see segmented.h */
+    int mode;                /* MODE_*, what's shown */
+    uiControl *query_split;  /* Normal / AI page: query pane above, results below */
+    uiControl *structure_view; /* Structure page: columns above, indexes below */
     structure_page st;
 
+    /* the query split's top pane: one of these at a time, in the same space */
+    uiControl *normal_view;  /* SQL editor + run row (MODE_NORMAL) */
+    uiControl *ai_view;      /* request + Ask Claude (MODE_AI) */
+
     /* Ask Claude: describe a query, get SQL in the editor */
-    uiEntry *ai_task;
+    uiMultilineEntry *ai_task;
     uiButton *ai_btn;
     int ai_in_editor;        /* the editor holds Claude's SQL, not run yet */
 
@@ -181,7 +191,7 @@ static struct {
     db_outcome shown; /* data behind the result grids */
 
     /* sidebar: list of tables in the current database */
-    uiControl *split;        /* sidebar | editor + results */
+    uiControl *split;        /* sidebar | Query / Structure */
     uiBox *side_box;
     uiTable *side_table;
     set_model *side_model;
@@ -194,6 +204,7 @@ static struct {
     char *browsing;          /* table shown by a double-click browse, or NULL */
     char *pending_browse;    /* double-clicked while a structure was loading */
     grid_edit_state edit;    /* editing that table's rows */
+    char *current_db;        /* SELECT DATABASE() after the last job, or NULL */
 
     MYSQL *conn;
     int busy;
@@ -352,14 +363,17 @@ static void show_outcome(db_outcome *out, const db_outcome *meta) {
 static void on_table_double_click(uiTable *t, int row, void *data);
 static void on_side_selection(uiTable *t, void *data);
 static const char *selected_table(int *is_view_out);
+static size_t selected_count(void);
+static int selected_tables(char ***names_out, size_t *n_out);
+static void free_names(char **names, size_t n);
 static unsigned on_table_menu_open(int row, void *data);
 static void on_table_menu_action(table_menu_item item, int row, void *data);
 
 static int is_view(const char *type) { return type && strstr(type, "VIEW") != NULL; }
 
 /* Rebuild the visible table list from tables_raw and the "Hide views" box,
- * selecting the table named keep (if it's in the list). */
-static void rebuild_sidebar_keeping(const char *keep) {
+ * selecting the nkeep tables named in keep (those still in the list). */
+static void rebuild_sidebar_keeping(char *const *keep, size_t nkeep) {
     if (app.side_table) {
         uiBoxDelete(app.side_box, uiBoxNumChildren(app.side_box) - 1);
         uiControlDestroy(uiControl(app.side_table));
@@ -372,7 +386,6 @@ static void rebuild_sidebar_keeping(const char *keep) {
     app.side_index = NULL;
 
     int hide = uiCheckboxChecked(app.hide_views);
-    int keep_row = -1;
     const db_set *raw = app.tables_raw.nsets ? &app.tables_raw.sets[0] : NULL;
     size_t n = raw ? raw->nrows : 0;
 
@@ -393,7 +406,6 @@ static void rebuild_sidebar_keeping(const char *keep) {
         char buf[512];
         snprintf(buf, sizeof buf, is_view(type) ? "%s  (view)" : "%s", name);
         s->cells[s->nrows] = strdup(buf);
-        if (keep && strcmp(keep, name) == 0) keep_row = (int)s->nrows;
         app.side_index[s->nrows] = r;
         s->nrows++;
     }
@@ -402,29 +414,49 @@ static void rebuild_sidebar_keeping(const char *keep) {
 
     app.side_model = new_set_model(s);
     app.side_table = new_grid(app.side_model);
+    /* Shift-click selects a range, Command-click adds or removes a row */
+    uiTableSetSelectionMode(app.side_table, uiTableSelectionModeZeroOrMany);
     sqlc_table_fill_width(app.side_table); /* column follows the sidebar width */
     uiTableOnRowDoubleClicked(app.side_table, on_table_double_click, NULL);
     uiTableOnSelectionChanged(app.side_table, on_side_selection, NULL);
     sqlc_table_set_context_menu(app.side_table, on_table_menu_open, on_table_menu_action, NULL);
     uiBoxAppend(app.side_box, uiControl(app.side_table), 1);
-    if (keep_row >= 0) {
-        uiTableSelection sel = { .NumRows = 1, .Rows = &keep_row };
-        uiTableSetSelection(app.side_table, &sel);
+    if (nkeep == 0 || s->nrows == 0 || s->nrows > (size_t)INT_MAX) return;
+
+    /* the visible rows whose table is in keep */
+    const char **names = calloc(s->nrows, sizeof *names);
+    unsigned char *kept = calloc(s->nrows, 1);
+    int *rows = calloc(s->nrows, sizeof *rows);
+    if (names && kept && rows) {
+        for (size_t v = 0; v < s->nrows; v++) names[v] = db_cell(raw, app.side_index[v], 0);
+        if (export_select_names(s->nrows, names, nkeep, (const char *const *)keep, kept, NULL) >= 0) {
+            int nrows = 0;
+            for (size_t v = 0; v < s->nrows; v++)
+                if (kept[v]) rows[nrows++] = (int)v;
+            if (nrows) {
+                uiTableSelection sel = { .NumRows = nrows, .Rows = rows };
+                uiTableSetSelection(app.side_table, &sel);
+            }
+        }
     }
+    free(rows);
+    free(kept);
+    free(names);
 }
 
 /* The same, keeping the current selection (tables_raw must be unchanged). */
 static void rebuild_sidebar(void) {
-    const char *was = selected_table(NULL);
-    char *keep = was ? strdup(was) : NULL;
-    rebuild_sidebar_keeping(keep);
-    free(keep);
+    char **keep = NULL;
+    size_t nkeep = 0;
+    if (selected_tables(&keep, &nkeep) != 0) nkeep = 0; /* out of memory: drop it */
+    rebuild_sidebar_keeping(keep, nkeep);
+    free_names(keep, nkeep);
 }
 
 /* ---------- worker thread ---------- */
 
-typedef enum { JOB_CONNECT, JOB_QUERY, JOB_TABLES, JOB_EXPORT, JOB_ALTER, JOB_AI, JOB_ROWS,
-               JOB_STRUCTURE } job_kind;
+typedef enum { JOB_CONNECT, JOB_QUERY, JOB_TABLES, JOB_EXPORT, JOB_EXPORT_DB, JOB_ALTER,
+               JOB_AI, JOB_ROWS, JOB_STRUCTURE } job_kind;
 
 /* JOB_ROWS: a change to the rows of the browsed table's grid */
 typedef enum { ROW_UPDATE, ROW_INSERT, ROW_DELETE } row_op;
@@ -442,7 +474,8 @@ typedef struct {
     char *profile;            /* saved connection used to connect, if any */
     int load_tables;          /* refresh the table list afterwards */
     int hide_views;           /* ... leaving views out of it */
-    /* JOB_EXPORT, JOB_ALTER, JOB_STRUCTURE */
+    /* JOB_EXPORT, JOB_EXPORT_DB (table = the database's name), JOB_ALTER,
+     * JOB_STRUCTURE */
     char *table, *path;
     alter_kind alter;
     char *new_name;           /* ALTER_RENAME */
@@ -450,6 +483,9 @@ typedef struct {
     export_format fmt;
     export_opts xopts;
     unsigned long long rows;
+    export_db_stats db_stats; /* JOB_EXPORT_DB */
+    char **names;             /* ... only these tables/views (malloc'd), if nnames */
+    size_t nnames;
     /* JOB_AI */
     char *task, *api_key;
     ai_result ai;
@@ -483,6 +519,7 @@ static void job_free(job *j) {
     free(j->table);
     free(j->path);
     free(j->new_name);
+    free_names(j->names, j->nnames);
     free(j->task);
     if (j->api_key) { memset(j->api_key, 0, strlen(j->api_key)); free(j->api_key); }
     ai_result_free(&j->ai);
@@ -527,6 +564,7 @@ static void remember_last_profile(const char *name);
 static void autotest_next(void);
 static int on_should_quit(void *data);
 #endif
+static void ask_claude_now(void);
 
 /* JOB_AI on the worker thread: schema, then the Claude API call. */
 static void ask_claude(job *j) {
@@ -624,6 +662,36 @@ static void export_progress(unsigned long long rows, void *data) {
     uiQueueMain(show_export_progress, r);
 }
 
+/* Database export progress: same hop, with the table being written. */
+typedef struct {
+    char *table;
+    const char *what;         /* "database" or "tables" (static strings) */
+    size_t index, count;
+    unsigned long long rows;
+} db_export_progress;
+
+static void show_db_export_progress(void *data) {
+    db_export_progress *p = data;
+    if (app.busy)
+        set_status("Exporting %s... %s (%zu of %zu), %llu rows",
+                   p->what, p->table, p->index, p->count, p->rows);
+    free(p->table);
+    free(p);
+}
+
+static void db_export_progress_cb(const char *table, size_t index, size_t count,
+                                  unsigned long long rows, void *data) {
+    db_export_progress *p = malloc(sizeof *p);
+    if (!p) return;
+    p->table = strdup(table ? table : "");
+    if (!p->table) { free(p); return; }
+    p->what = data ? (const char *)data : "database"; /* a string literal */
+    p->index = index;
+    p->count = count;
+    p->rows = rows;
+    uiQueueMain(show_db_export_progress, p);
+}
+
 static void *worker(void *data) {
     job *j = data;
     double t0 = now_seconds();
@@ -661,6 +729,14 @@ static void *worker(void *data) {
     } else if (j->kind == JOB_EXPORT) {
         j->ok = export_table(j->conn, j->table, j->is_view, j->fmt, &j->xopts, j->path,
                              export_progress, NULL, &j->rows, &j->error) == 0;
+    } else if (j->kind == JOB_EXPORT_DB) {
+        if (j->nnames)
+            j->ok = export_tables(j->conn, (const char *const *)j->names, j->nnames, &j->xopts,
+                                  j->path, db_export_progress_cb, (void *)"tables",
+                                  &j->db_stats, &j->error) == 0;
+        else
+            j->ok = export_database(j->conn, &j->xopts, j->path, db_export_progress_cb, NULL,
+                                    &j->db_stats, &j->error) == 0;
     } else {
         j->ok = 1; /* JOB_TABLES: just the refresh below */
     }
@@ -805,8 +881,15 @@ static void start_structure(const char *table) {
 /* On the Structure page, show the table selected in the sidebar (loading
  * it if it isn't the one shown). Called whenever that might have changed. */
 static void structure_sync(void) {
-    if (uiTabSelected(app.mode_tab) != MODE_STRUCTURE) return;
+    if (app.mode != MODE_STRUCTURE) return;
     if (!app.conn) { structure_message("Not connected."); return; }
+    size_t nsel = selected_count();
+    if (nsel > 1) {
+        char msg[128];
+        snprintf(msg, sizeof msg, "%zu tables selected - select one to see its structure.", nsel);
+        structure_message(msg);
+        return;
+    }
     const char *name = selected_table(NULL);
     if (!name) {
         if (!app.st.table)
@@ -819,14 +902,34 @@ static void structure_sync(void) {
     start_structure(name);
 }
 
+/* Shows one mode of the main area and keeps the switch in step (setting it
+ * from code doesn't call on_mode_changed). The results stay as they are
+ * across Normal / AI; Structure loads the selected table if needed. */
 static void show_mode(int mode) {
-    if (uiTabSelected(app.mode_tab) != mode) uiTabSetSelected(app.mode_tab, mode);
-    structure_sync(); /* uiTabSetSelected doesn't call on_mode_selected */
+    if (mode != MODE_AI && mode != MODE_STRUCTURE) mode = MODE_NORMAL;
+    app.mode = mode;
+    if (mode == MODE_STRUCTURE) {
+        uiControlHide(app.query_split);
+        uiControlShow(app.structure_view);
+    } else {
+        if (mode == MODE_AI) {
+            uiControlHide(app.normal_view);
+            uiControlShow(app.ai_view);
+        } else {
+            uiControlHide(app.ai_view);
+            uiControlShow(app.normal_view);
+        }
+        uiControlHide(app.structure_view);
+        uiControlShow(app.query_split);
+    }
+    if (sqlc_segmented_selected(app.mode_switch) != mode)
+        sqlc_segmented_set_selected(app.mode_switch, mode);
+    structure_sync();
 }
 
-static void on_mode_selected(uiTab *t, void *data) {
-    (void)t; (void)data;
-    structure_sync();
+static void on_mode_changed(uiControl *seg, int index, void *data) {
+    (void)seg; (void)data;
+    show_mode(index);
 }
 
 static int sync_queued;
@@ -914,13 +1017,17 @@ static void job_done(void *data) {
 
     /* The sidebar's selection, to keep when its list is replaced below
      * (following a rename). Not across connections. */
-    char *keep = NULL;
+    char **keep = NULL;
+    size_t nkeep = 0;
     if (j->load_tables && j->kind != JOB_CONNECT) {
-        const char *sel = selected_table(NULL);
-        if (sel && j->kind == JOB_ALTER && j->ok && j->alter == ALTER_RENAME &&
-            strcmp(sel, j->table) == 0)
-            sel = j->new_name;
-        keep = sel ? strdup(sel) : NULL;
+        if (selected_tables(&keep, &nkeep) != 0) nkeep = 0;
+        if (j->kind == JOB_ALTER && j->ok && j->alter == ALTER_RENAME) {
+            for (size_t i = 0; i < nkeep; i++) {
+                if (strcmp(keep[i], j->table) != 0) continue;
+                char *renamed = strdup(j->new_name);
+                if (renamed) { free(keep[i]); keep[i] = renamed; }
+            }
+        }
     }
 
     if (j->kind == JOB_CONNECT) {
@@ -961,10 +1068,10 @@ static void job_done(void *data) {
             char *text = ai_format(j->task, &j->ai);
             if (text) {
                 uiMultilineEntrySetText(app.editor, text);
-                show_mode(MODE_QUERY);
                 app.ai_in_editor = 1;
                 free(app.browsing);
                 app.browsing = NULL;
+                show_mode(MODE_NORMAL); /* the SQL is in the editor: show it */
             }
             free(text);
             if (j->ai.sql && *j->ai.sql)
@@ -980,6 +1087,27 @@ static void job_done(void *data) {
         } else {
             set_status("Export failed: %s", j->error ? j->error : "unknown error");
             show_error("Export failed", j->error ? j->error : "");
+        }
+    } else if (j->kind == JOB_EXPORT_DB) {
+        const export_db_stats *st = &j->db_stats;
+        if (j->ok && j->nnames) {
+            set_status("Exported %zu selected table%s from %s: %zu table%s, %zu view%s, %llu row%s "
+                       "to %s (%.2f s)%s",
+                       j->nnames, j->nnames == 1 ? "" : "s",
+                       j->table, st->tables, st->tables == 1 ? "" : "s",
+                       st->views, st->views == 1 ? "" : "s",
+                       st->rows, st->rows == 1 ? "" : "s", j->path, j->seconds,
+                       st->skipped ? " - some objects skipped, see the file" : "");
+        } else if (j->ok) {
+            set_status("Exported database %s: %zu table%s, %zu view%s, %llu row%s to %s (%.2f s)%s",
+                       j->table, st->tables, st->tables == 1 ? "" : "s",
+                       st->views, st->views == 1 ? "" : "s",
+                       st->rows, st->rows == 1 ? "" : "s", j->path, j->seconds,
+                       st->skipped ? " - some objects skipped, see the file" : "");
+        } else {
+            const char *title = j->nnames ? "Export failed" : "Database export failed";
+            set_status("%s: %s", title, j->error ? j->error : "unknown error");
+            show_error(title, j->error ? j->error : "");
         }
     } else if (j->kind == JOB_TABLES) {
         const db_set *t = j->tables.nsets ? &j->tables.sets[0] : NULL;
@@ -1013,6 +1141,13 @@ static void job_done(void *data) {
         show_outcome(&j->out, browsed ? &j->meta : NULL);
     }
 
+    /* The worker read DATABASE() after the job (see load_tables). */
+    if (j->conn) {
+        free(app.current_db);
+        app.current_db = j->current_db;
+        j->current_db = NULL;
+    }
+
     /* Refresh the sidebar (the database may have changed via USE). */
     if (j->load_tables) {
         db_outcome_free(&app.tables_raw);
@@ -1022,8 +1157,8 @@ static void job_done(void *data) {
     }
     uiButtonSetText(app.load_tables_btn, app.tables_loaded ? "Refresh tables" : "Load tables");
     /* Only when the list changed, so the selection survives e.g. an export. */
-    if (j->kind == JOB_CONNECT || j->load_tables) rebuild_sidebar_keeping(keep);
-    free(keep);
+    if (j->kind == JOB_CONNECT || j->load_tables) rebuild_sidebar_keeping(keep, nkeep);
+    free_names(keep, nkeep);
 
     job_free(j);
     /* a double-click that came while the structure was loading */
@@ -1095,7 +1230,8 @@ static int run_query(const char *sql, const char *browse) {
     j->hide_views = j->eo.hide_views;
     set_status("Running...");
     start_job(j);
-    show_mode(MODE_QUERY); /* that's where the results go */
+    /* that's where the results go (AI shows them too: stay there) */
+    if (app.mode == MODE_STRUCTURE) show_mode(MODE_NORMAL);
     return 1;
 }
 
@@ -1109,6 +1245,7 @@ static int browse_table(const char *name) {
     if (sql) {
         uiMultilineEntrySetText(app.editor, sql);
         app.ai_in_editor = 0;
+        show_mode(MODE_NORMAL); /* the editor's text was replaced: show what runs */
         started = run_query(sql, copy);
         if (started) {
             free(app.browsing);
@@ -1146,6 +1283,14 @@ static int confirm_ai_sql(const char *sql) {
 }
 
 static void on_run_menu(void) {
+    if (app.mode == MODE_AI) { /* the editor is hidden: ⌘↩ sends the request instead */
+        ask_claude_now();
+        return;
+    }
+    if (app.mode == MODE_STRUCTURE) { /* the editor is hidden: don't run it unseen */
+        set_status("Switch to Normal to run SQL (\xE2\x8C\x98\xE2\x86\xA9 runs the editor there).");
+        return;
+    }
     char *sql = uiMultilineEntryText(app.editor);
     if (app.busy || !app.conn || confirm_ai_sql(sql ? sql : "")) {
         if (run_sql(sql ? sql : "")) { /* the user's own SQL: no longer browsing a table */
@@ -1219,11 +1364,13 @@ static void on_remove_api_key(uiMenuItem *m, uiWindow *w, void *data) {
     free(path);
 }
 
-static void on_ask_claude(uiButton *b, void *data) {
-    (void)b; (void)data;
+static void ask_claude_now(void) {
     if (app.busy) return;
     if (!app.conn) { set_status("Connect first, so Claude can see the database's tables."); return; }
-    char *task = entry_dup(app.ai_task);
+    char *t = uiMultilineEntryText(app.ai_task);
+    char *task = strdup(t ? t : "");
+    uiFreeText(t);
+    if (!task) return;
     const char *p = task;
     while (isspace((unsigned char)*p)) p++;
     if (!*p) {
@@ -1242,6 +1389,16 @@ static void on_ask_claude(uiButton *b, void *data) {
     j->api_key = key;
     set_status("Asking Claude...");
     start_job(j);
+}
+
+static void on_ask_claude(uiButton *b, void *data) {
+    (void)b; (void)data;
+    ask_claude_now();
+}
+
+static void on_ask_claude_menu(uiMenuItem *m, uiWindow *w, void *data) {
+    (void)m; (void)w; (void)data;
+    show_mode(MODE_AI);
 }
 
 static void load_tables_now(void) {
@@ -1282,13 +1439,59 @@ static void start_export(const char *table, int is_view, export_format fmt,
 
 static const char *table_at_row(int row, int *is_view_out);
 
-/* The table selected in the sidebar, or NULL (pointer into tables_raw). */
+/* The table selected in the sidebar when exactly one row is selected, else
+ * NULL (pointer into tables_raw). */
 static const char *selected_table(int *is_view_out) {
     if (!app.side_table || !app.side_data.nsets) return NULL;
     uiTableSelection *sel = uiTableGetSelection(app.side_table);
-    int row = sel && sel->NumRows > 0 ? sel->Rows[0] : -1;
+    int row = sel && sel->NumRows == 1 ? sel->Rows[0] : -1;
     uiFreeTableSelection(sel);
     return table_at_row(row, is_view_out);
+}
+
+/* How many sidebar rows are selected. */
+static size_t selected_count(void) {
+    if (!app.side_table || !app.side_data.nsets) return 0;
+    uiTableSelection *sel = uiTableGetSelection(app.side_table);
+    size_t n = sel && sel->NumRows > 0 ? (size_t)sel->NumRows : 0;
+    uiFreeTableSelection(sel);
+    return n;
+}
+
+static void free_names(char **names, size_t n) {
+    for (size_t i = 0; names && i < n; i++) free(names[i]);
+    free(names);
+}
+
+/* Copies of the names of every selected sidebar table, in list order:
+ * *names_out (malloc'd array of malloc'd strings, free with free_names) and
+ * *n_out, NULL and 0 when nothing is selected. Returns 0, or -1 if out of
+ * memory (nothing to free then). */
+static int selected_tables(char ***names_out, size_t *n_out) {
+    *names_out = NULL;
+    *n_out = 0;
+    if (!app.side_table || !app.side_data.nsets) return 0;
+    uiTableSelection *sel = uiTableGetSelection(app.side_table);
+    if (!sel) return 0;
+    size_t nrows = sel->NumRows > 0 ? (size_t)sel->NumRows : 0;
+    char **names = nrows ? calloc(nrows, sizeof *names) : NULL;
+    size_t n = 0;
+    int rc = 0;
+    if (nrows && !names) rc = -1;
+    for (size_t i = 0; names && i < nrows; i++) {
+        const char *t = table_at_row(sel->Rows[i], NULL);
+        if (!t) continue;
+        if (!(names[n] = strdup(t))) { rc = -1; break; }
+        n++;
+    }
+    uiFreeTableSelection(sel);
+    if (rc != 0 || n == 0) {
+        free_names(names, n);
+        return rc;
+    }
+    *names_out = names;
+    *n_out = n;
+    return 0;
 }
 
 /* Options dialog + save panel, then the export job. */
@@ -1304,28 +1507,118 @@ static void export_table_flow(const char *table, int view) {
     free(t);
 }
 
-static void export_selected_table(void) {
+static void export_database_flow(void);
+static void export_tables_flow(char **names, size_t n);
+
+/* Export…: the whole database with nothing selected in the sidebar, the one
+ * selected table (SQL / CSV / XML), or the selected tables into one SQL file. */
+static void export_sidebar_selection(void) {
     if (app.busy) return;
     if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return; }
-    int view = 0;
-    const char *name = selected_table(&view);
-    if (!name) {
-        uiMsgBoxError(app.win, "Export",
-                      app.tables_loaded ? "Select a table in the sidebar first."
-                                        : "Load the table list and select a table first.");
-        return;
+    char **names = NULL;
+    size_t n = 0;
+    if (selected_tables(&names, &n) != 0) { set_status("Out of memory"); return; }
+    if (n == 0) {
+        export_database_flow();
+    } else if (n == 1) {
+        int view = 0;
+        const char *name = selected_table(&view);
+        export_table_flow(name ? name : names[0], view);
+    } else {
+        export_tables_flow(names, n); /* takes names */
+        names = NULL;
+        n = 0;
     }
-    export_table_flow(name, view);
+    free_names(names, n);
 }
 
 static void on_export(uiButton *b, void *data) {
     (void)b; (void)data;
-    export_selected_table();
+    export_sidebar_selection();
 }
 
 static void on_export_menu(uiMenuItem *m, uiWindow *w, void *data) {
     (void)m; (void)w; (void)data;
-    export_selected_table();
+    export_sidebar_selection();
+}
+
+/* Export the current database (all tables, then views) on the worker thread. */
+static void start_export_db(const char *db, const export_opts *opts, const char *path) {
+    if (app.busy || !app.conn) return;
+    job *j = calloc(1, sizeof *j);
+    if (!j) return;
+    j->kind = JOB_EXPORT_DB;
+    j->conn = app.conn;
+    j->table = strdup(db);
+    j->path = strdup(path);
+    j->fmt = EXPORT_SQL;
+    j->xopts = *opts;
+    if (!j->table || !j->path) { job_free(j); return; }
+    set_status("Exporting database %s...", db);
+    start_job(j);
+}
+
+/* Export the n named tables/views of database db into one SQL file on the
+ * worker thread. Takes names (malloc'd, see selected_tables) in every case. */
+static void start_export_tables(const char *db, char **names, size_t n,
+                                const export_opts *opts, const char *path) {
+    job *j = app.busy || !app.conn || !n ? NULL : calloc(1, sizeof *j);
+    if (!j) { free_names(names, n); return; }
+    j->kind = JOB_EXPORT_DB;
+    j->conn = app.conn;
+    j->names = names;
+    j->nnames = n;
+    j->table = strdup(db);
+    j->path = strdup(path);
+    j->fmt = EXPORT_SQL;
+    j->xopts = *opts;
+    if (!j->table || !j->path) { job_free(j); return; }
+    set_status("Exporting %zu tables from %s...", n, db);
+    start_job(j);
+}
+
+/* Options dialog + save panel for the selected tables. Takes names. */
+static void export_tables_flow(char **names, size_t n) {
+    if (!app.current_db) {
+        free_names(names, n);
+        uiMsgBoxError(app.win, "Export",
+                      "No database selected. Pick one in the Database field and connect, "
+                      "or run USE <database>; first.");
+        return;
+    }
+    char *db = strdup(app.current_db); /* the dialog runs a modal loop; keep our own copy */
+    if (!db) { free_names(names, n); return; }
+    export_opts opts;
+    char *path = NULL;
+    if (sqlc_export_database_dialog(db, n, &opts, &path))
+        start_export_tables(db, names, n, &opts, path);
+    else
+        free_names(names, n);
+    free(path);
+    free(db);
+}
+
+static void export_database_flow(void) {
+    if (app.busy) return;
+    if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return; }
+    if (!app.current_db) {
+        uiMsgBoxError(app.win, "Export Database",
+                      "No database selected. Pick one in the Database field and connect, "
+                      "or run USE <database>; first.");
+        return;
+    }
+    char *db = strdup(app.current_db); /* the dialog runs a modal loop; keep our own copy */
+    if (!db) return;
+    export_opts opts;
+    char *path = NULL;
+    if (sqlc_export_database_dialog(db, 0, &opts, &path)) start_export_db(db, &opts, path);
+    free(path);
+    free(db);
+}
+
+static void on_export_db_menu(uiMenuItem *m, uiWindow *w, void *data) {
+    (void)m; (void)w; (void)data;
+    export_database_flow();
 }
 
 static void on_hide_views(uiCheckbox *c, void *data) {
@@ -2271,6 +2564,10 @@ static void autotest_next(void) {
         sqlc_split_set_position(app.split, 5000);
         printf("[sidebar] width 5000 -> %d (window leaves room for the editor)\n",
                sqlc_split_position(app.split));
+        /* editor / results divider: a 20000-row grid must not squeeze the
+         * query pane away (the drag limits are checked at the end) */
+        printf("[split] editor height after a big result: %d (min 100)\n",
+               sqlc_split_position(app.query_split));
         /* export the selected sidebar table (the dialog is skipped) */
         {
             int r0 = 0;
@@ -2293,21 +2590,43 @@ static void autotest_next(void) {
             printf("[export] file lines: %d\n", lines);
             remove("build/autotest-export.csv");
         }
+        /* export the whole database (the dialog is skipped) */
+        printf("[export db] current database: %s\n", app.current_db ? app.current_db : "-");
+        {
+            export_opts o = export_default_opts();
+            if (app.current_db) start_export_db(app.current_db, &o, "build/autotest-export-db.sql");
+        }
+        break;
+    case 7:
+        autotest_print("export db");
+        {
+            FILE *f = fopen("build/autotest-export-db.sql", "r");
+            int creates = 0, views = 0, inserts = 0;
+            char line[4096];
+            while (f && fgets(line, sizeof line, f)) {
+                creates += strncmp(line, "CREATE TABLE ", 13) == 0;
+                views += strncmp(line, "-- View ", 8) == 0;
+                inserts += strncmp(line, "INSERT INTO ", 12) == 0;
+            }
+            if (f) fclose(f);
+            printf("[export db] CREATE TABLE: %d, views: %d, INSERT: %d\n", creates, views, inserts);
+            remove("build/autotest-export-db.sql");
+        }
         /* reconnect with -A (still checked): no table list until asked */
         on_connect(app.connect_btn, NULL);
         break;
-    case 7:
+    case 8:
         autotest_print("connect -A");
         load_tables_now();
         break;
-    case 8:
+    case 9:
         autotest_print("load tables");
         /* context menu: work on a scratch table, with -A off so the list follows */
         uiCheckboxSetChecked(app.no_rehash, 0);
         run_sql("DROP TABLE IF EXISTS ctx_tmp; CREATE TABLE ctx_tmp (id INT); "
                 "INSERT INTO ctx_tmp VALUES (1), (2);");
         break;
-    case 9: {
+    case 10: {
         int row = autotest_row("ctx_tmp");
         char menu[512];
         sqlc_table_menu_describe(app.side_table, row, menu, sizeof menu);
@@ -2327,11 +2646,11 @@ static void autotest_next(void) {
         on_table_double_click(app.side_table, row, NULL); /* browse it */
         break;
     }
-    case 10:
+    case 11:
         autotest_print("browse ctx_tmp");
         start_alter(ALTER_RENAME, "ctx_tmp", 0, "ctx `odd` name");
         break;
-    case 11: {
+    case 12: {
         autotest_print("rename");
         char *ed = uiMultilineEntryText(app.editor);
         printf("[rename] editor: %s, browsing: %s\n", ed, app.browsing ? app.browsing : "-");
@@ -2339,29 +2658,29 @@ static void autotest_next(void) {
         start_alter(ALTER_TRUNCATE, "ctx `odd` name", 0, NULL);
         break;
     }
-    case 12:
+    case 13:
         autotest_print("truncate");
         run_sql("SELECT COUNT(*) FROM `ctx ``odd`` name`");
         break;
-    case 13:
+    case 14:
         printf("[truncate] rows left: %s\n", db_cell(&app.shown.sets[0], 0, 0));
         on_table_double_click(app.side_table, autotest_row("ctx `odd` name"), NULL);
         break;
-    case 14:
+    case 15:
         start_alter(ALTER_DROP, "ctx `odd` name", 0, NULL);
         break;
-    case 15:
+    case 16:
         autotest_print("drop");
         printf("[drop] browsing: %s\n", app.browsing ? app.browsing : "-");
         start_alter(ALTER_DROP, "ctx `odd` name", 0, NULL); /* again: server error */
         break;
-    case 16:
+    case 17:
         autotest_print("drop again");
         /* views: Truncate is disabled */
         uiCheckboxSetChecked(app.hide_views, 0);
         on_hide_views(app.hide_views, NULL);
         break;
-    case 17: {
+    case 18: {
         char menu[512];
         sqlc_table_menu_describe(app.side_table, autotest_row("customer_totals"), menu, sizeof menu);
         printf("[menu] view: %s\n", menu);
@@ -2372,26 +2691,38 @@ static void autotest_next(void) {
                uiCheckboxChecked(app.hide_views), uiCheckboxChecked(app.no_rehash));
         break; /* turning on Hide views reloads the list */
     }
-    case 18:
+    case 19:
         on_connect(app.connect_btn, NULL);
         break;
-    case 19:
+    case 20:
         autotest_print("connect tables once");
         run_sql("DROP TABLE IF EXISTS once_tmp; CREATE TABLE once_tmp (id INT);");
         break;
-    case 20:
+    case 21:
         autotest_print("query, tables once");
         printf("[tables once] once_tmp in sidebar: %s\n", autotest_row("once_tmp") >= 0 ? "yes" : "no");
         load_tables_now();
         break;
-    case 21:
+    case 22:
         printf("[tables once] after refresh, once_tmp in sidebar: %s\n",
                autotest_row("once_tmp") >= 0 ? "yes" : "no");
         uiCheckboxSetChecked(app.tables_once, 0);
         on_tables_once(app.tables_once, NULL);
         run_sql("DROP TABLE once_tmp;");
         break;
-    case 22: {
+    case 23: {
+        /* the Normal / AI / Structure switch: Normal and AI swap the query
+         * pane in place above the same results; Structure replaces both */
+        show_mode(MODE_AI);
+        printf("[view] AI: ai view %d, editor view %d, results %d, structure %d, switch %d\n",
+               uiControlVisible(app.ai_view), uiControlVisible(app.normal_view),
+               uiControlVisible(app.query_split), uiControlVisible(app.structure_view),
+               sqlc_segmented_selected(app.mode_switch));
+        show_mode(MODE_NORMAL);
+        printf("[view] Normal: ai view %d, editor view %d, results %d, structure %d, switch %d\n",
+               uiControlVisible(app.ai_view), uiControlVisible(app.normal_view),
+               uiControlVisible(app.query_split), uiControlVisible(app.structure_view),
+               sqlc_segmented_selected(app.mode_switch));
         /* Claude's SQL (no network here: as if Ask Claude had filled the
          * editor): a destructive statement asks first; the test cancels. */
         ai_result r = { .explanation = strdup("Deletes every customer."),
@@ -2410,7 +2741,7 @@ static void autotest_next(void) {
                app.busy ? "yes" : "no", app.ai_in_editor);
         break;
     }
-    case 23:
+    case 24:
         autotest_print("ai read-only");
         /* row editing: scratch tables with and without a primary key */
         run_sql("DROP TABLE IF EXISTS edit_tmp; "
@@ -2422,10 +2753,10 @@ static void autotest_next(void) {
                 "DROP TABLE IF EXISTS nopk_tmp; CREATE TABLE nopk_tmp (a INT, b VARCHAR(10)); "
                 "INSERT INTO nopk_tmp VALUES (1, 'x'), (1, 'x'), (2, 'y');");
         break;
-    case 24:
+    case 25:
         browse_table("edit_tmp");
         break;
-    case 25: {
+    case 26: {
         autotest_print("browse edit_tmp");
         grid_edit_state *e = &app.edit;
         printf("[edit] grid: %s, read-only: %s, columns: %u, key columns: %u\n",
@@ -2438,7 +2769,7 @@ static void autotest_next(void) {
         sqlc_grid_test_finish(e->grid, "Annie", GRID_END_RETURN);
         break;
     }
-    case 26:
+    case 27:
         autotest_row_print("after edit", 0);
         /* a date: the calendar, then Tab to the datetime column */
         begin_cell_edit(1, 3, NULL);
@@ -2447,19 +2778,19 @@ static void autotest_next(void) {
         autotest_editor("picked in calendar");
         sqlc_grid_test_finish(app.edit.grid, "2024-02-29", GRID_END_TAB);
         break;
-    case 27:
+    case 28:
         autotest_row_print("after date", 1);
         autotest_editor("tabbed to seen");
         sqlc_grid_test_finish(app.edit.grid, "2024-1-5 9:30", GRID_END_RETURN);
         break;
-    case 28:
+    case 29:
         autotest_row_print("after datetime", 1);
         /* not a number: refused, the editor stays open with the text */
         begin_cell_edit(0, 2, NULL);
         sqlc_grid_test_finish(app.edit.grid, "abc", GRID_END_RETURN);
         uiQueueMain(autotest_resume, NULL); /* runs after the editor's callback */
         break;
-    case 29:
+    case 30:
         autotest_editor("after bad number");
         sqlc_grid_close_editor(app.edit.grid);
         {
@@ -2474,7 +2805,7 @@ static void autotest_next(void) {
         }
         on_cell_menu_action(GRID_MENU_SET_NULL, 0, 2, NULL);
         break;
-    case 30:
+    case 31:
         autotest_row_print("after set NULL", 0);
         /* + : a new row, typed in place */
         on_add_row(NULL, NULL);
@@ -2483,11 +2814,11 @@ static void autotest_next(void) {
         sqlc_grid_test_finish(app.edit.grid, "Dee", GRID_END_TAB);
         uiQueueMain(autotest_resume, NULL);
         break;
-    case 31:
+    case 32:
         autotest_editor("new row, tab");
         sqlc_grid_test_finish(app.edit.grid, "7", GRID_END_RETURN);
         break;
-    case 32: {
+    case 33: {
         autotest_row_print("inserted", 3);
         printf("[edit] unsaved row: %d, rows: %zu\n", app.edit.new_row, app.edit.set->nrows);
         /* select rows 1 and 3 (Annie, Cy) and delete them */
@@ -2497,7 +2828,7 @@ static void autotest_next(void) {
         delete_selected_rows();
         break;
     }
-    case 33: {
+    case 34: {
         autotest_status("delete 2");
         for (size_t r = 0; r < app.edit.set->nrows; r++) autotest_row_print("left", (int)r);
         /* Cancel in the "are you sure?" keeps the rows */
@@ -2519,7 +2850,7 @@ static void autotest_next(void) {
         on_clear_rows(NULL, NULL); /* truncate, then the grid reloads */
         break;
     }
-    case 34:
+    case 35:
         autotest_status("delete all");
         printf("[edit] rows: %zu, grid editable: %s\n", app.edit.set ? app.edit.set->nrows : 0,
                app.edit.grid && !app.edit.readonly ? "yes" : "no");
@@ -2527,43 +2858,69 @@ static void autotest_next(void) {
         on_add_row(NULL, NULL);
         sqlc_grid_test_finish(app.edit.grid, "", GRID_END_RETURN);
         break;
-    case 35:
+    case 36:
         autotest_row_print("defaults", 0);
         browse_table("nopk_tmp");
         break;
-    case 36:
+    case 37:
         printf("[nopk] key columns: %u, read-only: %s\n", app.edit.info.npk,
                app.edit.readonly ? app.edit.readonly : "no");
         begin_cell_edit(1, 1, NULL);
         sqlc_grid_test_finish(app.edit.grid, "z", GRID_END_RETURN);
         break;
-    case 37:
+    case 38:
         autotest_status("nopk edit");
         run_sql("SELECT GROUP_CONCAT(b ORDER BY b) FROM nopk_tmp");
         break;
-    case 38:
+    case 39:
         printf("[nopk] values now: %s\n", db_cell(&app.shown.sets[0], 0, 0));
         browse_table("customer_totals");
         break;
-    case 39:
+    case 40:
         printf("[view] grid: %s, read-only: %s\n", app.edit.grid ? "yes" : "no",
                app.edit.readonly ? app.edit.readonly : "no");
         on_cell_double_clicked(0, 0, NULL);
         printf("[view] editor opened: %s\n", sqlc_grid_editing(app.edit.grid, NULL, NULL, NULL) ? "yes" : "no");
         run_sql("DROP TABLE edit_tmp; DROP TABLE nopk_tmp;");
         break;
-    case 40: {
+    case 41: {
         autotest_print("cleanup");
+        /* sidebar multi-select: two rows, kept across a rebuild, and the
+         * Structure page asks for one */
+        {
+            int a = autotest_row("customers"), b = autotest_row("orders");
+            int two[2] = { a < b ? a : b, a < b ? b : a };
+            if (two[0] >= 0) {
+                uiTableSelection sel2 = { .NumRows = 2, .Rows = two };
+                uiTableSetSelection(app.side_table, &sel2);
+            }
+            rebuild_sidebar();
+            char **names = NULL;
+            size_t n = 0;
+            int rc = selected_tables(&names, &n);
+            printf("[multi] selected: %zu (rc %d):", n, rc);
+            for (size_t i = 0; i < n; i++) printf(" [%s]", names[i]);
+            printf(", single: %s\n", selected_table(NULL) ? selected_table(NULL) : "-");
+            free_names(names, n);
+            show_mode(MODE_STRUCTURE);
+            char *title = uiLabelText(app.st.title);
+            printf("[multi] structure: %s, loading: %s\n", title,
+                   app.busy && app.job_kind == JOB_STRUCTURE ? "yes" : "no");
+            uiFreeText(title);
+            show_mode(MODE_NORMAL);
+        }
         /* Structure page: select a table, switch to it */
         int row = autotest_row("orders");
         uiTableSelection sel = { .NumRows = 1, .Rows = &row };
         uiTableSetSelection(app.side_table, &sel);
         show_mode(MODE_STRUCTURE);
-        printf("[structure] tab: %d, loading: %s\n", uiTabSelected(app.mode_tab),
+        printf("[structure] switch: %d, page shown: %d, query page shown: %d, loading: %s\n",
+               sqlc_segmented_selected(app.mode_switch), uiControlVisible(app.structure_view),
+               uiControlVisible(app.query_split),
                app.busy && app.job_kind == JOB_STRUCTURE ? "yes" : "no");
         break;
     }
-    case 41: {
+    case 42: {
         autotest_structure("orders");
         char menu[512];
         int row = autotest_row("customers");
@@ -2572,7 +2929,7 @@ static void autotest_next(void) {
         on_table_menu_action(TABLE_MENU_STRUCTURE, row, NULL); /* loads customers */
         break;
     }
-    case 42: {
+    case 43: {
         autotest_structure("menu");
         /* the same table again: nothing to load */
         structure_sync(); /* what the queued selection callback does */
@@ -2590,7 +2947,7 @@ static void autotest_next(void) {
         structure_sync(); /* what the queued selection callback does */
         break;
     }
-    case 43: {
+    case 44: {
         autotest_structure("view");
         /* double-click while on Structure: the click loads the structure,
          * the double-click browses once that's done */
@@ -2603,21 +2960,27 @@ static void autotest_next(void) {
                app.pending_browse ? app.pending_browse : "-");
         break;
     }
-    case 44:
+    case 45:
         autotest_print("browse after structure");
-        printf("[structure] tab: %s, browsing: %s, sidebar selection kept: %s\n",
-               uiTabSelected(app.mode_tab) == MODE_QUERY ? "Query" : "Structure",
+        printf("[structure] mode: %s, browsing: %s, sidebar selection kept: %s\n",
+               app.mode == MODE_NORMAL ? "Normal" : app.mode == MODE_AI ? "AI" : "Structure",
                app.browsing ? app.browsing : "-",
                selected_table(NULL) ? selected_table(NULL) : "-");
         /* the editor / results divider */
         sqlc_split_set_position(app.query_split, 300);
         printf("[split] editor height: %d\n", sqlc_split_position(app.query_split));
         sqlc_split_set_position(app.query_split, 5);
-        printf("[split] dragged to the top: %d\n", sqlc_split_position(app.query_split));
+        printf("[split] dragged to the top: %d (min 100)\n", sqlc_split_position(app.query_split));
         sqlc_split_set_position(app.query_split, 5000);
         printf("[split] dragged to the bottom: editor %d (results keep their minimum)\n",
                sqlc_split_position(app.query_split));
         sqlc_split_set_position(app.query_split, 200);
+        /* ⌘↩ on Structure runs nothing (the editor is hidden), only a hint;
+         * customers' structure is already shown, so nothing loads either */
+        show_mode(MODE_STRUCTURE);
+        on_run_menu();
+        printf("[structure] cmd-return on Structure: busy %d, results page shown %d\n",
+               app.busy, uiControlVisible(app.query_split));
         fflush(stdout);
         if (on_should_quit(NULL)) uiQuit();
         break;
@@ -2655,10 +3018,13 @@ static uiBox *labeled(const char *label, uiControl *c) {
 
 static void build_window(void) {
     uiMenu *file = uiNewMenu("File");
-    uiMenuItemOnClicked(uiMenuAppendItem(file, "Export Table\xE2\x80\xA6"), on_export_menu, NULL);
+    uiMenuItemOnClicked(uiMenuAppendItem(file, "Export\xE2\x80\xA6"), on_export_menu, NULL);
+    uiMenuItemOnClicked(uiMenuAppendItem(file, "Export Database\xE2\x80\xA6"), on_export_db_menu, NULL);
     uiMenuAppendSeparator(file);
     uiMenuAppendQuitItem(file);
     uiMenu *ai = uiNewMenu("AI");
+    uiMenuItemOnClicked(uiMenuAppendItem(ai, "Ask Claude"), on_ask_claude_menu, NULL);
+    uiMenuAppendSeparator(ai);
     uiMenuItemOnClicked(uiMenuAppendItem(ai, "Set Claude API Key\xE2\x80\xA6"), on_set_api_key, NULL);
     uiMenuItemOnClicked(uiMenuAppendItem(ai, "Remove Claude API Key"), on_remove_api_key, NULL);
     uiOnShouldQuit(on_should_quit, NULL);
@@ -2733,36 +3099,35 @@ static void build_window(void) {
     uiButtonOnClicked(app.export_btn, on_export, NULL);
     uiBoxAppend(app.side_box, uiControl(app.export_btn), 0);
 
-    /* right side: Query | Structure */
-    app.mode_tab = uiNewTab();
-    uiTabOnSelected(app.mode_tab, on_mode_selected, NULL);
+    /* right side: a slim bar with the Normal | AI | Structure switch at its
+     * right edge, above one page at a time */
+    uiBox *main_box = uiNewVerticalBox();
+    uiBoxSetPadded(main_box, 1);
+    uiBox *switch_row = uiNewHorizontalBox();
+    uiBoxSetPadded(switch_row, 1);
+    static const char *const modes[] = { "Normal", "AI", "Structure" }; /* MODE_* order */
+    app.mode_switch = sqlc_new_segmented(modes, 3);
+    sqlc_segmented_on_changed(app.mode_switch, on_mode_changed, NULL);
+    uiBoxAppend(switch_row, uiControl(uiNewHorizontalBox()), 1); /* pushes it right */
+    uiBoxAppend(switch_row, app.mode_switch, 0);
+    uiBoxAppend(main_box, uiControl(switch_row), 0);
 
-    app.split = sqlc_new_sidebar_split(uiControl(app.side_box), uiControl(app.mode_tab),
+    app.split = sqlc_new_sidebar_split(uiControl(app.side_box), uiControl(main_box),
                                        220, 120, "SidebarWidth");
     uiBoxAppend(root, app.split, 1);
 
-    /* Query page */
-    uiBox *query = uiNewVerticalBox();
-    uiBoxSetPadded(query, 1);
+    /* Normal / AI page: the query pane above, results below, with a draggable
+     * divider. The query pane has two views in the same space, one shown at
+     * a time: Normal (SQL editor + run row) and AI (Ask Claude). */
+    uiBox *editor_pane = uiNewVerticalBox();
+    uiBoxSetPadded(editor_pane, 1);
 
-    /* Ask Claude: describe it, get SQL (with an explanation) in the editor */
-    uiBox *ai_row = uiNewHorizontalBox();
-    uiBoxSetPadded(ai_row, 1);
-    app.ai_task = uiNewEntry();
-    app.ai_btn = uiNewButton("Ask Claude");
-    uiButtonOnClicked(app.ai_btn, on_ask_claude, NULL);
-    uiBoxAppend(ai_row, uiControl(app.ai_task), 1);
-    uiBoxAppend(ai_row, uiControl(app.ai_btn), 0);
-    uiBoxAppend(query, uiControl(labeled("Ask Claude - describe the query you need "
-                                         "(e.g. top 10 customers by total order value last month)",
-                                         uiControl(ai_row))), 0);
-
-    /* editor + Run above, results below, with a draggable divider */
-    uiBox *top = uiNewVerticalBox();
-    uiBoxSetPadded(top, 1);
+    /* Normal view: the SQL editor and the run row */
+    uiBox *normal = uiNewVerticalBox();
+    uiBoxSetPadded(normal, 1);
     app.editor = uiNewNonWrappingMultilineEntry();
     uiMultilineEntrySetText(app.editor, "SHOW TABLES;");
-    uiBoxAppend(top, uiControl(app.editor), 1);
+    uiBoxAppend(normal, uiControl(app.editor), 1);
 
     uiBox *run_row = uiNewHorizontalBox();
     uiBoxSetPadded(run_row, 1);
@@ -2771,13 +3136,35 @@ static void build_window(void) {
     uiBoxAppend(run_row, uiControl(app.run_btn), 0);
     uiBoxAppend(run_row, uiControl(uiNewLabel("Double-click a table to browse it. "
                                               "Drag the line below to resize.")), 0);
-    uiBoxAppend(top, uiControl(run_row), 0);
+    uiBoxAppend(normal, uiControl(run_row), 0);
+    app.normal_view = uiControl(normal);
+    uiBoxAppend(editor_pane, app.normal_view, 1);
 
-    app.results_box = uiNewVerticalBox();
-    app.query_split = sqlc_new_stacked_split(uiControl(top), uiControl(app.results_box),
-                                             200, 90, 80, "QueryEditorHeight");
-    uiBoxAppend(query, app.query_split, 1);
-    uiTabAppend(app.mode_tab, "Query", uiControl(query));
+    /* AI view: describe it, get SQL (with an explanation) in the editor */
+    uiBox *ai_box = uiNewVerticalBox();
+    uiBoxSetPadded(ai_box, 1);
+    uiBoxAppend(ai_box, uiControl(uiNewLabel("Describe the query you need (e.g. top 10 customers "
+                                             "by total order value last month)")), 0);
+    app.ai_task = uiNewMultilineEntry();
+    uiBoxAppend(ai_box, uiControl(app.ai_task), 1);
+    uiBox *ai_row = uiNewHorizontalBox();
+    uiBoxSetPadded(ai_row, 1);
+    app.ai_btn = uiNewButton("Ask Claude (\xE2\x8C\x98\xE2\x86\xA9)"); /* "Ask Claude (⌘↩)" */
+    uiButtonOnClicked(app.ai_btn, on_ask_claude, NULL);
+    uiBoxAppend(ai_row, uiControl(app.ai_btn), 0);
+    uiBoxAppend(ai_row, uiControl(uiNewLabel("The SQL appears in the editor (Normal view); "
+                                             "nothing runs until you press Run.")), 0);
+    uiBoxAppend(ai_box, uiControl(ai_row), 0);
+    app.ai_view = uiControl(ai_box);
+    uiControlHide(app.ai_view);
+    uiBoxAppend(editor_pane, app.ai_view, 1);
+
+    /* Half and half to start (0 = half); 100 points each at least, so a
+     * big result grid can't squeeze the editor away, or the other way round. */
+    app.results_box = uiNewVerticalBox(); /* the pane stays, empty, until a query runs */
+    app.query_split = sqlc_new_stacked_split(uiControl(editor_pane), uiControl(app.results_box),
+                                             0, 100, 100, "QueryEditorHeight");
+    uiBoxAppend(main_box, app.query_split, 1);
 
     /* Structure page */
     uiBox *structure = uiNewVerticalBox();
@@ -2803,7 +3190,10 @@ static void build_window(void) {
     uiBoxAppend(idx_pane, uiControl(app.st.idx_box), 1);
     uiBoxAppend(structure, sqlc_new_stacked_split(uiControl(cols_pane), uiControl(idx_pane),
                                                   280, 80, 80, "StructureColumnsHeight"), 1);
-    uiTabAppend(app.mode_tab, "Structure", uiControl(structure));
+    app.structure_view = uiControl(structure);
+    uiControlHide(app.structure_view);
+    uiBoxAppend(main_box, app.structure_view, 1);
+    app.mode = MODE_NORMAL;
 
     app.status = uiNewLabel("Not connected.");
     uiBoxAppend(root, uiControl(app.status), 0);
@@ -2845,6 +3235,7 @@ int main(void) {
         free(app.side_index);
         free(app.menu_table);
         free(app.browsing);
+        free(app.current_db);
         free(app.pending_browse);
         free(app.st.table);
         free_set_model(app.st.cols_model);

@@ -1,5 +1,6 @@
 #include "export.h"
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,8 +19,21 @@ struct export_writer {
     export_col *cols;     /* with copied names */
     /* SQL batching */
     int in_insert;
+    int wrote_insert;     /* any INSERT written (dump: blank line at the end) */
     size_t batch_rows, batch_bytes;
 };
+
+/* Session settings around a SQL file, so it loads in any table order and
+ * TIMESTAMPs (read in UTC) come back unchanged. */
+static const char SQL_SESSION_BEGIN[] =
+    "SET NAMES utf8mb4;\n"
+    "SET @OLD_TIME_ZONE=@@TIME_ZONE, TIME_ZONE='+00:00';\n"
+    "SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO';\n"
+    "SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0;\n\n";
+static const char SQL_SESSION_END[] =
+    "SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;\n"
+    "SET SQL_MODE=@OLD_SQL_MODE;\n"
+    "SET TIME_ZONE=@OLD_TIME_ZONE;\n";
 
 export_opts export_default_opts(void) {
     export_opts o = { .sql_structure = 1, .sql_drop = 1, .sql_data = 1,
@@ -61,6 +75,16 @@ void export_sql_ident(FILE *f, const char *name) {
     for (const char *c = name; *c; c++) {
         if (*c == '`') putc('`', f);
         putc(*c, f);
+    }
+    putc('`', f);
+}
+
+void export_sql_comment_ident(FILE *f, const char *name) {
+    putc('`', f);
+    for (const char *c = name; *c; c++) {
+        unsigned char u = (unsigned char)*c;
+        if (*c == '`') putc('`', f);
+        putc(u < 0x20 || u == 0x7F ? '?' : *c, f);
     }
     putc('`', f);
 }
@@ -161,14 +185,17 @@ static void writer_free(export_writer *w) {
 
 static void sql_header(export_writer *w, const char *create_sql) {
     FILE *f = w->f;
-    fputs("-- sqlc export of ", f);
-    fputs(w->is_view ? "view " : "table ", f);
-    export_sql_ident(f, w->table);
-    fputs("\n\n"
-          "SET NAMES utf8mb4;\n"
-          "SET @OLD_TIME_ZONE=@@TIME_ZONE, TIME_ZONE='+00:00';\n"
-          "SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO';\n"
-          "SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0;\n\n", f);
+    if (w->opts.sql_in_dump) {
+        fputs(w->is_view ? "-- View " : "-- Table ", f);
+        export_sql_comment_ident(f, w->table);
+        putc('\n', f);
+    } else {
+        fputs("-- sqlc export of ", f);
+        fputs(w->is_view ? "view " : "table ", f);
+        export_sql_comment_ident(f, w->table);
+        fputs("\n\n", f);
+        fputs(SQL_SESSION_BEGIN, f);
+    }
     if (w->opts.sql_structure) {
         if (w->opts.sql_drop) {
             fputs(w->is_view ? "DROP VIEW IF EXISTS " : "DROP TABLE IF EXISTS ", f);
@@ -238,6 +265,7 @@ static void sql_row(export_writer *w, char **vals, const unsigned long *lens) {
         }
         fputs(") VALUES\n", f);
         w->in_insert = 1;
+        w->wrote_insert = 1;
         w->batch_rows = w->batch_bytes = 0;
     } else {
         fputs(",\n", f);
@@ -312,9 +340,12 @@ int export_end(export_writer *w) {
     switch (w->fmt) {
     case EXPORT_SQL:
         sql_close_insert(w);
-        fputs("\nSET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;\n"
-              "SET SQL_MODE=@OLD_SQL_MODE;\n"
-              "SET TIME_ZONE=@OLD_TIME_ZONE;\n", f);
+        if (!w->opts.sql_in_dump) {
+            putc('\n', f);
+            fputs(SQL_SESSION_END, f);
+        } else if (w->wrote_insert) {
+            putc('\n', f);
+        }
         break;
     case EXPORT_CSV:
         break;
@@ -324,4 +355,154 @@ int export_end(export_writer *w) {
     }
     writer_free(w);
     return ferror(f) ? -1 : 0;
+}
+
+/* ---------- whole-database dump ---------- */
+
+export_obj_kind export_object_kind(const char *table_type) {
+    if (!table_type) return EXPORT_OBJ_SKIP;
+    if (strcmp(table_type, "BASE TABLE") == 0 || strcmp(table_type, "SYSTEM VERSIONED") == 0)
+        return EXPORT_OBJ_TABLE;
+    if (strcmp(table_type, "VIEW") == 0) return EXPORT_OBJ_VIEW;
+    return EXPORT_OBJ_SKIP;
+}
+
+void export_sql_dump_header(FILE *f, const char *db, size_t ntables, size_t nviews,
+                            int selection) {
+    fputs(selection ? "-- sqlc export of selected tables from database "
+                    : "-- sqlc export of database ", f);
+    export_sql_comment_ident(f, db ? db : "");
+    fprintf(f, ": %zu table%s, %zu view%s\n\n", ntables, ntables == 1 ? "" : "s",
+            nviews, nviews == 1 ? "" : "s");
+    fputs(SQL_SESSION_BEGIN, f);
+}
+
+void export_sql_dump_footer(FILE *f) {
+    fputs(SQL_SESSION_END, f);
+}
+
+void export_sql_dump_skipped(FILE *f, const char *name, const char *table_type) {
+    fputs("-- Skipped ", f);
+    export_sql_comment_ident(f, name ? name : "");
+    fputs(" (", f);
+    for (const char *c = table_type ? table_type : "unknown type"; *c; c++)
+        putc((unsigned char)*c < 0x20 ? '?' : *c, f);
+    fputs("): not exported\n\n", f);
+}
+
+typedef struct {
+    const char *name;
+    size_t index;
+} named_index;
+
+static int cmp_named(const void *a, const void *b) {
+    return strcmp(((const named_index *)a)->name, ((const named_index *)b)->name);
+}
+
+int export_select_names(size_t n, const char *const *names, size_t nsel,
+                        const char *const *sel, unsigned char *keep, size_t *missing) {
+    if (n) memset(keep, 0, n);
+    if (nsel == 0) return 0;
+    /* names sorted (with their positions), then one binary search per selected name */
+    named_index *sorted = malloc((n ? n : 1) * sizeof *sorted);
+    if (!sorted) return -1;
+    size_t m = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!names[i]) continue;
+        sorted[m].name = names[i];
+        sorted[m].index = i;
+        m++;
+    }
+    qsort(sorted, m, sizeof *sorted, cmp_named);
+    int rc = 0;
+    for (size_t k = 0; k < nsel; k++) {
+        named_index key = { .name = sel[k] ? sel[k] : "", .index = 0 };
+        named_index *hit = m ? bsearch(&key, sorted, m, sizeof *sorted, cmp_named) : NULL;
+        if (!hit || !sel[k]) {
+            if (rc == 0) {
+                rc = 1;
+                if (missing) *missing = k;
+            }
+            continue;
+        }
+        /* equal names sit next to each other: keep them all */
+        size_t at = (size_t)(hit - sorted), lo = at, hi = at;
+        while (lo > 0 && strcmp(sorted[lo - 1].name, key.name) == 0) lo--;
+        while (hi + 1 < m && strcmp(sorted[hi + 1].name, key.name) == 0) hi++;
+        for (size_t i = lo; i <= hi; i++) keep[sorted[i].index] = 1;
+    }
+    free(sorted);
+    return rc;
+}
+
+void export_dump_basename(char *buf, size_t size, const char *db, size_t nselected) {
+    if (!size) return;
+    if (!db || !*db) db = "database";
+    if (nselected == 0) snprintf(buf, size, "%s", db);
+    else snprintf(buf, size, "%s-%zu-table%s", db, nselected, nselected == 1 ? "" : "s");
+}
+
+/* `name` with backticks doubled, as a string (malloc'd), or NULL. */
+static char *quoted_ident(const char *name) {
+    size_t n = 3;
+    for (const char *c = name; *c; c++) n += *c == '`' ? 2 : 1;
+    char *q = malloc(n);
+    if (!q) return NULL;
+    char *p = q;
+    *p++ = '`';
+    for (const char *c = name; *c; c++) {
+        if (*c == '`') *p++ = '`';
+        *p++ = *c;
+    }
+    *p++ = '`';
+    *p = '\0';
+    return q;
+}
+
+int export_view_order(size_t n, const char *const *names, const char *const *defs,
+                      size_t *order) {
+    for (size_t i = 0; i < n; i++) order[i] = i;
+    if (n < 2) return 0;
+    if (n > SIZE_MAX / n) return -1;
+
+    /* mentions[i * n + j]: view i's definition mentions view j;
+     * waiting[i]: how many unplaced views view i mentions */
+    unsigned char *mentions = calloc(n * n, 1);
+    size_t *waiting = calloc(n, sizeof *waiting);
+    unsigned char *placed = calloc(n, 1);
+    char **quoted = calloc(n, sizeof *quoted);
+    int rc = -1;
+    if (!mentions || !waiting || !placed || !quoted) goto done;
+    for (size_t j = 0; j < n; j++)
+        if (!(quoted[j] = quoted_ident(names[j] ? names[j] : ""))) goto done;
+    for (size_t i = 0; i < n; i++) {
+        if (!defs[i]) continue;
+        for (size_t j = 0; j < n; j++) {
+            if (j == i || !strstr(defs[i], quoted[j])) continue;
+            mentions[i * n + j] = 1;
+            waiting[i]++;
+        }
+    }
+
+    for (size_t k = 0; k < n; k++) {
+        size_t pick = n;
+        for (size_t i = 0; i < n && pick == n; i++)
+            if (!placed[i] && waiting[i] == 0) pick = i;
+        for (size_t i = 0; i < n && pick == n; i++) /* a cycle: take the first */
+            if (!placed[i]) pick = i;
+        order[k] = pick;
+        placed[pick] = 1;
+        for (size_t i = 0; i < n; i++)
+            if (mentions[i * n + pick]) { mentions[i * n + pick] = 0; waiting[i]--; }
+    }
+    rc = 0;
+
+done:
+    if (quoted) for (size_t j = 0; j < n; j++) free(quoted[j]);
+    free(quoted);
+    free(placed);
+    free(waiting);
+    free(mentions);
+    if (rc != 0) for (size_t i = 0; i < n; i++) order[i] = i;
+    return rc;
 }
