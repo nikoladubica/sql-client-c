@@ -41,6 +41,8 @@ char *sqlc_clipboard_text(void);
  * Returns the entered text (malloc'd), or NULL if cancelled. */
 char *sqlc_prompt(const char *title, const char *message, const char *initial,
                   const char *ok_label);
+/* The same with a password field (typing is hidden), starting empty. */
+char *sqlc_prompt_secret(const char *title, const char *message, const char *ok_label);
 
 /* Modal "are you sure?" alert where Cancel is the default button (Return
  * and Escape cancel). destructive marks ok_label red (macOS 11+).

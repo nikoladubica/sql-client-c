@@ -15,4 +15,13 @@ char *keychain_get(const char *profile);
 /* Removing a missing item is not an error. */
 void keychain_delete(const char *profile);
 
+/* The same for any service/account, e.g. the Claude API key
+ * (KEYCHAIN_AI_SERVICE / KEYCHAIN_AI_ACCOUNT). */
+#define KEYCHAIN_AI_SERVICE "sqlc-ai"
+#define KEYCHAIN_AI_ACCOUNT "anthropic-api-key"
+int keychain_set_item(const char *service, const char *account, const char *secret,
+                      char *err, int errlen);
+char *keychain_get_item(const char *service, const char *account);
+void keychain_delete_item(const char *service, const char *account);
+
 #endif

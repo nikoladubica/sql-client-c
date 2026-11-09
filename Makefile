@@ -38,10 +38,12 @@ $(LIBUI_LIB): $(LIBUI_OBJ)
 # ---- GUI: sqlc-gui ----
 GUI_BIN := sqlc-gui
 GUI_SRC := src/gui.c src/db.c src/profiles.c src/keychain.c src/macos_menu.m src/splitview.m \
-           src/export.c src/export_db.c src/export_dialog.m src/table_menu.m
+           src/export.c src/export_db.c src/export_dialog.m src/table_menu.m \
+           src/ai.c src/ai_db.c src/json.c
 GUI_HDR := src/db.h src/profiles.h src/keychain.h src/macos_menu.h src/splitview.h \
-           src/export.h src/export_db.h src/export_dialog.h src/table_menu.h
-GUI_LIBS := $(LIBUI_LIB) -framework Foundation -framework AppKit -framework Security -lobjc
+           src/export.h src/export_db.h src/export_dialog.h src/table_menu.h \
+           src/ai.h src/ai_db.h src/json.h
+GUI_LIBS := $(LIBUI_LIB) -framework Foundation -framework AppKit -framework Security -lobjc -lcurl
 
 gui: $(GUI_BIN)
 
@@ -57,15 +59,19 @@ gui-test: $(GUI_SRC) $(GUI_HDR) $(LIBUI_LIB)
 	SQLC_CONFIG_DIR=$(BUILD)/test-config SQLC_TEST_DB=$${SQLC_TEST_DB:-test_sqlc_demo} \
 		$(BUILD)/sqlc-gui-test
 
-# Unit tests: saved-connections file format and export writers (no database needed).
+# Unit tests: saved-connections file format, export writers and the AI request /
+# response handling (no database or network needed).
 TEST_CFLAGS := -std=c11 -Wall -Wextra -g -O0 -D_DARWIN_C_SOURCE -fsanitize=address,undefined -Isrc
 
-test: tests/profiles_test.c src/profiles.c src/profiles.h tests/export_test.c src/export.c src/export.h
+test: tests/profiles_test.c src/profiles.c src/profiles.h tests/export_test.c src/export.c src/export.h \
+      tests/ai_test.c src/ai.c src/ai.h src/json.c src/json.h
 	@mkdir -p $(BUILD)
 	$(CC) $(TEST_CFLAGS) -o $(BUILD)/profiles_test tests/profiles_test.c src/profiles.c
 	$(BUILD)/profiles_test $(BUILD)/test-profiles
 	$(CC) $(TEST_CFLAGS) -o $(BUILD)/export_test tests/export_test.c src/export.c
 	$(BUILD)/export_test
+	$(CC) $(TEST_CFLAGS) -o $(BUILD)/ai_test tests/ai_test.c src/ai.c src/json.c -lcurl
+	$(BUILD)/ai_test
 
 # Export round trip against a real server: SQL re-import, XML and CSV checks.
 # Creates and drops the databases test_sqlc_export_src and test_sqlc_export_dst.

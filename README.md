@@ -11,10 +11,14 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
 ### GUI (`sqlc-gui`)
 
 - Connection bar (host, port, user, password, database) with options you can
-  set before connecting: **Hide views** and **No auto-rehash (-A)**
+  set before connecting: **Hide views**, **No auto-rehash (-A)** and
+  **Tables only, load once**
 - **Saved connections**: save the connection fields under a name and pick it
   from a dropdown next time (passwords go in the macOS Keychain)
 - SQL editor with **Run** (button or ⌘↩); several statements at once
+- **Ask Claude**: describe the query you need in plain language and Claude
+  writes the SQL into the editor, with an explanation as `--` comments, for you
+  to review and run (needs an Anthropic API key)
 - Results grid, with one tab per result set, plus "Query OK" and error pages
 - Sidebar listing the tables in the current database, with a **Load tables** /
   **Refresh tables** button; drag its right edge to resize it (the width is remembered)
@@ -70,13 +74,17 @@ If you cloned without `--recursive`, the Makefile fetches the submodule for you
 
 Fill in the connection fields, press **Connect**, type SQL and press **Run** (⌘↩).
 
-Connection options (both are saved with a connection):
+Connection options (all are saved with a connection):
 
 - **Hide views**: views are left out of the sidebar (they're filtered in the
   query to the server) and out of `SHOW TABLES` results, like the CLI's `--no-views`.
 - **No auto-rehash (-A)**: like the CLI's `-A`, the table list isn't loaded
   on connect or after each query, which speeds up connecting to large schemas.
   Press **Load tables** in the sidebar to load it when you need it.
+- **Tables only, load once**: the sidebar lists base tables (no views) when you
+  connect, and after that behaves like `-A`: it isn't reloaded after each
+  query, so press **Refresh tables** after creating, dropping or `USE`. It
+  turns on **Hide views** and takes the place of **-A** while it's checked.
 
 To keep a connection, type a **Name** and press **Save**. Saved connections
 appear in the **Saved connections** dropdown; choosing one fills in the fields,
@@ -89,6 +97,34 @@ Connections are stored in `~/Library/Application Support/sqlc/connections`
 (service `sqlc`), never in that file. The first time an item is read, macOS may
 ask whether `sqlc-gui` may use it (and again after a rebuild, since the binary
 changes).
+
+### Ask Claude (AI query assistant)
+
+Type what you need in the **Ask Claude** field above the editor (for example
+*top 10 customers by total order value last month*) and press **Ask Claude**.
+Claude's answer replaces the editor's text: your request and Claude's
+explanation as `--` comments, then the SQL. **Nothing runs until you press Run**,
+so read it first and edit it if needed.
+
+- **API key**: the first time, sqlc asks for an
+  [Anthropic API key](https://console.anthropic.com/) and stores it in your login
+  Keychain (service `sqlc-ai`). Change or remove it under **AI › Set Claude API
+  Key…** / **AI › Remove Claude API Key**. If no key is in the Keychain,
+  `ANTHROPIC_API_KEY` from the environment is used.
+- **What is sent**: your request, the server version, the current database's
+  name, and its schema: table and view names, column names and types,
+  NULL-ability, keys and foreign keys. **Row data is never sent.** Very large
+  schemas are shortened to about 200 KB.
+- **Safety**: if the SQL Claude wrote contains `DROP`, `TRUNCATE`, `DELETE`,
+  `ALTER … DROP` or an `UPDATE` without `WHERE`, **Run** asks first (Cancel is
+  the default). Claude is also told to write read-only queries unless you ask
+  for a change.
+- It uses `claude-opus-5-5` through the Messages API, with structured output
+  (`{explanation, sql}`). If a safety classifier declines a request, the API
+  retries it on a recommended fallback model (`fallbacks: "default"`); the status
+  bar shows which model answered.
+- Errors (no or invalid key, network, rate limits, overload) are shown in a
+  dialog and the status bar.
 
 ### Export
 
@@ -160,13 +196,17 @@ freeze the window; the file only appears once the export has finished.
 | `src/export.c` | Streaming SQL / CSV / XML writers (no database code) |
 | `src/export_db.c` | Export a table from a connection through those writers |
 | `src/export_dialog.m` | Native export options dialog and save panel |
-| `src/table_menu.m` | Sidebar right-click menu, rename prompt, confirmations, clipboard |
+| `src/table_menu.m` | Sidebar right-click menu, rename and API-key prompts, confirmations, clipboard |
+| `src/ai.c` | Ask Claude: request body, Claude API call (libcurl), reply parsing, editor text, destructive-statement check |
+| `src/ai_db.c` | Current database's schema as text for the prompt |
+| `src/json.c` | Small JSON builder and parser used by `ai.c` |
 | `third_party/libui-ng` | libui-ng submodule |
 
 ## Development
 
-`make test` runs the unit tests for the saved-connections file and the export
-writers' escaping/quoting (no database needed).
+`make test` runs the unit tests for the saved-connections file, the export
+writers' escaping/quoting, and Ask Claude's request/response handling,
+comment formatting and destructive-statement check (no database or network needed).
 
 `make export-test` exports an edge-case table in every format and checks the
 result: the SQL is re-imported into an empty database and compared with
@@ -175,7 +215,9 @@ with Python. It creates and drops `test_sqlc_export_src` and `test_sqlc_export_d
 
 `make gui-test` builds the GUI with sanitizers and runs a scripted smoke test
 (connect, multi-statement results, views filter, double-click, row cap,
-export, `-A`, and the context-menu actions on a scratch table `ctx_tmp`). It
+export, `-A`, the context-menu actions on a scratch table `ctx_tmp`, and
+"Tables only, load once" with a scratch table `once_tmp`, and the Run warning
+for destructive SQL from Claude, without calling the API). It
 expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
 `customers` and `orders` plus a view.
 
@@ -189,6 +231,8 @@ expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
 - GUI: the grid is read-only, there's no syntax highlighting, and it always
   runs the whole editor (not just the selection). A running query can't be
   cancelled yet.
+- Ask Claude is GUI only (no `sqlc` CLI command yet), and the window is busy
+  (Run disabled) until Claude answers; a request can't be cancelled.
 
 ## License
 

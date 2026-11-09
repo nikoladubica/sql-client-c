@@ -25,7 +25,10 @@
 
 #include <ui.h>
 #include <mysql.h>
+#include <curl/curl.h>
 
+#include "ai.h"
+#include "ai_db.h"
 #include "db.h"
 #include "keychain.h"
 #include "macos_menu.h"
@@ -37,6 +40,7 @@
 #include "profiles.h"
 
 #define GUI_MAX_ROWS 10000 /* rows kept per result set in the grid */
+#define AI_SCHEMA_BYTES (200u * 1024) /* schema text sent to Claude, at most about */
 
 /* ---------- table models backed by a db_set ---------- */
 
@@ -117,8 +121,14 @@ static struct {
     uiButton *connect_btn, *run_btn, *load_tables_btn, *export_btn;
     uiCheckbox *hide_views;     /* views left out of the sidebar and SHOW TABLES */
     uiCheckbox *no_rehash;      /* -A: only load the table list on request */
+    uiCheckbox *tables_once;    /* tables only, loaded on connect, then like -A */
     uiMultilineEntry *editor;
     uiLabel *status;
+
+    /* Ask Claude: describe a query, get SQL in the editor */
+    uiEntry *ai_task;
+    uiButton *ai_btn;
+    int ai_in_editor;        /* the editor holds Claude's SQL, not run yet */
 
     /* results area: holder box with one child (a tab, grid or label) */
     uiBox *results_box;
@@ -169,12 +179,24 @@ static void set_busy(int busy) {
         uiControlDisable(uiControl(app.run_btn));
         uiControlDisable(uiControl(app.load_tables_btn));
         uiControlDisable(uiControl(app.export_btn));
+        uiControlDisable(uiControl(app.ai_btn));
     } else {
         uiControlEnable(uiControl(app.connect_btn));
         uiControlEnable(uiControl(app.run_btn));
         uiControlEnable(uiControl(app.load_tables_btn));
         uiControlEnable(uiControl(app.export_btn));
+        uiControlEnable(uiControl(app.ai_btn));
     }
+}
+
+/* Load the table list on connect? Not with -A, but "Tables only, load once" does. */
+static int load_on_connect(void) {
+    return !uiCheckboxChecked(app.no_rehash) || uiCheckboxChecked(app.tables_once);
+}
+
+/* Reload it after every query? Neither -A nor "Tables only, load once" does. */
+static int load_after_queries(void) {
+    return !uiCheckboxChecked(app.no_rehash) && !uiCheckboxChecked(app.tables_once);
 }
 
 /* ---------- results area ---------- */
@@ -306,7 +328,7 @@ static void rebuild_sidebar(void) {
 
 /* ---------- worker thread ---------- */
 
-typedef enum { JOB_CONNECT, JOB_QUERY, JOB_TABLES, JOB_EXPORT, JOB_ALTER } job_kind;
+typedef enum { JOB_CONNECT, JOB_QUERY, JOB_TABLES, JOB_EXPORT, JOB_ALTER, JOB_AI } job_kind;
 
 /* JOB_ALTER: what the context menu asked for */
 typedef enum { ALTER_RENAME, ALTER_TRUNCATE, ALTER_DROP } alter_kind;
@@ -329,6 +351,9 @@ typedef struct {
     export_format fmt;
     export_opts xopts;
     unsigned long long rows;
+    /* JOB_AI */
+    char *task, *api_key;
+    ai_result ai;
 
     /* results, filled by the worker */
     int ok;
@@ -347,6 +372,9 @@ static void job_free(job *j) {
     free(j->table);
     free(j->path);
     free(j->new_name);
+    free(j->task);
+    if (j->api_key) { memset(j->api_key, 0, strlen(j->api_key)); free(j->api_key); }
+    ai_result_free(&j->ai);
     db_outcome_free(&j->out);
     db_outcome_free(&j->tables);
     free(j);
@@ -383,6 +411,26 @@ static void remember_last_profile(const char *name);
 static void autotest_next(void);
 static int on_should_quit(void *data);
 #endif
+
+/* JOB_AI on the worker thread: schema, then the Claude API call. */
+static void ask_claude(job *j) {
+    db_exec_opts eo = { 0 };
+    db_outcome cur;
+    char *dbname = NULL;
+    if (db_execute(j->conn, "SELECT DATABASE()", &eo, &cur) == 0 && cur.nsets &&
+        cur.sets[0].nrows && db_cell(&cur.sets[0], 0, 0))
+        dbname = strdup(db_cell(&cur.sets[0], 0, 0));
+    db_outcome_free(&cur);
+
+    char *schema = dbname ? ai_schema(j->conn, AI_SCHEMA_BYTES) : NULL;
+    char *body = ai_build_request(AI_MODEL, mysql_get_server_info(j->conn), dbname,
+                                  schema, j->task);
+    if (!body) j->ai.error = strdup("Out of memory");
+    else j->ok = ai_generate(j->api_key, body, &j->ai) == 0;
+    free(body);
+    free(schema);
+    free(dbname);
+}
 
 /* Export progress: called on the worker thread, shown on the UI thread. */
 static void show_export_progress(void *data) {
@@ -421,6 +469,8 @@ static void *worker(void *data) {
         }
     } else if (j->kind == JOB_QUERY || j->kind == JOB_ALTER) {
         j->ok = db_execute(j->conn, j->sql, &j->eo, &j->out) == 0;
+    } else if (j->kind == JOB_AI) {
+        ask_claude(j);
     } else if (j->kind == JOB_EXPORT) {
         j->ok = export_table(j->conn, j->table, j->is_view, j->fmt, &j->xopts, j->path,
                              export_progress, NULL, &j->rows, &j->error) == 0;
@@ -526,7 +576,9 @@ static void job_done(void *data) {
                    mysql_get_host_info(app.conn), mysql_get_server_info(app.conn),
                    j->current_db ? " - database: " : "",
                    j->current_db ? j->current_db : "",
-                   j->load_tables ? "" : " - table list not loaded (-A)");
+                   !j->load_tables ? " - table list not loaded (-A)"
+                   : uiCheckboxChecked(app.tables_once) ? " - tables only, not refreshed after queries"
+                   : "");
         /* The old connection's list is stale whether or not we reload it. */
         db_outcome_free(&app.tables_raw);
         app.tables_loaded = 0;
@@ -534,6 +586,26 @@ static void job_done(void *data) {
         app.browsing = NULL;
     } else if (j->kind == JOB_ALTER) {
         alter_done(j);
+    } else if (j->kind == JOB_AI) {
+        if (!j->ok) {
+            const char *err = j->ai.error ? j->ai.error : "unknown error";
+            set_status("Ask Claude failed: %s", err);
+            show_error("Ask Claude failed", err);
+        } else {
+            char *text = ai_format(j->task, &j->ai);
+            if (text) {
+                uiMultilineEntrySetText(app.editor, text);
+                app.ai_in_editor = 1;
+                free(app.browsing);
+                app.browsing = NULL;
+            }
+            free(text);
+            if (j->ai.sql && *j->ai.sql)
+                set_status("%s wrote a query in %.1f s - review it, then press Run.",
+                           j->ai.model ? j->ai.model : "Claude", j->seconds);
+            else
+                set_status("Claude didn't write a query - see the comments in the editor.");
+        }
     } else if (j->kind == JOB_EXPORT) {
         if (j->ok) {
             set_status("Exported %llu row%s of %s to %s (%.2f s)", j->rows, j->rows == 1 ? "" : "s",
@@ -617,7 +689,7 @@ static void on_connect(uiButton *b, void *data) {
     int sel = uiComboboxSelected(app.profile_box);
     if (sel > 0 && (size_t)sel <= app.profiles.n)
         j->profile = strdup(app.profiles.items[sel - 1].name);
-    j->load_tables = !uiCheckboxChecked(app.no_rehash);
+    j->load_tables = load_on_connect();
     j->hide_views = uiCheckboxChecked(app.hide_views);
     set_status("Connecting to %s...", j->host);
     start_job(j);
@@ -639,19 +711,43 @@ static int run_sql(const char *sql) {
     j->sql = strdup(sql);
     j->eo.hide_views = uiCheckboxChecked(app.hide_views);
     j->eo.max_rows = GUI_MAX_ROWS;
-    /* With -A the list is only refreshed when asked (Load/Refresh tables). */
-    j->load_tables = !uiCheckboxChecked(app.no_rehash);
+    /* With -A (or "Tables only, load once") the list is only refreshed when
+     * asked (Load/Refresh tables). */
+    j->load_tables = load_after_queries();
     j->hide_views = j->eo.hide_views;
     set_status("Running...");
     start_job(j);
     return 1;
 }
 
+/* Claude's SQL is about to run: ask first if it destroys data or structure.
+ * Returns 1 to go ahead. */
+static int confirm_ai_sql(const char *sql) {
+    if (!app.ai_in_editor) return 1;
+    char *what = ai_destructive(sql);
+    if (!what) return 1;
+    char msg[1024];
+    snprintf(msg, sizeof msg,
+             "The SQL Claude wrote contains: %s.\n\n"
+             "This can't be undone. Check that it does what you asked before running it.",
+             what);
+    free(what);
+#ifdef SQLC_AUTOTEST
+    printf("[dialog] Run Claude's SQL?: %s\n", msg);
+    return 0;
+#else
+    return sqlc_confirm_danger("Run statements that change data?", msg, "Run Anyway", 1);
+#endif
+}
+
 static void on_run_menu(void) {
     char *sql = uiMultilineEntryText(app.editor);
-    if (run_sql(sql ? sql : "")) { /* the user's own SQL: no longer browsing a table */
-        free(app.browsing);
-        app.browsing = NULL;
+    if (app.busy || !app.conn || confirm_ai_sql(sql ? sql : "")) {
+        if (run_sql(sql ? sql : "")) { /* the user's own SQL: no longer browsing a table */
+            free(app.browsing);
+            app.browsing = NULL;
+            app.ai_in_editor = 0;
+        }
     }
     uiFreeText(sql);
 }
@@ -659,6 +755,80 @@ static void on_run_menu(void) {
 static void on_run(uiButton *b, void *data) {
     (void)b; (void)data;
     on_run_menu();
+}
+
+/* ---------- Ask Claude ---------- */
+
+static const char AI_KEY_MESSAGE[] =
+    "Paste your Anthropic API key (from console.anthropic.com). It is stored in your "
+    "login Keychain.\n\n"
+    "When you ask Claude, sqlc sends your request, the server version and the current "
+    "database's table and column names, types and keys to the Claude API. Row data is "
+    "never sent.";
+
+/* Prompts for the key and stores it. Returns the key (malloc'd) or NULL. */
+static char *prompt_api_key(void) {
+    char *key = sqlc_prompt_secret("Claude API key", AI_KEY_MESSAGE, "Save");
+    if (!key) return NULL;
+    char *p = key, *e;
+    while (isspace((unsigned char)*p)) p++;
+    e = p + strlen(p);
+    while (e > p && isspace((unsigned char)e[-1])) *--e = '\0';
+    if (!*p) { free(key); return NULL; }
+    memmove(key, p, strlen(p) + 1);
+    char err[256];
+    if (keychain_set_item(KEYCHAIN_AI_SERVICE, KEYCHAIN_AI_ACCOUNT, key, err, sizeof err) != 0)
+        show_error("Could not save the API key", err); /* still usable this time */
+    else
+        set_status("Claude API key saved in the Keychain.");
+    return key;
+}
+
+/* The Keychain key, else $ANTHROPIC_API_KEY, else ask for one. */
+static char *api_key(void) {
+    char *key = keychain_get_item(KEYCHAIN_AI_SERVICE, KEYCHAIN_AI_ACCOUNT);
+    if (key && *key) return key;
+    free(key);
+    const char *env = getenv("ANTHROPIC_API_KEY");
+    if (env && *env) return strdup(env);
+    return prompt_api_key();
+}
+
+static void on_set_api_key(uiMenuItem *m, uiWindow *w, void *data) {
+    (void)m; (void)w; (void)data;
+    char *key = prompt_api_key();
+    if (key) { memset(key, 0, strlen(key)); free(key); }
+}
+
+static void on_remove_api_key(uiMenuItem *m, uiWindow *w, void *data) {
+    (void)m; (void)w; (void)data;
+    keychain_delete_item(KEYCHAIN_AI_SERVICE, KEYCHAIN_AI_ACCOUNT);
+    set_status("Claude API key removed from the Keychain.");
+}
+
+static void on_ask_claude(uiButton *b, void *data) {
+    (void)b; (void)data;
+    if (app.busy) return;
+    if (!app.conn) { set_status("Connect first, so Claude can see the database's tables."); return; }
+    char *task = entry_dup(app.ai_task);
+    const char *p = task;
+    while (isspace((unsigned char)*p)) p++;
+    if (!*p) {
+        set_status("Describe the query you need in the Ask Claude field first.");
+        free(task);
+        return;
+    }
+    char *key = api_key();
+    if (!key) { set_status("Ask Claude needs an API key (AI \xE2\x80\xBA Set Claude API Key\xE2\x80\xA6)."); free(task); return; }
+
+    job *j = calloc(1, sizeof *j);
+    if (!j) { free(task); free(key); return; }
+    j->kind = JOB_AI;
+    j->conn = app.conn;
+    j->task = task;
+    j->api_key = key;
+    set_status("Asking Claude...");
+    start_job(j);
 }
 
 static void load_tables_now(void) {
@@ -753,6 +923,27 @@ static void on_hide_views(uiCheckbox *c, void *data) {
     if (app.tables_loaded) load_tables_now();
 }
 
+/* "Tables only, load once" implies Hide views and replaces -A: lock both. */
+static void sync_tables_once(int reload) {
+    if (uiCheckboxChecked(app.tables_once)) {
+        uiCheckboxSetChecked(app.no_rehash, 0);
+        if (!uiCheckboxChecked(app.hide_views)) {
+            uiCheckboxSetChecked(app.hide_views, 1);
+            if (reload) on_hide_views(app.hide_views, NULL);
+        }
+        uiControlDisable(uiControl(app.hide_views));
+        uiControlDisable(uiControl(app.no_rehash));
+    } else {
+        uiControlEnable(uiControl(app.hide_views));
+        uiControlEnable(uiControl(app.no_rehash));
+    }
+}
+
+static void on_tables_once(uiCheckbox *c, void *data) {
+    (void)c; (void)data;
+    sync_tables_once(1);
+}
+
 /* Double-click a table: SELECT * FROM it. */
 static void on_table_double_click(uiTable *t, int row, void *data) {
     (void)t; (void)data;
@@ -762,6 +953,7 @@ static void on_table_double_click(uiTable *t, int row, void *data) {
     char *sql = browse_sql(name);
     if (!sql) return;
     uiMultilineEntrySetText(app.editor, sql);
+    app.ai_in_editor = 0;
     if (run_sql(sql)) {
         free(app.browsing);
         app.browsing = strdup(name);
@@ -913,6 +1105,8 @@ static void apply_selected_profile(void) {
     uiCheckboxSetChecked(app.remember_pw, p->remember_password);
     uiCheckboxSetChecked(app.hide_views, p->hide_views);
     uiCheckboxSetChecked(app.no_rehash, p->no_auto_rehash);
+    uiCheckboxSetChecked(app.tables_once, p->tables_once);
+    sync_tables_once(0);
     rebuild_sidebar();
 
     char *pw = p->remember_password ? keychain_get(p->name) : NULL;
@@ -959,6 +1153,7 @@ static void on_save_profile(uiButton *b, void *data) {
         .remember_password = uiCheckboxChecked(app.remember_pw),
         .hide_views = uiCheckboxChecked(app.hide_views),
         .no_auto_rehash = uiCheckboxChecked(app.no_rehash),
+        .tables_once = uiCheckboxChecked(app.tables_once),
     };
     int existed = profiles_find(&app.profiles, name) != NULL;
 
@@ -1216,9 +1411,55 @@ static void autotest_next(void) {
         char menu[512];
         sqlc_table_menu_describe(app.side_table, autotest_row("customer_totals"), menu, sizeof menu);
         printf("[menu] view: %s\n", menu);
-        if (on_should_quit(NULL)) uiQuit();
+        /* "Tables only, load once": no views on connect, no refresh after queries */
+        uiCheckboxSetChecked(app.tables_once, 1);
+        on_tables_once(app.tables_once, NULL);
+        printf("[tables once] hide views: %d, -A: %d\n",
+               uiCheckboxChecked(app.hide_views), uiCheckboxChecked(app.no_rehash));
+        break; /* turning on Hide views reloads the list */
+    }
+    case 18:
+        on_connect(app.connect_btn, NULL);
+        break;
+    case 19:
+        autotest_print("connect tables once");
+        run_sql("DROP TABLE IF EXISTS once_tmp; CREATE TABLE once_tmp (id INT);");
+        break;
+    case 20:
+        autotest_print("query, tables once");
+        printf("[tables once] once_tmp in sidebar: %s\n", autotest_row("once_tmp") >= 0 ? "yes" : "no");
+        load_tables_now();
+        break;
+    case 21:
+        printf("[tables once] after refresh, once_tmp in sidebar: %s\n",
+               autotest_row("once_tmp") >= 0 ? "yes" : "no");
+        uiCheckboxSetChecked(app.tables_once, 0);
+        on_tables_once(app.tables_once, NULL);
+        run_sql("DROP TABLE once_tmp;");
+        break;
+    case 22: {
+        /* Claude's SQL (no network here: as if Ask Claude had filled the
+         * editor): a destructive statement asks first; the test cancels. */
+        ai_result r = { .explanation = strdup("Deletes every customer."),
+                        .sql = strdup("DELETE FROM customers;") };
+        char *text = ai_format("remove all customers", &r);
+        uiMultilineEntrySetText(app.editor, text);
+        app.ai_in_editor = 1;
+        free(text);
+        ai_result_free(&r);
+        on_run_menu();
+        printf("[ai] destructive SQL ran: %s\n", app.busy ? "yes" : "no");
+        /* a read-only query from Claude runs without asking */
+        uiMultilineEntrySetText(app.editor, "-- Request: count customers\nSELECT COUNT(*) FROM customers;\n");
+        on_run_menu();
+        printf("[ai] read-only SQL ran: %s, still marked as Claude's: %d\n",
+               app.busy ? "yes" : "no", app.ai_in_editor);
         break;
     }
+    case 23:
+        autotest_print("ai read-only");
+        if (on_should_quit(NULL)) uiQuit();
+        break;
     }
 }
 
@@ -1256,6 +1497,9 @@ static void build_window(void) {
     uiMenuItemOnClicked(uiMenuAppendItem(file, "Export Table\xE2\x80\xA6"), on_export_menu, NULL);
     uiMenuAppendSeparator(file);
     uiMenuAppendQuitItem(file);
+    uiMenu *ai = uiNewMenu("AI");
+    uiMenuItemOnClicked(uiMenuAppendItem(ai, "Set Claude API Key\xE2\x80\xA6"), on_set_api_key, NULL);
+    uiMenuItemOnClicked(uiMenuAppendItem(ai, "Remove Claude API Key"), on_remove_api_key, NULL);
     uiOnShouldQuit(on_should_quit, NULL);
 
     app.win = uiNewWindow("sqlc", 1100, 720, 1);
@@ -1301,6 +1545,8 @@ static void build_window(void) {
     app.hide_views = uiNewCheckbox("Hide views");
     uiCheckboxOnToggled(app.hide_views, on_hide_views, NULL);
     app.no_rehash = uiNewCheckbox("No auto-rehash (-A)");
+    app.tables_once = uiNewCheckbox("Tables only, load once");
+    uiCheckboxOnToggled(app.tables_once, on_tables_once, NULL);
 
     uiBoxAppend(bar, uiControl(labeled("Host", uiControl(app.host))), 1);
     uiBoxAppend(bar, uiControl(labeled("Port", uiControl(app.port))), 0);
@@ -1309,6 +1555,7 @@ static void build_window(void) {
     uiBoxAppend(bar, uiControl(labeled("Database", uiControl(app.db))), 1);
     uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.hide_views))), 0);
     uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.no_rehash))), 0);
+    uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.tables_once))), 0);
     uiBoxAppend(bar, uiControl(labeled(" ", uiControl(app.connect_btn))), 0);
     uiBoxAppend(root, uiControl(bar), 0);
     uiBoxAppend(root, uiControl(uiNewHorizontalSeparator()), 0);
@@ -1329,6 +1576,18 @@ static void build_window(void) {
     app.split = sqlc_new_sidebar_split(uiControl(app.side_box), uiControl(right),
                                        220, 120, "SidebarWidth");
     uiBoxAppend(root, app.split, 1);
+
+    /* Ask Claude: describe it, get SQL (with an explanation) in the editor */
+    uiBox *ai_row = uiNewHorizontalBox();
+    uiBoxSetPadded(ai_row, 1);
+    app.ai_task = uiNewEntry();
+    app.ai_btn = uiNewButton("Ask Claude");
+    uiButtonOnClicked(app.ai_btn, on_ask_claude, NULL);
+    uiBoxAppend(ai_row, uiControl(app.ai_task), 1);
+    uiBoxAppend(ai_row, uiControl(app.ai_btn), 0);
+    uiBoxAppend(right, uiControl(labeled("Ask Claude - describe the query you need "
+                                         "(e.g. top 10 customers by total order value last month)",
+                                         uiControl(ai_row))), 0);
 
     app.editor = uiNewNonWrappingMultilineEntry();
     uiMultilineEntrySetText(app.editor, "SHOW TABLES;");
@@ -1361,6 +1620,7 @@ int main(void) {
         return 1;
     }
     mysql_library_init(0, NULL, NULL); /* before any worker thread */
+    curl_global_init(CURL_GLOBAL_DEFAULT);
 
     build_window();
     sqlc_install_menus(on_run_menu);
@@ -1387,5 +1647,6 @@ int main(void) {
         uiUninit();
     }
     mysql_library_end();
+    curl_global_cleanup();
     return 0;
 }

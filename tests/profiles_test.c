@@ -32,7 +32,7 @@ int main(int argc, char **argv) {
 
     profile a = { .name = "zeta", .host = "db.example.com", .port = 3307, .user = "app",
                   .database = "shop", .remember_password = 1, .hide_views = 1,
-                  .no_auto_rehash = 1 };
+                  .no_auto_rehash = 1, .tables_once = 1 };
     profile b = { .name = "Alpha", .host = "localhost", .port = 3306, .user = "root",
                   .database = "", .remember_password = 0 };
     profile c = { .name = "bad\nname", .host = "x", .user = "x", .database = "x" };
@@ -59,10 +59,10 @@ int main(int argc, char **argv) {
     CHECK(z && strcmp(z->host, "db.example.com") == 0 && z->port == 3307 &&
           strcmp(z->user, "app2") == 0 && strcmp(z->database, "shop") == 0 &&
           z->remember_password == 1 && z->hide_views == 1 &&
-          z->no_auto_rehash == 1);
+          z->no_auto_rehash == 1 && z->tables_once == 1);
     profile *al = profiles_find(&back, "Alpha");
     CHECK(al && strcmp(al->database, "") == 0 && al->remember_password == 0 &&
-          al->no_auto_rehash == 0);
+          al->no_auto_rehash == 0 && al->tables_once == 0);
     CHECK(strcmp(back.items[0].name, "Alpha") == 0);
 
     /* removing the last-used profile clears last */

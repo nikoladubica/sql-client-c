@@ -119,14 +119,16 @@ char *sqlc_clipboard_text(void) {
     return u ? strdup(u) : NULL;
 }
 
-char *sqlc_prompt(const char *title, const char *message, const char *initial,
-                  const char *ok_label) {
+static char *prompt(const char *title, const char *message, const char *initial,
+                    const char *ok_label, int secure) {
     NSAlert *alert = [[NSAlert alloc] init];
     [alert setMessageText:[NSString stringWithUTF8String:title] ?: @""];
     [alert setInformativeText:[NSString stringWithUTF8String:message] ?: @""];
     [alert addButtonWithTitle:[NSString stringWithUTF8String:ok_label] ?: @"OK"];
     [alert addButtonWithTitle:@"Cancel"];
-    NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 280, 24)];
+    NSRect frame = NSMakeRect(0, 0, secure ? 360 : 280, 24);
+    NSTextField *field = secure ? [[NSSecureTextField alloc] initWithFrame:frame]
+                                : [[NSTextField alloc] initWithFrame:frame];
     [field setStringValue:[NSString stringWithUTF8String:initial] ?: @""];
     [alert setAccessoryView:field];
     [[alert window] setInitialFirstResponder:field];
@@ -140,6 +142,15 @@ char *sqlc_prompt(const char *title, const char *message, const char *initial,
     [field release];
     [alert release];
     return out;
+}
+
+char *sqlc_prompt(const char *title, const char *message, const char *initial,
+                  const char *ok_label) {
+    return prompt(title, message, initial, ok_label, 0);
+}
+
+char *sqlc_prompt_secret(const char *title, const char *message, const char *ok_label) {
+    return prompt(title, message, "", ok_label, 1);
 }
 
 int sqlc_confirm_danger(const char *title, const char *message, const char *ok_label,

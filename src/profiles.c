@@ -29,6 +29,7 @@ static int profile_copy(profile *dst, const profile *src) {
     dst->remember_password = src->remember_password;
     dst->hide_views = src->hide_views;
     dst->no_auto_rehash = src->no_auto_rehash;
+    dst->tables_once = src->tables_once;
     if (!dst->name || !dst->host || !dst->user || !dst->database) {
         profile_clear(dst);
         return -1;
@@ -186,6 +187,8 @@ int profiles_load(const char *path, profile_list *out) {
             cur.hide_views = atoi(val) != 0;
         } else if (strcmp(key, "no_auto_rehash") == 0) {
             cur.no_auto_rehash = atoi(val) != 0;
+        } else if (strcmp(key, "tables_once") == 0) {
+            cur.tables_once = atoi(val) != 0;
         }
     }
     if (rc == 0) rc = flush(out, &cur, &have);
@@ -252,6 +255,7 @@ int profiles_save(const char *path, const profile_list *pl) {
         fprintf(f, "remember_password=%d\n", p->remember_password ? 1 : 0);
         fprintf(f, "hide_views=%d\n", p->hide_views ? 1 : 0);
         fprintf(f, "no_auto_rehash=%d\n", p->no_auto_rehash ? 1 : 0);
+        fprintf(f, "tables_once=%d\n", p->tables_once ? 1 : 0);
     }
 
     int err = ferror(f) || fflush(f) != 0 || fsync(fd) != 0;

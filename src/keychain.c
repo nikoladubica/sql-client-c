@@ -9,11 +9,11 @@
 
 #define SERVICE "sqlc"
 
-/* Base query: generic password, service "sqlc", account = profile. */
-static CFMutableDictionaryRef base_query(const char *profile) {
+/* Base query: generic password with this service and account. */
+static CFMutableDictionaryRef base_query(const char *svc, const char *profile) {
     CFMutableDictionaryRef q = CFDictionaryCreateMutable(
         NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFStringRef service = CFStringCreateWithCString(NULL, SERVICE, kCFStringEncodingUTF8);
+    CFStringRef service = CFStringCreateWithCString(NULL, svc, kCFStringEncodingUTF8);
     CFStringRef account = CFStringCreateWithCString(NULL, profile, kCFStringEncodingUTF8);
     if (!q || !service || !account) {
         if (q) CFRelease(q);
@@ -37,8 +37,9 @@ static void describe(OSStatus st, char *err, int errlen) {
     if (msg) CFRelease(msg);
 }
 
-int keychain_set(const char *profile, const char *password, char *err, int errlen) {
-    CFMutableDictionaryRef q = base_query(profile);
+int keychain_set_item(const char *svc, const char *profile, const char *password,
+                      char *err, int errlen) {
+    CFMutableDictionaryRef q = base_query(svc, profile);
     CFDataRef data = CFDataCreate(NULL, (const UInt8 *)password, (CFIndex)strlen(password));
     if (!q || !data) {
         if (q) CFRelease(q);
@@ -54,7 +55,7 @@ int keychain_set(const char *profile, const char *password, char *err, int errle
     CFRelease(attrs);
 
     if (st == errSecItemNotFound) {
-        CFStringRef label = CFStringCreateWithFormat(NULL, NULL, CFSTR("sqlc: %s"), profile);
+        CFStringRef label = CFStringCreateWithFormat(NULL, NULL, CFSTR("%s: %s"), svc, profile);
         if (label) { CFDictionarySetValue(q, kSecAttrLabel, label); CFRelease(label); }
         CFDictionarySetValue(q, kSecValueData, data);
         st = SecItemAdd(q, NULL);
@@ -66,8 +67,8 @@ int keychain_set(const char *profile, const char *password, char *err, int errle
     return 0;
 }
 
-char *keychain_get(const char *profile) {
-    CFMutableDictionaryRef q = base_query(profile);
+char *keychain_get_item(const char *svc, const char *profile) {
+    CFMutableDictionaryRef q = base_query(svc, profile);
     if (!q) return NULL;
     CFDictionarySetValue(q, kSecReturnData, kCFBooleanTrue);
     CFDictionarySetValue(q, kSecMatchLimit, kSecMatchLimitOne);
@@ -91,9 +92,17 @@ char *keychain_get(const char *profile) {
     return pw;
 }
 
-void keychain_delete(const char *profile) {
-    CFMutableDictionaryRef q = base_query(profile);
+void keychain_delete_item(const char *svc, const char *profile) {
+    CFMutableDictionaryRef q = base_query(svc, profile);
     if (!q) return;
     SecItemDelete(q);
     CFRelease(q);
 }
+
+int keychain_set(const char *profile, const char *password, char *err, int errlen) {
+    return keychain_set_item(SERVICE, profile, password, err, errlen);
+}
+
+char *keychain_get(const char *profile) { return keychain_get_item(SERVICE, profile); }
+
+void keychain_delete(const char *profile) { keychain_delete_item(SERVICE, profile); }
