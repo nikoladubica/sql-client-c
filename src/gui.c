@@ -156,6 +156,7 @@ static struct {
     char *menu_table;        /* table the context menu was opened on */
     int menu_is_view;
     char *browsing;          /* table shown by a double-click browse, or NULL */
+    char *current_db;        /* SELECT DATABASE() after the last job, or NULL */
 
     MYSQL *conn;
     int busy;
@@ -357,7 +358,8 @@ static void rebuild_sidebar(void) {
 
 /* ---------- worker thread ---------- */
 
-typedef enum { JOB_CONNECT, JOB_QUERY, JOB_TABLES, JOB_EXPORT, JOB_ALTER, JOB_AI } job_kind;
+typedef enum { JOB_CONNECT, JOB_QUERY, JOB_TABLES, JOB_EXPORT, JOB_EXPORT_DB, JOB_ALTER,
+               JOB_AI } job_kind;
 
 /* JOB_ALTER: what the context menu asked for */
 typedef enum { ALTER_RENAME, ALTER_TRUNCATE, ALTER_DROP } alter_kind;
@@ -372,7 +374,7 @@ typedef struct {
     char *profile;            /* saved connection used to connect, if any */
     int load_tables;          /* refresh the table list afterwards */
     int hide_views;           /* ... leaving views out of it */
-    /* JOB_EXPORT, JOB_ALTER */
+    /* JOB_EXPORT, JOB_EXPORT_DB (table = the database's name), JOB_ALTER */
     char *table, *path;
     alter_kind alter;
     char *new_name;           /* ALTER_RENAME */
@@ -380,6 +382,7 @@ typedef struct {
     export_format fmt;
     export_opts xopts;
     unsigned long long rows;
+    export_db_stats db_stats; /* JOB_EXPORT_DB */
     /* JOB_AI */
     char *task, *api_key;
     ai_result ai;
@@ -477,6 +480,35 @@ static void export_progress(unsigned long long rows, void *data) {
     uiQueueMain(show_export_progress, r);
 }
 
+/* Database export progress: same hop, with the table being written. */
+typedef struct {
+    char *table;
+    size_t index, count;
+    unsigned long long rows;
+} db_export_progress;
+
+static void show_db_export_progress(void *data) {
+    db_export_progress *p = data;
+    if (app.busy)
+        set_status("Exporting database... %s (%zu of %zu), %llu rows",
+                   p->table, p->index, p->count, p->rows);
+    free(p->table);
+    free(p);
+}
+
+static void db_export_progress_cb(const char *table, size_t index, size_t count,
+                                  unsigned long long rows, void *data) {
+    (void)data;
+    db_export_progress *p = malloc(sizeof *p);
+    if (!p) return;
+    p->table = strdup(table ? table : "");
+    if (!p->table) { free(p); return; }
+    p->index = index;
+    p->count = count;
+    p->rows = rows;
+    uiQueueMain(show_db_export_progress, p);
+}
+
 static void *worker(void *data) {
     job *j = data;
     double t0 = now_seconds();
@@ -504,6 +536,9 @@ static void *worker(void *data) {
     } else if (j->kind == JOB_EXPORT) {
         j->ok = export_table(j->conn, j->table, j->is_view, j->fmt, &j->xopts, j->path,
                              export_progress, NULL, &j->rows, &j->error) == 0;
+    } else if (j->kind == JOB_EXPORT_DB) {
+        j->ok = export_database(j->conn, &j->xopts, j->path, db_export_progress_cb, NULL,
+                                &j->db_stats, &j->error) == 0;
     } else {
         j->ok = 1; /* JOB_TABLES: just the refresh below */
     }
@@ -645,6 +680,18 @@ static void job_done(void *data) {
             set_status("Export failed: %s", j->error ? j->error : "unknown error");
             show_error("Export failed", j->error ? j->error : "");
         }
+    } else if (j->kind == JOB_EXPORT_DB) {
+        const export_db_stats *st = &j->db_stats;
+        if (j->ok) {
+            set_status("Exported database %s: %zu table%s, %zu view%s, %llu row%s to %s (%.2f s)%s",
+                       j->table, st->tables, st->tables == 1 ? "" : "s",
+                       st->views, st->views == 1 ? "" : "s",
+                       st->rows, st->rows == 1 ? "" : "s", j->path, j->seconds,
+                       st->skipped ? " - some objects skipped, see the file" : "");
+        } else {
+            set_status("Database export failed: %s", j->error ? j->error : "unknown error");
+            show_error("Database export failed", j->error ? j->error : "");
+        }
     } else if (j->kind == JOB_TABLES) {
         const db_set *t = j->tables.nsets ? &j->tables.sets[0] : NULL;
         if (j->tables.error)
@@ -674,6 +721,13 @@ static void job_done(void *data) {
             set_status("Query OK, %llu row%s affected in %.3f s", affected,
                        affected == 1 ? "" : "s", j->seconds);
         show_outcome(&j->out);
+    }
+
+    /* The worker read DATABASE() after the job (see load_tables). */
+    if (j->conn) {
+        free(app.current_db);
+        app.current_db = j->current_db;
+        j->current_db = NULL;
     }
 
     /* Refresh the sidebar (the database may have changed via USE). */
@@ -965,6 +1019,45 @@ static void on_export(uiButton *b, void *data) {
 static void on_export_menu(uiMenuItem *m, uiWindow *w, void *data) {
     (void)m; (void)w; (void)data;
     export_selected_table();
+}
+
+/* Export the current database (all tables, then views) on the worker thread. */
+static void start_export_db(const char *db, const export_opts *opts, const char *path) {
+    if (app.busy || !app.conn) return;
+    job *j = calloc(1, sizeof *j);
+    if (!j) return;
+    j->kind = JOB_EXPORT_DB;
+    j->conn = app.conn;
+    j->table = strdup(db);
+    j->path = strdup(path);
+    j->fmt = EXPORT_SQL;
+    j->xopts = *opts;
+    if (!j->table || !j->path) { job_free(j); return; }
+    set_status("Exporting database %s...", db);
+    start_job(j);
+}
+
+static void export_database_flow(void) {
+    if (app.busy) return;
+    if (!app.conn) { set_status("Not connected - fill in the fields above and press Connect."); return; }
+    if (!app.current_db) {
+        uiMsgBoxError(app.win, "Export Database",
+                      "No database selected. Pick one in the Database field and connect, "
+                      "or run USE <database>; first.");
+        return;
+    }
+    char *db = strdup(app.current_db); /* the dialog runs a modal loop; keep our own copy */
+    if (!db) return;
+    export_opts opts;
+    char *path = NULL;
+    if (sqlc_export_database_dialog(db, &opts, &path)) start_export_db(db, &opts, path);
+    free(path);
+    free(db);
+}
+
+static void on_export_db_menu(uiMenuItem *m, uiWindow *w, void *data) {
+    (void)m; (void)w; (void)data;
+    export_database_flow();
 }
 
 static void on_hide_views(uiCheckbox *c, void *data) {
@@ -1402,21 +1495,43 @@ static void autotest_next(void) {
             printf("[export] file lines: %d\n", lines);
             remove("build/autotest-export.csv");
         }
+        /* export the whole database (the dialog is skipped) */
+        printf("[export db] current database: %s\n", app.current_db ? app.current_db : "-");
+        {
+            export_opts o = export_default_opts();
+            if (app.current_db) start_export_db(app.current_db, &o, "build/autotest-export-db.sql");
+        }
+        break;
+    case 7:
+        autotest_print("export db");
+        {
+            FILE *f = fopen("build/autotest-export-db.sql", "r");
+            int creates = 0, views = 0, inserts = 0;
+            char line[4096];
+            while (f && fgets(line, sizeof line, f)) {
+                creates += strncmp(line, "CREATE TABLE ", 13) == 0;
+                views += strncmp(line, "-- View ", 8) == 0;
+                inserts += strncmp(line, "INSERT INTO ", 12) == 0;
+            }
+            if (f) fclose(f);
+            printf("[export db] CREATE TABLE: %d, views: %d, INSERT: %d\n", creates, views, inserts);
+            remove("build/autotest-export-db.sql");
+        }
         /* reconnect with -A (still checked): no table list until asked */
         on_connect(app.connect_btn, NULL);
         break;
-    case 7:
+    case 8:
         autotest_print("connect -A");
         load_tables_now();
         break;
-    case 8:
+    case 9:
         autotest_print("load tables");
         /* context menu: work on a scratch table, with -A off so the list follows */
         uiCheckboxSetChecked(app.no_rehash, 0);
         run_sql("DROP TABLE IF EXISTS ctx_tmp; CREATE TABLE ctx_tmp (id INT); "
                 "INSERT INTO ctx_tmp VALUES (1), (2);");
         break;
-    case 9: {
+    case 10: {
         int row = autotest_row("ctx_tmp");
         char menu[512];
         sqlc_table_menu_describe(app.side_table, row, menu, sizeof menu);
@@ -1436,11 +1551,11 @@ static void autotest_next(void) {
         on_table_double_click(app.side_table, row, NULL); /* browse it */
         break;
     }
-    case 10:
+    case 11:
         autotest_print("browse ctx_tmp");
         start_alter(ALTER_RENAME, "ctx_tmp", 0, "ctx `odd` name");
         break;
-    case 11: {
+    case 12: {
         autotest_print("rename");
         char *ed = uiMultilineEntryText(app.editor);
         printf("[rename] editor: %s, browsing: %s\n", ed, app.browsing ? app.browsing : "-");
@@ -1448,29 +1563,29 @@ static void autotest_next(void) {
         start_alter(ALTER_TRUNCATE, "ctx `odd` name", 0, NULL);
         break;
     }
-    case 12:
+    case 13:
         autotest_print("truncate");
         run_sql("SELECT COUNT(*) FROM `ctx ``odd`` name`");
         break;
-    case 13:
+    case 14:
         printf("[truncate] rows left: %s\n", db_cell(&app.shown.sets[0], 0, 0));
         on_table_double_click(app.side_table, autotest_row("ctx `odd` name"), NULL);
         break;
-    case 14:
+    case 15:
         start_alter(ALTER_DROP, "ctx `odd` name", 0, NULL);
         break;
-    case 15:
+    case 16:
         autotest_print("drop");
         printf("[drop] browsing: %s\n", app.browsing ? app.browsing : "-");
         start_alter(ALTER_DROP, "ctx `odd` name", 0, NULL); /* again: server error */
         break;
-    case 16:
+    case 17:
         autotest_print("drop again");
         /* views: Truncate is disabled */
         uiCheckboxSetChecked(app.hide_views, 0);
         on_hide_views(app.hide_views, NULL);
         break;
-    case 17: {
+    case 18: {
         char menu[512];
         sqlc_table_menu_describe(app.side_table, autotest_row("customer_totals"), menu, sizeof menu);
         printf("[menu] view: %s\n", menu);
@@ -1481,26 +1596,26 @@ static void autotest_next(void) {
                uiCheckboxChecked(app.hide_views), uiCheckboxChecked(app.no_rehash));
         break; /* turning on Hide views reloads the list */
     }
-    case 18:
+    case 19:
         on_connect(app.connect_btn, NULL);
         break;
-    case 19:
+    case 20:
         autotest_print("connect tables once");
         run_sql("DROP TABLE IF EXISTS once_tmp; CREATE TABLE once_tmp (id INT);");
         break;
-    case 20:
+    case 21:
         autotest_print("query, tables once");
         printf("[tables once] once_tmp in sidebar: %s\n", autotest_row("once_tmp") >= 0 ? "yes" : "no");
         load_tables_now();
         break;
-    case 21:
+    case 22:
         printf("[tables once] after refresh, once_tmp in sidebar: %s\n",
                autotest_row("once_tmp") >= 0 ? "yes" : "no");
         uiCheckboxSetChecked(app.tables_once, 0);
         on_tables_once(app.tables_once, NULL);
         run_sql("DROP TABLE once_tmp;");
         break;
-    case 22: {
+    case 23: {
         /* the query pane's Normal / AI switcher swaps the views in place */
         show_view(VIEW_AI);
         printf("[view] AI: ai view %d, editor view %d, switcher %d\n", uiControlVisible(app.ai_view),
@@ -1527,7 +1642,7 @@ static void autotest_next(void) {
                app.busy ? "yes" : "no", app.ai_in_editor);
         break;
     }
-    case 23:
+    case 24:
         autotest_print("ai read-only");
         if (on_should_quit(NULL)) uiQuit();
         break;
@@ -1566,6 +1681,7 @@ static uiBox *labeled(const char *label, uiControl *c) {
 static void build_window(void) {
     uiMenu *file = uiNewMenu("File");
     uiMenuItemOnClicked(uiMenuAppendItem(file, "Export Table\xE2\x80\xA6"), on_export_menu, NULL);
+    uiMenuItemOnClicked(uiMenuAppendItem(file, "Export Database\xE2\x80\xA6"), on_export_db_menu, NULL);
     uiMenuAppendSeparator(file);
     uiMenuAppendQuitItem(file);
     uiMenu *ai = uiNewMenu("AI");
@@ -1747,6 +1863,7 @@ int main(void) {
         free(app.side_index);
         free(app.menu_table);
         free(app.browsing);
+        free(app.current_db);
         profiles_free(&app.profiles);
         free(app.profiles_file);
         if (app.conn) mysql_close(app.conn);

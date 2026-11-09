@@ -29,6 +29,8 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
   and **Export** (Truncate and Delete always ask first; Cancel is the default)
 - **Export** a table as SQL, CSV or XML (select it, then **Export…** in the
   sidebar or **File › Export Table…**)
+- **Export the whole database** as one SQL file, every table's structure and
+  data and then the views (**File › Export Database…**)
 - Queries run on a background thread, so the window never freezes
 - Shows the first 10,000 rows per result set
 
@@ -162,6 +164,27 @@ freeze the window; the file only appears once the export has finished.
 - **XML**: UTF-8, `<table name="…"><row><field name="…">…</field></row></table>`;
   `NULL` is `<field name="…" xsi:nil="true"/>`, binary is `encoding="hex"`.
 
+#### Whole database
+
+**File › Export Database…** exports the current database (the one
+`SELECT DATABASE()` names: the **Database** field, or the last `USE`) to one
+SQL file, defaulting to `<database>.sql`. Choose structure, `DROP … IF EXISTS`
+and data as for a table; there is no CSV or XML form.
+
+- The file starts by setting `utf8mb4`, the UTC time zone and
+  `FOREIGN_KEY_CHECKS=0`, and ends by restoring them, so tables load in any
+  order whatever their foreign keys.
+- Every table follows by name, each written exactly like a single-table SQL
+  export (`DROP TABLE IF EXISTS`, `CREATE TABLE`, `INSERT`s).
+- Views come after all tables (`CREATE VIEW` only, no data), and a view that
+  uses another view comes after it.
+- Sequences and other objects that aren't tables or views are left out, with
+  a `-- Skipped` comment in the file.
+- There's no `CREATE DATABASE` or `USE`: load it into any database with
+  `mysql db < db.sql`.
+- The status bar shows which table is being written and the row count.
+  Nothing is changed on the server (`SELECT` and `SHOW` only).
+
 ## CLI usage
 
 ```sh
@@ -213,8 +236,8 @@ freeze the window; the file only appears once the export has finished.
 | `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), which libui-ng lacks |
 | `src/splitview.m` | Resizable sidebar and editor/results divider: `NSSplitView`s wrapped as libui controls |
 | `src/export.c` | Streaming SQL / CSV / XML writers (no database code) |
-| `src/export_db.c` | Export a table from a connection through those writers |
-| `src/export_dialog.m` | Native export options dialog and save panel |
+| `src/export_db.c` | Export a table, or the whole current database as SQL, from a connection through those writers |
+| `src/export_dialog.m` | Native export options dialogs (table and database) and save panel |
 | `src/table_menu.m` | Sidebar right-click menu, rename and API-key prompts, confirmations, clipboard |
 | `src/ai.c` | Ask Claude: request body, Claude API call (libcurl), reply parsing, editor text, destructive-statement check |
 | `src/ai_db.c` | Current database's schema as text for the prompt |
@@ -224,7 +247,8 @@ freeze the window; the file only appears once the export has finished.
 ## Development
 
 `make test` runs the unit tests for the saved-connections file, the export
-writers' escaping/quoting, and Ask Claude's request/response handling,
+writers' escaping/quoting, the database dump's header, comments and view
+ordering, and Ask Claude's request/response handling,
 comment formatting and destructive-statement check (no database or network needed).
 
 `make export-test` exports an edge-case table in every format and checks the
@@ -234,7 +258,7 @@ with Python. It creates and drops `test_sqlc_export_src` and `test_sqlc_export_d
 
 `make gui-test` builds the GUI with sanitizers and runs a scripted smoke test
 (connect, multi-statement results, views filter, double-click, row cap,
-the editor/results divider's minimum heights, export, `-A`, the context-menu actions on a scratch table `ctx_tmp`, and
+the editor/results divider's minimum heights, table and database export, `-A`, the context-menu actions on a scratch table `ctx_tmp`, and
 "Tables only, load once" with a scratch table `once_tmp`, and the Run warning
 for destructive SQL from Claude, without calling the API). It
 expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
@@ -250,6 +274,12 @@ expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
 - GUI: the grid is read-only, there's no syntax highlighting, and it always
   runs the whole editor (not just the selection). A running query can't be
   cancelled yet.
+- Database export is SQL only and GUI only. Tables are read one after
+  another, not in one transaction, so a database that is being written to
+  during the export isn't captured as a consistent snapshot. Views keep their
+  `DEFINER`, as `SHOW CREATE VIEW` writes it; loading them as another user
+  may need the privilege to set that definer. MariaDB system-versioned tables
+  export their current rows only, without history.
 - Ask Claude is GUI only (no `sqlc` CLI command yet), and the window is busy
   (Run disabled) until Claude answers; a request can't be cancelled.
 

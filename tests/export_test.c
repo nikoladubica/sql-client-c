@@ -200,6 +200,158 @@ static void test_sql_writer(void) {
     CHECK(strstr(s, "INSERT") == NULL);
 }
 
+/* A table and a view as parts of a database dump: no SET header/footer of
+ * their own, a short comment instead. */
+static void test_sql_in_dump(void) {
+    export_opts o = export_default_opts();
+    o.sql_in_dump = 1;
+    char *r1[] = { "1", "x", NULL };
+    unsigned long l1[] = { 1, 1, 0 };
+
+    start();
+    export_writer *w = export_begin(out, EXPORT_SQL, &o, "t", "CREATE TABLE `t` (...)", 0, 3, cols3);
+    export_row(w, r1, l1);
+    CHECK(export_end(w) == 0);
+    EXPECT("-- Table `t`\n"
+           "DROP TABLE IF EXISTS `t`;\n"
+           "CREATE TABLE `t` (...);\n\n"
+           "INSERT INTO `t` (`id`, `na,me`, `data`) VALUES\n"
+           "(1,'x',NULL);\n\n");
+
+    /* no rows: nothing after the CREATE */
+    start();
+    w = export_begin(out, EXPORT_SQL, &o, "empty", "CREATE TABLE `empty` (...)", 0, 3, cols3);
+    export_end(w);
+    EXPECT("-- Table `empty`\nDROP TABLE IF EXISTS `empty`;\nCREATE TABLE `empty` (...);\n\n");
+
+    start();
+    w = export_begin(out, EXPORT_SQL, &o, "v", "CREATE VIEW `v` AS select 1", 1, 0, NULL);
+    export_end(w);
+    EXPECT("-- View `v`\nDROP VIEW IF EXISTS `v`;\nCREATE VIEW `v` AS select 1;\n\n");
+
+    /* the standalone file keeps its header and footer */
+    o.sql_in_dump = 0;
+    start();
+    w = export_begin(out, EXPORT_SQL, &o, "t", "CREATE TABLE `t` (...)", 0, 3, cols3);
+    export_end(w);
+    const char *s = finish();
+    CHECK(strncmp(s, "-- sqlc export of table `t`\n\nSET NAMES utf8mb4;\n", 48) == 0);
+    CHECK(strstr(s, "SET TIME_ZONE=@OLD_TIME_ZONE;\n") != NULL);
+}
+
+static void test_dump_header_footer(void) {
+    start();
+    export_sql_dump_header(out, "shop", 2, 1);
+    EXPECT("-- sqlc export of database `shop`: 2 tables, 1 view\n\n"
+           "SET NAMES utf8mb4;\n"
+           "SET @OLD_TIME_ZONE=@@TIME_ZONE, TIME_ZONE='+00:00';\n"
+           "SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO';\n"
+           "SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0;\n\n");
+    start();
+    export_sql_dump_header(out, "x", 1, 0);
+    CHECK(strncmp(finish(), "-- sqlc export of database `x`: 1 table, 0 views\n", 49) == 0);
+    /* a line break in a name must not end the comment and start SQL */
+    start();
+    export_sql_dump_header(out, "a`b\nSELECT 1;", 0, 2);
+    CHECK(strncmp(finish(), "-- sqlc export of database `a``b?SELECT 1;`: 0 tables, 2 views\n", 63) == 0);
+    start();
+    export_sql_dump_footer(out);
+    EXPECT("SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;\n"
+           "SET SQL_MODE=@OLD_SQL_MODE;\n"
+           "SET TIME_ZONE=@OLD_TIME_ZONE;\n");
+    start();
+    export_sql_dump_skipped(out, "seq", "SEQUENCE");
+    EXPECT("-- Skipped `seq` (SEQUENCE): not exported\n\n");
+    start();
+    export_sql_dump_skipped(out, "s\r\nq", NULL);
+    EXPECT("-- Skipped `s??q` (unknown type): not exported\n\n");
+    /* the table writer's own comment is guarded the same way */
+    export_opts o = export_default_opts();
+    start();
+    export_writer *w = export_begin(out, EXPORT_SQL, &o, "t\nx", NULL, 0, 0, NULL);
+    export_end(w);
+    CHECK(strncmp(finish(), "-- sqlc export of table `t?x`\n", 30) == 0);
+    start();
+    export_sql_comment_ident(out, "caf\xC3\xA9 tab\there");
+    EXPECT("`caf\xC3\xA9 tab?here`");
+}
+
+static void test_object_kind(void) {
+    CHECK(export_object_kind("BASE TABLE") == EXPORT_OBJ_TABLE);
+    CHECK(export_object_kind("SYSTEM VERSIONED") == EXPORT_OBJ_TABLE);
+    CHECK(export_object_kind("VIEW") == EXPORT_OBJ_VIEW);
+    CHECK(export_object_kind("SYSTEM VIEW") == EXPORT_OBJ_SKIP);
+    CHECK(export_object_kind("SEQUENCE") == EXPORT_OBJ_SKIP);
+    CHECK(export_object_kind("TEMPORARY") == EXPORT_OBJ_SKIP);
+    CHECK(export_object_kind("view") == EXPORT_OBJ_SKIP);
+    CHECK(export_object_kind("") == EXPORT_OBJ_SKIP);
+    CHECK(export_object_kind(NULL) == EXPORT_OBJ_SKIP);
+}
+
+/* order[] as "a,b,c" */
+static const char *order_str(size_t n, const char *const *names, const size_t *order) {
+    static char s[256];
+    s[0] = '\0';
+    for (size_t i = 0; i < n; i++) {
+        if (i) strncat(s, ",", sizeof s - strlen(s) - 1);
+        strncat(s, names[order[i]], sizeof s - strlen(s) - 1);
+    }
+    return s;
+}
+
+#define EXPECT_ORDER(n, names, defs, expected) do { \
+    size_t ord_[16]; \
+    CHECK(export_view_order(n, names, defs, ord_) == 0); \
+    const char *got_ = order_str(n, names, ord_); \
+    if (strcmp(got_, expected) != 0) { \
+        fprintf(stderr, "%s:%d: expected order [%s]\n  got [%s]\n", __FILE__, __LINE__, expected, got_); \
+        failures++; \
+    } \
+} while (0)
+
+static void test_view_order(void) {
+    /* independent views keep their (name) order */
+    const char *n1[] = { "a", "b", "c" };
+    const char *d1[] = { "CREATE VIEW `a` AS select `t`.`x` from `t`",
+                         "CREATE VIEW `b` AS select 1", NULL };
+    EXPECT_ORDER(3, n1, d1, "a,b,c");
+
+    /* a uses c, c uses b: b, c, a */
+    const char *d2[] = { "CREATE VIEW `a` AS select * from `c`",
+                         "CREATE VIEW `b` AS select 1",
+                         "CREATE VIEW `c` AS select * from `db`.`b`" };
+    EXPECT_ORDER(3, n1, d2, "b,c,a");
+
+    /* a name inside another doesn't count: `ab` is not `a` */
+    const char *n3[] = { "ab", "a" };
+    const char *d3[] = { "CREATE VIEW `ab` AS select 1", "CREATE VIEW `a` AS select * from `ab`" };
+    EXPECT_ORDER(2, n3, d3, "ab,a");
+    const char *d3b[] = { "CREATE VIEW `ab` AS select * from `abc`", "CREATE VIEW `a` AS select 1" };
+    EXPECT_ORDER(2, n3, d3b, "ab,a");
+
+    /* backticks in names are matched doubled, as SHOW CREATE writes them */
+    const char *n4[] = { "x", "we`ird" };
+    const char *d4[] = { "CREATE VIEW `x` AS select * from `we``ird`", "CREATE VIEW `we``ird` AS select 1" };
+    EXPECT_ORDER(2, n4, d4, "we`ird,x");
+
+    /* a cycle (or false match) still yields every view once */
+    const char *n5[] = { "p", "q", "r" };
+    const char *d5[] = { "CREATE VIEW `p` AS select * from `q`",
+                         "CREATE VIEW `q` AS select * from `p`",
+                         "CREATE VIEW `r` AS select * from `q`" };
+    EXPECT_ORDER(3, n5, d5, "p,q,r");
+
+    /* non-ASCII names */
+    const char *n6[] = { "caf\xC3\xA9", "z" };
+    const char *d6[] = { "CREATE VIEW `caf\xC3\xA9` AS select * from `z`", "CREATE VIEW `z` AS select 1" };
+    EXPECT_ORDER(2, n6, d6, "z,caf\xC3\xA9");
+
+    /* empty and single */
+    size_t one[1] = { 99 };
+    CHECK(export_view_order(0, NULL, NULL, one) == 0 && one[0] == 99);
+    EXPECT_ORDER(1, n1, d1, "a");
+}
+
 int main(void) {
     test_sql_escaping();
     test_csv_escaping();
@@ -207,6 +359,10 @@ int main(void) {
     test_csv_writer();
     test_xml_writer();
     test_sql_writer();
+    test_sql_in_dump();
+    test_dump_header_footer();
+    test_object_kind();
+    test_view_order();
     free(buf);
     if (failures) { fprintf(stderr, "export_test: %d failure(s)\n", failures); return 1; }
     printf("export_test: all checks passed\n");

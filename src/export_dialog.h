@@ -14,4 +14,13 @@
 int sqlc_export_dialog(const char *table, int is_view,
                        export_format *fmt, export_opts *opts, char **path);
 
+/*
+ * The same for a whole database (export_database): SQL only, with the
+ * structure / DROP / data options, then a save panel defaulting to
+ * "<db>.sql". Remembered separately from the table choices.
+ *
+ * Returns 1 with *opts and *path (malloc'd) filled in, or 0 if cancelled.
+ */
+int sqlc_export_database_dialog(const char *db, export_opts *opts, char **path);
+
 #endif

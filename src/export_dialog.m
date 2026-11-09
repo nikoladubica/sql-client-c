@@ -10,6 +10,8 @@
 static int have_last;
 static export_format last_fmt;
 static export_opts last_opts;
+static int have_last_db;
+static export_opts last_db_opts;
 
 @interface SqlcFlippedView : NSView
 @end
@@ -19,7 +21,7 @@ static export_opts last_opts;
 
 @interface SqlcExportControls : NSObject {
 @public
-    NSPopUpButton *format;
+    NSPopUpButton *format;              /* nil for a database: SQL only */
     NSButton *structure, *drop, *data;  /* SQL */
     NSButton *nullN, *bom;              /* CSV */
     NSButton *ok;
@@ -31,7 +33,7 @@ static export_opts last_opts;
 @implementation SqlcExportControls
 - (void)update:(id)sender {
     (void)sender;
-    NSInteger f = [format indexOfSelectedItem];
+    NSInteger f = format ? [format indexOfSelectedItem] : EXPORT_SQL;
     BOOL sql = f == EXPORT_SQL, csv = f == EXPORT_CSV;
     BOOL wantStructure = [structure state] == NSControlStateValueOn;
     [structure setEnabled:sql];
@@ -64,6 +66,21 @@ static NSTextField *heading(NSView *parent, NSString *text, CGFloat y) {
     [t setFrame:NSMakeRect(0, y, 340, 16)];
     [parent addSubview:t];
     return t;
+}
+
+/* Save panel suggesting "<name>.<ext>"; 1 with *path (malloc'd) or 0. */
+static int save_panel(NSString *name, export_format fmt, char **path) {
+    NSSavePanel *panel = [NSSavePanel savePanel];
+    NSString *ext = [NSString stringWithUTF8String:export_extension(fmt)];
+    NSString *safe = [[name stringByReplacingOccurrencesOfString:@"/" withString:@"-"]
+                          stringByReplacingOccurrencesOfString:@":" withString:@"-"];
+    [panel setNameFieldStringValue:[safe stringByAppendingPathExtension:ext]];
+    [panel setCanCreateDirectories:YES];
+    [panel setExtensionHidden:NO];
+    if ([panel runModal] != NSModalResponseOK) return 0;
+    const char *p = [[[panel URL] path] fileSystemRepresentation];
+    if (!p || !(*path = strdup(p))) return 0;
+    return 1;
 }
 
 int sqlc_export_dialog(const char *table, int is_view,
@@ -131,17 +148,55 @@ int sqlc_export_dialog(const char *table, int is_view,
     if (!is_view) last_opts = o; /* a view's forced "no data" shouldn't stick */
     else { int d = last_opts.sql_data; last_opts = o; last_opts.sql_data = d; }
 
-    NSSavePanel *panel = [NSSavePanel savePanel];
-    NSString *ext = [NSString stringWithUTF8String:export_extension(f)];
-    NSString *safe = [[name stringByReplacingOccurrencesOfString:@"/" withString:@"-"]
-                          stringByReplacingOccurrencesOfString:@":" withString:@"-"];
-    [panel setNameFieldStringValue:[safe stringByAppendingPathExtension:ext]];
-    [panel setCanCreateDirectories:YES];
-    [panel setExtensionHidden:NO];
-    if ([panel runModal] != NSModalResponseOK) return 0;
-    const char *p = [[[panel URL] path] fileSystemRepresentation];
-    if (!p || !(*path = strdup(p))) return 0;
+    if (!save_panel(name, f, path)) return 0;
     *fmt = f;
+    *opts = o;
+    return 1;
+}
+
+int sqlc_export_database_dialog(const char *db, export_opts *opts, char **path) {
+    if (!have_last_db) {
+        last_db_opts = export_default_opts();
+        have_last_db = 1;
+    }
+    NSString *name = [NSString stringWithUTF8String:db];
+    if (!name) name = @"database";
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    [alert setMessageText:[NSString stringWithFormat:@"Export database “%@”", name]];
+    [alert setInformativeText:@"One SQL file with every table, then the views. "
+                               "Choose what to include, then where to save it."];
+    NSButton *ok = [alert addButtonWithTitle:@"Export…"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    SqlcExportControls *c = [SqlcExportControls new];
+    c->isView = NO;
+    c->ok = ok;
+
+    NSView *v = [[SqlcFlippedView alloc] initWithFrame:NSMakeRect(0, 0, 340, 88)];
+    heading(v, @"SQL", 0);
+    c->structure = checkbox(v, @"Structure (CREATE TABLE and CREATE VIEW)",
+                            last_db_opts.sql_structure, 20, 0, c);
+    c->drop = checkbox(v, @"Add DROP TABLE / DROP VIEW IF EXISTS",
+                       last_db_opts.sql_drop, 42, 18, c);
+    c->data = checkbox(v, @"Data (INSERT statements, tables only)",
+                       last_db_opts.sql_data, 64, 0, c);
+
+    [alert setAccessoryView:v];
+    [v release];
+    [c update:nil];
+
+    int confirmed = [alert runModal] == NSAlertFirstButtonReturn;
+    export_opts o = export_default_opts();
+    o.sql_structure = [c->structure state] == NSControlStateValueOn;
+    o.sql_drop = [c->drop state] == NSControlStateValueOn;
+    o.sql_data = [c->data state] == NSControlStateValueOn;
+    [c release];
+    [alert release];
+    if (!confirmed) return 0;
+    last_db_opts = o;
+
+    if (!save_panel(name, EXPORT_SQL, path)) return 0;
     *opts = o;
     return 1;
 }
