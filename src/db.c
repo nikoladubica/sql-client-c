@@ -15,6 +15,21 @@ char *db_error_string(MYSQL *conn) {
     return s;
 }
 
+MYSQL *db_connect(const char *host, const char *user, const char *pass,
+                  const char *db, unsigned int port, char **err) {
+    *err = NULL;
+    MYSQL *conn = mysql_init(NULL);
+    if (!conn) { *err = strdup("mysql_init failed"); return NULL; }
+    mysql_options(conn, MYSQL_SET_CHARSET_NAME, "utf8mb4");
+    if (!mysql_real_connect(conn, host, user, pass, db, port, NULL,
+                            CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS)) {
+        *err = db_error_string(conn);
+        mysql_close(conn);
+        return NULL;
+    }
+    return conn;
+}
+
 char *db_quote_ident(const char *name) {
     size_t n = strlen(name);
     char *q = malloc(2 * n + 3), *o = q;

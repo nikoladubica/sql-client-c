@@ -48,6 +48,14 @@ static inline const char *db_cell(const db_set *s, size_t row, unsigned int col)
 /* malloc'd "ERROR <n> (<state>): <message>" for the connection's last error. */
 char *db_error_string(MYSQL *conn);
 
+/* Open a connection: utf8mb4, CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS
+ * (as db_execute expects). db may be NULL (no database selected), port 0
+ * (the default). Returns the connection (close it with mysql_close), or NULL
+ * with *err set to a malloc'd message (NULL if out of memory); the handle is
+ * closed then. Blocks; the GUI calls it on its worker thread. */
+MYSQL *db_connect(const char *host, const char *user, const char *pass,
+                  const char *db, unsigned int port, char **err);
+
 /* malloc'd `name` with any backticks doubled, for use as an identifier. */
 char *db_quote_ident(const char *name);
 

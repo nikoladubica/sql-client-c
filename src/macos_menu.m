@@ -1,20 +1,31 @@
-// Native macOS menus: the standard Edit menu, plus Query > Run (Cmd+Return).
+// Native macOS menus: the standard Edit menu, Query > Run (Cmd+Return), and
+// File > New Tab (Cmd+T) / Close Tab (Cmd+W).
 // Edit menu: libui-ng doesn't create one, and without it
 // Cmd+C / Cmd+V / Cmd+A / Cmd+Z do nothing in text fields.
 #import <Cocoa/Cocoa.h>
 
 #include "macos_menu.h"
 
-static void (*run_callback)(void);
+static sqlc_menu_callbacks callbacks;
 
 @interface SqlcMenuTarget : NSObject
 - (void)runQuery:(id)sender;
+- (void)newTab:(id)sender;
+- (void)closeTab:(id)sender;
 @end
 
 @implementation SqlcMenuTarget
 - (void)runQuery:(id)sender {
     (void)sender;
-    if (run_callback) run_callback();
+    if (callbacks.run) callbacks.run();
+}
+- (void)newTab:(id)sender {
+    (void)sender;
+    if (callbacks.new_tab) callbacks.new_tab();
+}
+- (void)closeTab:(id)sender {
+    (void)sender;
+    if (callbacks.close_tab) callbacks.close_tab();
 }
 @end
 
@@ -29,9 +40,23 @@ static void add(NSMenu *menu, NSString *title, SEL action, NSString *key,
     [item release];
 }
 
-void sqlc_install_menus(void (*on_run)(void)) {
+/* An item calling one of menu_target's actions, inserted at index. */
+static void insert_own(NSMenu *menu, NSInteger index, NSString *title, SEL action,
+                       NSString *key) {
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:key];
+    [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand];
+    [item setTarget:menu_target];
+    [menu insertItem:item atIndex:index];
+    [item release];
+}
+
+void sqlc_install_menus(const sqlc_menu_callbacks *cb) {
+    if (cb) callbacks = *cb;
+    // No "Show Tab Bar" / "New Tab" window tabbing from macOS: tabs are sqlc's own.
+    [NSWindow setAllowsAutomaticWindowTabbing:NO];
     NSMenu *bar = [NSApp mainMenu];
     if (bar == nil) return;
+    if (menu_target == nil) menu_target = [SqlcMenuTarget new];
 
     NSMenu *edit = [[NSMenu alloc] initWithTitle:@"Edit"];
     const NSEventModifierFlags cmd = NSEventModifierFlagCommand;
@@ -51,8 +76,6 @@ void sqlc_install_menus(void (*on_run)(void)) {
     [edit release];
 
     /* Query > Run (Cmd+Return) */
-    run_callback = on_run;
-    menu_target = [SqlcMenuTarget new];
     NSMenu *query = [[NSMenu alloc] initWithTitle:@"Query"];
     NSMenuItem *run = [[NSMenuItem alloc] initWithTitle:@"Run" action:@selector(runQuery:) keyEquivalent:@"\r"];
     [run setKeyEquivalentModifierMask:cmd];
@@ -65,6 +88,15 @@ void sqlc_install_menus(void (*on_run)(void)) {
     [bar insertItem:qholder atIndex:([bar numberOfItems] > 1 ? 2 : [bar numberOfItems])];
     [qholder release];
     [query release];
+
+    /* File > New Tab, Close Tab, then a separator, above libui's items.
+     * libui itself binds neither Cmd+T nor Cmd+W. */
+    NSMenu *file = [[bar itemWithTitle:@"File"] submenu]; // owned by the bar
+    if (file != nil) {
+        insert_own(file, 0, @"New Tab", @selector(newTab:), @"t");
+        insert_own(file, 1, @"Close Tab", @selector(closeTab:), @"w");
+        [file insertItem:[NSMenuItem separatorItem] atIndex:2];
+    }
 }
 
 int sqlc_confirm(const char *title, const char *message, const char *ok_label) {

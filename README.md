@@ -15,6 +15,12 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
   with options you set before connecting: **Hide views**, **No auto-rehash (-A)**
   and **Tables only, load once**. Once connected, the window switches to the
   full layout, with a slim bar on top showing the connection and a **Disconnect** button
+- **Tabs** in a strip along the top: **+** (or **File › New Tab**, ⌘T) opens
+  another welcome screen in a new tab;
+  each tab is a full workspace with its own connection, so tabs can point at
+  different servers (or the same one) and a long query in one never blocks
+  another. Each tab's **x**, a middle click on it, or **Close Tab** (⌘W)
+  disconnects and closes it
 - While connecting, the form and the list are disabled and a spinner turns
   under the form, with a random SQL tip (one of 50, never the same one twice in a row);
   **Load tables** / **Refresh tables** show the same spinner and a tip in the sidebar
@@ -49,6 +55,8 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
   data and then the views (also **File › Export Database…**, whatever is selected)
 - A **progress bar** with **Cancel** next to the status line while an export runs,
   and a sound and an alert with the time it took when it ends
+- Exports run on a **connection of their own**, so you can keep browsing,
+  querying and editing while one runs
 - Queries run on a background thread, so the window never freezes
 - Shows the first 10,000 rows per result set
 
@@ -111,9 +119,16 @@ below. A slim bar above it shows the connection
 the **Hide views** option and **Disconnect**. **Disconnect** (disabled while a
 query is running) closes the connection and goes back to the welcome screen.
 It clears the results, the table list and the structure, but the editor keeps
-its text. An unsaved new row in a browsed table is discarded. To change
-**No auto-rehash (-A)** or **Tables only, load once**, disconnect, change
-them and connect again.
+its text. An unsaved new row in a browsed table is discarded. If an export is
+running, it asks first ("An export is running. Disconnecting cancels it and
+deletes the partial file."; Cancel is the default) and cancels the export.
+To change **No auto-rehash (-A)** or **Tables only, load once**, disconnect,
+change them and connect again.
+
+sqlc-gui keeps the login (including the password) in memory while you're
+connected, so an export can open its own connection (see [Export](#export)).
+The password is zeroed and freed on **Disconnect**, when you close the tab
+and when you quit.
 
 A **Normal | AI | Structure** switch at the right end of a slim bar above the
 main area (right of the sidebar) picks what the area shows. In **Normal** and
@@ -175,6 +190,43 @@ Connections are stored in `~/Library/Application Support/sqlc/connections`
 text: only your user account can read it, but anyone with access to your
 account (or a backup of that folder) can. Leave it unticked for connections
 whose password you'd rather type each time.
+
+### Tabs
+
+The window holds one or more tabs, in a strip along its top: left-aligned,
+the selected one highlighted, each with its title and an **x**, and a **+**
+right after the last one. Click a tab to bring it to front. **+** (or
+**File › New Tab**, ⌘T) always opens a new tab on the welcome screen;
+connecting fills it with the full layout. Tabs get narrower as you add them,
+down to a minimum width; a long title is cut with an ellipsis and shown in
+full when you hover over the tab.
+
+Each tab is a workspace of its own: its connection, current database, table
+list, editor, results, structure, row editing, status line, running job and
+export. Tabs can be connected to different servers, or several to the same
+one, and a query or export in one tab never blocks or changes another. Menus
+and shortcuts (Run, Export, Ask Claude, ...) act on the tab in front, and a
+job finishing in a tab behind it updates that tab.
+
+A tab's title is the saved connection it was opened with, else
+`user@host / database` (`user@host` with no database selected, updated after
+`USE`), or "New connection" on the welcome screen; the window's title follows
+the tab in front. Saved connections are shared: saving or deleting one
+updates the list in every tab.
+
+A tab's **x**, a middle click anywhere on it, or **File › Close Tab** (⌘W,
+the tab in front) disconnects and closes it. If a query or an export is
+running in it, or a browsed table has an unsaved new row, it asks first (Cancel is the default); the export is cancelled and its
+partial file deleted, and a running query finishes on its own before the
+connection is closed. Closing the last tab leaves a fresh welcome tab in its
+place, never an empty window.
+
+Quitting (⌘Q or closing the window) while anything is running in any tab
+asks first and lists it, one line per job (for example
+`root@localhost / shop - export of shop` and `staging - query`). Running
+exports are cancelled and sqlc-gui quits once they have stopped and removed
+their temporary files ("Cancelling the export before quitting..." in their
+tabs' status lines meanwhile); a running query is simply dropped.
 
 ### Ask Claude (AI query assistant)
 
@@ -250,6 +302,24 @@ For one table, pick a format and options, then where to save (defaults to `<tabl
 Rows are streamed to the file on a background thread, so big tables don't
 freeze the window; the file only appears once the export has finished.
 
+Every export opens a **separate, hidden connection** with the same login
+(host, port, user, password, `utf8mb4`) to the current database, and closes
+it when the export ends, fails or is cancelled. The main connection stays
+free: while an export runs you can browse tables, run queries, edit rows and
+look at structures. One export runs at a time in each tab (tabs export
+independently); starting another in the same tab says "An export is already
+running - wait for it or cancel it." Its progress bar, **Cancel** and finish
+alert belong to the tab it was started from. If the export's
+connection can't be opened (the password changed, `max_connections`, the
+network), the export fails with that error and nothing else changes.
+
+On its connection the export runs inside `START TRANSACTION WITH CONSISTENT
+SNAPSHOT` (repeatable read), so it sees committed data only, as of the moment
+it started, and a whole database is a consistent snapshot across its tables
+(InnoDB; MyISAM and other non-transactional tables are read as they are when
+reached). It doesn't see the main connection's session state: `SET`
+variables, temporary tables, or changes in a transaction you haven't committed.
+
 While any export runs (one table, selected tables or the whole database), a
 progress bar and a **Cancel** button sit next to the status line, which keeps
 saying what is being written:
@@ -268,9 +338,10 @@ saying what is being written:
   finishes in the meantime, confirming does nothing. Once confirmed it stops
   at the next table or within a few thousand rows, the temporary file is
   deleted (the target file is never created, and one that already exists is
-  left as it was) and the status line reads "Export cancelled.". The
-  connection stays usable: the rest of the table being read is skipped
-  first, which can take a moment on a big table.
+  left as it was) and the status line reads "Export cancelled.". The rest of
+  the table being read is skipped first, which can take a moment on a big
+  table. **Disconnect** and quitting also cancel a running export, after
+  asking.
 - **When it ends**, the bar is hidden. A finished export plays a sound and
   shows an alert with how long it took and what was written ("Export
   finished in 2m 14s - 12 tables, 1,204,331 rows, saved to ~/dump.sql."); a
@@ -373,10 +444,12 @@ with the same structure / `DROP … IF EXISTS` / data options:
 | `src/db.c`, `src/db.h` | Shared core: run SQL, collect results, views filter |
 | `src/main.c`, `src/complete.c` | CLI and its tab completion |
 | `src/gui.c` | GUI (libui-ng) |
-| `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), which libui-ng lacks; small control sizes and widths; the end-of-export sound, Dock bounce and alert |
+| `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), File › New Tab (⌘T) and Close Tab (⌘W), which libui-ng lacks; small control sizes and widths; the end-of-export sound, Dock bounce and alert |
 | `src/splitview.m` | Resizable panes (sidebar, editor / results, columns / indexes): an `NSSplitView` wrapped as a libui control |
 | `src/loading.m` | The loading spinner with a tip under it (connecting, refreshing tables): an `NSProgressIndicator` and a wrapping label wrapped as a libui control |
 | `src/sql_tips.c` | The 50 SQL tips shown while connecting or loading tables, and the no-repeat random pick |
+| `src/tabs.c` | Tab titles and the quit / close-tab list of running jobs (no UI) |
+| `src/tabbar.m` | The window's tab strip: left-aligned tabs with a close button, "+", middle click to close; a custom `NSView` wrapped as a libui control |
 | `src/segmented.m` | The Normal / AI / Structure switch: an `NSSegmentedControl` wrapped as a libui control |
 | `src/export.c` | Streaming SQL / CSV / XML writers, the progress bar's value, time and count formatting, and the temporary file an export is written to (no database code) |
 | `src/export_db.c` | Export a table, the whole current database or selected tables as SQL, from a connection through those writers |
@@ -395,7 +468,8 @@ with the same structure / `DROP … IF EXISTS` / data options:
 writers' escaping/quoting, the database dump's header, comments, view
 ordering and table selection, Ask Claude's request/response handling, comment formatting and
 destructive-statement check, the row editor's value checks and generated
-SQL, and the SQL tips' length, format and no-repeat pick (no database or network needed).
+SQL, the SQL tips' length, format and no-repeat pick, and the tab titles and
+running-jobs list (truncation, UTF-8) (no database or network needed).
 
 `make export-test` exports an edge-case table in every format and checks the
 result: the SQL is re-imported into an empty database and compared with
@@ -425,14 +499,17 @@ a primary key and a read-only view, and the welcome screen at launch and after
   edited, not the results of your own queries; it shows the first 1000 rows.
   There's no syntax highlighting, and it always runs the whole editor (not just
   the selection). A running query can't be cancelled yet.
-- Database and multi-table export are SQL only and GUI only. Tables are read one after
-  another, not in one transaction, so a database that is being written to
-  during the export isn't captured as a consistent snapshot. Views keep their
+- Database and multi-table export are SQL only and GUI only. The consistent
+  snapshot covers transactional (InnoDB) tables only. Views keep their
   `DEFINER`, as `SHOW CREATE VIEW` writes it; loading them as another user
   may need the privilege to set that definer. MariaDB system-versioned tables
   export their current rows only, without history.
-- Quitting sqlc-gui while an export runs doesn't ask first: the export stops
-  and its temporary `<file>.sqlc-XXXXXX` is left next to the target.
+- GUI: one export at a time per tab, and a tab's status line is shared by its
+  jobs: an export's progress messages replace a query's result message in that
+  tab while it runs. With many tabs open, once they reach their minimum width
+  the strip is cut off at the window's right edge (no scrolling or overflow
+  menu yet): tabs past it, and **+**, can't be clicked until some are closed
+  or the window is widened; ⌘T still opens a new tab.
 - Ask Claude is GUI only (no `sqlc` CLI command yet), and the window is busy
   (Run disabled) until Claude answers; a request can't be cancelled.
 

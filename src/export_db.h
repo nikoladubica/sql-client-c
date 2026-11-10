@@ -67,8 +67,11 @@ typedef struct {
  *
  * Read-only on the server: SELECT and SHOW only, plus the session time zone
  * as in export_table (restored after each table). Tables are read one after
- * another, not in one transaction, so it is not a consistent snapshot of a
- * database that is being written to. Blocks; run it on a worker thread.
+ * another; this function starts no transaction, so on its own it is not a
+ * consistent snapshot of a database that is being written to. The GUI runs
+ * it on a connection of its own inside START TRANSACTION WITH CONSISTENT
+ * SNAPSHOT, which makes it one (InnoDB tables). Blocks; run it on a worker
+ * thread.
  * Written to a temporary file and renamed over path only when complete.
  *
  * Progress: index counts from 1 up to count (tables + views written), with
