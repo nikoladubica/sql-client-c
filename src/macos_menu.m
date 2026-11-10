@@ -84,3 +84,27 @@ void sqlc_button_set_small(uiButton *b) {
     [btn setFont:[NSFont systemFontOfSize:[NSFont systemFontSizeForControlSize:NSControlSizeSmall]]];
     [btn invalidateIntrinsicContentSize];
 }
+
+void sqlc_control_set_width(uiControl *c, double width) {
+    NSView *v = (NSView *) uiControlHandle(c);
+    [v setTranslatesAutoresizingMaskIntoConstraints:NO];
+    [[[v widthAnchor] constraintEqualToConstant:width] setActive:YES];
+}
+
+void sqlc_notify_done(const char *title, const char *message, int failed) {
+    if (![NSApp isActive]) [NSApp requestUserAttention:NSInformationalRequest];
+    if (failed) {
+        NSBeep();
+    } else {
+        NSSound *glass = [NSSound soundNamed:@"Glass"]; // shared, not owned
+        if (glass) [glass play];
+        else NSBeep();
+    }
+    NSAlert *alert = [[NSAlert alloc] init];
+    if (failed) [alert setAlertStyle:NSAlertStyleWarning];
+    [alert setMessageText:[NSString stringWithUTF8String:title] ?: @""];
+    [alert setInformativeText:[NSString stringWithUTF8String:message] ?: @""];
+    [alert addButtonWithTitle:@"OK"];
+    [alert runModal];
+    [alert release];
+}

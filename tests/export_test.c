@@ -1,7 +1,11 @@
 /* Unit tests for the export writers (no database needed). */
+#include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "export.h"
 
@@ -433,6 +437,159 @@ static void test_dump_basename(void) {
     CHECK(b[0] == 'x');
 }
 
+static int pct(size_t index, size_t count, unsigned long long rows, unsigned long long est,
+               unsigned long long est_before, unsigned long long est_total) {
+    export_progress p = { "t", index, count, rows, est, est_before, est_total };
+    return export_progress_percent(&p);
+}
+
+static void test_progress_percent(void) {
+    /* one table: rows against the estimate, never 100 */
+    CHECK(pct(1, 1, 0, 1000, 0, 1000) == 0);
+    CHECK(pct(1, 1, 500, 1000, 0, 1000) == 50);
+    CHECK(pct(1, 1, 999, 1000, 0, 1000) == 99);
+    CHECK(pct(1, 1, 1000, 1000, 0, 1000) == 99);
+    CHECK(pct(1, 1, 5000, 1000, 0, 1000) == 99); /* estimate too low */
+    /* no estimate (a view, an empty or unknown table): indeterminate */
+    CHECK(pct(1, 1, 0, 0, 0, 0) == -1);
+    CHECK(pct(1, 1, 12345, 0, 0, 0) == -1);
+    CHECK(export_progress_percent(NULL) == -1);
+    CHECK(pct(0, 0, 0, 0, 0, 0) == -1);
+
+    /* several: weighted by estimate, a huge table doesn't leave it at 90% */
+    /* tables a (10 rows), b (1,000,000), c (10): weights 11, 1000001, 11 */
+    CHECK(pct(1, 3, 0, 10, 0, 1000020) == 0);
+    CHECK(pct(2, 3, 0, 1000000, 10, 1000020) == 0);           /* 11 / 1000023 */
+    CHECK(pct(2, 3, 500100, 1000000, 10, 1000020) == 50);     /* moves within the table */
+    CHECK(pct(2, 3, 2000000, 1000000, 10, 1000020) == 99);    /* capped at its estimate */
+    CHECK(pct(3, 3, 0, 10, 1000010, 1000020) == 99);
+    /* no estimates at all: "i of n" steps */
+    CHECK(pct(1, 4, 0, 0, 0, 0) == 0);
+    CHECK(pct(2, 4, 0, 0, 0, 0) == 25);
+    CHECK(pct(3, 4, 70000, 0, 0, 0) == 50);
+    CHECK(pct(4, 4, 0, 0, 0, 0) == 75);
+    /* out-of-range index is clamped, still below 100 */
+    CHECK(pct(9, 4, 0, 0, 0, 0) == 75);
+    /* huge numbers don't overflow */
+    CHECK(pct(2, 2, 0, 18000000000000000000ULL, 0, 18000000000000000000ULL) < 100);
+}
+
+static void test_format_duration(void) {
+    char b[32];
+    export_format_duration(b, sizeof b, 0); CHECK(strcmp(b, "0s") == 0);
+    export_format_duration(b, sizeof b, -3); CHECK(strcmp(b, "0s") == 0);
+    export_format_duration(b, sizeof b, 14.7); CHECK(strcmp(b, "14s") == 0);
+    export_format_duration(b, sizeof b, 59.9); CHECK(strcmp(b, "59s") == 0);
+    export_format_duration(b, sizeof b, 60); CHECK(strcmp(b, "1m 00s") == 0);
+    export_format_duration(b, sizeof b, 134); CHECK(strcmp(b, "2m 14s") == 0);
+    export_format_duration(b, sizeof b, 3599); CHECK(strcmp(b, "59m 59s") == 0);
+    export_format_duration(b, sizeof b, 3600); CHECK(strcmp(b, "1h 00m") == 0);
+    export_format_duration(b, sizeof b, 7384); CHECK(strcmp(b, "2h 03m") == 0);
+    export_format_duration(b, 3, 134); CHECK(strcmp(b, "2m") == 0); /* truncated */
+}
+
+static void test_format_count(void) {
+    char b[32];
+    export_format_count(b, sizeof b, 0); CHECK(strcmp(b, "0") == 0);
+    export_format_count(b, sizeof b, 999); CHECK(strcmp(b, "999") == 0);
+    export_format_count(b, sizeof b, 1000); CHECK(strcmp(b, "1,000") == 0);
+    export_format_count(b, sizeof b, 1204331); CHECK(strcmp(b, "1,204,331") == 0);
+    export_format_count(b, sizeof b, 18446744073709551615ULL);
+    CHECK(strcmp(b, "18,446,744,073,709,551,615") == 0);
+    export_format_count(b, 4, 1204331); CHECK(strcmp(b, "1,2") == 0);
+}
+
+static void test_tilde_path(void) {
+    char b[64];
+    export_tilde_path(b, sizeof b, "/Users/me/dump.sql", "/Users/me"); CHECK(strcmp(b, "~/dump.sql") == 0);
+    export_tilde_path(b, sizeof b, "/Users/me/dump.sql", "/Users/me/"); CHECK(strcmp(b, "~/dump.sql") == 0);
+    export_tilde_path(b, sizeof b, "/Users/me", "/Users/me"); CHECK(strcmp(b, "~") == 0);
+    export_tilde_path(b, sizeof b, "/Users/meg/x.sql", "/Users/me"); CHECK(strcmp(b, "/Users/meg/x.sql") == 0);
+    export_tilde_path(b, sizeof b, "/tmp/x.sql", "/Users/me"); CHECK(strcmp(b, "/tmp/x.sql") == 0);
+    export_tilde_path(b, sizeof b, "/tmp/x.sql", NULL); CHECK(strcmp(b, "/tmp/x.sql") == 0);
+    export_tilde_path(b, sizeof b, "/tmp/x.sql", "/"); CHECK(strcmp(b, "/tmp/x.sql") == 0);
+}
+
+/* Files in dir other than . and .. */
+static int count_files(const char *dir, const char *containing) {
+    DIR *d = opendir(dir);
+    int n = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d)))
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..") &&
+            (!containing || strstr(e->d_name, containing)))
+            n++;
+    if (d) closedir(d);
+    return n;
+}
+
+static char *slurp(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    char *s = calloc(1, 256);
+    if (s) fread(s, 1, 255, f);
+    fclose(f);
+    return s;
+}
+
+static void test_temp_file(void) {
+    const char *dir = "build/export-temp-test";
+    const char *path = "build/export-temp-test/out.sql";
+    mkdir("build", 0755);
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) { CHECK(!"mkdir"); return; }
+    remove(path);
+
+    /* finished: the target only, no temp file left */
+    char *tmp = NULL, *err = NULL;
+    FILE *f = export_temp_open(path, &tmp, &err);
+    CHECK(f && tmp && !err);
+    if (!f) return;
+    CHECK(strstr(tmp, "out.sql.sqlc-") != NULL);
+    fputs("first", f);
+    CHECK(export_temp_finish(f, tmp, path, 1, 0, &err) == 0 && !err);
+    char *got = slurp(path);
+    CHECK(got && strcmp(got, "first") == 0);
+    free(got);
+    CHECK(count_files(dir, NULL) == 1);
+
+    /* cancelled with a target already there: target untouched, temp gone */
+    f = export_temp_open(path, &tmp, &err);
+    CHECK(f != NULL);
+    if (!f) return;
+    fputs("partial", f);
+    CHECK(export_temp_finish(f, tmp, path, 0, 0, &err) == -1);
+    CHECK(err == NULL); /* a cancel has nothing to report */
+    got = slurp(path);
+    CHECK(got && strcmp(got, "first") == 0);
+    free(got);
+    CHECK(count_files(dir, ".sqlc-") == 0);
+
+    /* cancelled with no target: nothing at all */
+    remove(path);
+    f = export_temp_open(path, &tmp, &err);
+    CHECK(f != NULL);
+    if (!f) return;
+    fputs("partial", f);
+    CHECK(export_temp_finish(f, tmp, path, 0, 0, &err) == -1 && !err);
+    CHECK(count_files(dir, NULL) == 0);
+
+    /* a write error: reported, nothing left */
+    f = export_temp_open(path, &tmp, &err);
+    CHECK(f != NULL);
+    if (!f) return;
+    CHECK(export_temp_finish(f, tmp, path, 1, ENOSPC, &err) == -1);
+    CHECK(err && strstr(err, "Could not write") != NULL);
+    free(err);
+    err = NULL;
+    CHECK(count_files(dir, NULL) == 0);
+
+    /* a directory that doesn't exist: an error, no FILE */
+    f = export_temp_open("build/export-temp-test/no/such/out.sql", &tmp, &err);
+    CHECK(f == NULL && tmp == NULL && err && strstr(err, "Could not create") != NULL);
+    free(err);
+    rmdir(dir);
+}
+
 int main(void) {
     test_sql_escaping();
     test_csv_escaping();
@@ -446,6 +603,11 @@ int main(void) {
     test_view_order();
     test_select_names();
     test_dump_basename();
+    test_progress_percent();
+    test_format_duration();
+    test_format_count();
+    test_tilde_path();
+    test_temp_file();
     free(buf);
     if (failures) { fprintf(stderr, "export_test: %d failure(s)\n", failures); return 1; }
     printf("export_test: all checks passed\n");

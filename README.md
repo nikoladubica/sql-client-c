@@ -47,6 +47,8 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
   nothing selected, the whole database
 - **Export the whole database** as one SQL file, every table's structure and
   data and then the views (also **File › Export Database…**, whatever is selected)
+- A **progress bar** with **Cancel** next to the status line while an export runs,
+  and a sound and an alert with the time it took when it ends
 - Queries run on a background thread, so the window never freezes
 - Shows the first 10,000 rows per result set
 
@@ -248,6 +250,35 @@ For one table, pick a format and options, then where to save (defaults to `<tabl
 Rows are streamed to the file on a background thread, so big tables don't
 freeze the window; the file only appears once the export has finished.
 
+While any export runs (one table, selected tables or the whole database), a
+progress bar and a **Cancel** button sit next to the status line, which keeps
+saying what is being written:
+
+- **Progress**: one table moves by rows written against its row estimate
+  (`information_schema.TABLES.TABLE_ROWS`, not a `COUNT(*)`); several tables
+  are weighted by their estimates, so one huge table moves the bar for as long
+  as it takes. Estimates can be off by tens of percent on InnoDB, so the bar
+  is approximate and stays below 100% until the export has really finished.
+  With no estimate (a view, or a single table the server has none for) the bar
+  is indeterminate; with no estimates at all for several tables it steps
+  table by table.
+- **Cancel** asks first ("Cancel the export? The partial file will be
+  deleted."); **Keep exporting** is the default, so Return doesn't cancel and
+  Escape does nothing. The export keeps running while you decide, and if it
+  finishes in the meantime, confirming does nothing. Once confirmed it stops
+  at the next table or within a few thousand rows, the temporary file is
+  deleted (the target file is never created, and one that already exists is
+  left as it was) and the status line reads "Export cancelled.". The
+  connection stays usable: the rest of the table being read is skipped
+  first, which can take a moment on a big table.
+- **When it ends**, the bar is hidden. A finished export plays a sound and
+  shows an alert with how long it took and what was written ("Export
+  finished in 2m 14s - 12 tables, 1,204,331 rows, saved to ~/dump.sql."); a
+  failed one shows the error and the time until it failed, with the system
+  alert sound; a cancelled one shows neither. If sqlc-gui is in the
+  background, its Dock icon bounces and the alert is waiting when you come
+  back. The status line keeps its usual final message.
+
 - **SQL**: `DROP TABLE IF EXISTS` + `SHOW CREATE TABLE`, then multi-row `INSERT`s
   (structure only, data only, or both). Binary columns are written as hex,
   `NULL` as `NULL`, and generated columns are left out. Import it with
@@ -342,15 +373,15 @@ with the same structure / `DROP … IF EXISTS` / data options:
 | `src/db.c`, `src/db.h` | Shared core: run SQL, collect results, views filter |
 | `src/main.c`, `src/complete.c` | CLI and its tab completion |
 | `src/gui.c` | GUI (libui-ng) |
-| `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), which libui-ng lacks |
+| `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), which libui-ng lacks; small control sizes and widths; the end-of-export sound, Dock bounce and alert |
 | `src/splitview.m` | Resizable panes (sidebar, editor / results, columns / indexes): an `NSSplitView` wrapped as a libui control |
 | `src/loading.m` | The loading spinner with a tip under it (connecting, refreshing tables): an `NSProgressIndicator` and a wrapping label wrapped as a libui control |
 | `src/sql_tips.c` | The 50 SQL tips shown while connecting or loading tables, and the no-repeat random pick |
 | `src/segmented.m` | The Normal / AI / Structure switch: an `NSSegmentedControl` wrapped as a libui control |
-| `src/export.c` | Streaming SQL / CSV / XML writers (no database code) |
+| `src/export.c` | Streaming SQL / CSV / XML writers, the progress bar's value, time and count formatting, and the temporary file an export is written to (no database code) |
 | `src/export_db.c` | Export a table, the whole current database or selected tables as SQL, from a connection through those writers |
 | `src/export_dialog.m` | Native export options dialogs (table, database or selected tables) and save panel |
-| `src/table_menu.m` | Sidebar right-click menu, rename and API-key prompts, confirmations, clipboard |
+| `src/table_menu.m` | Sidebar right-click menu, rename and API-key prompts, confirmations (Cancel / Keep exporting as the default), clipboard |
 | `src/row_edit.c` | Row editing without UI: column kinds, value checks, `UPDATE` / `INSERT` / `DELETE` SQL |
 | `src/grid_edit.m` | In-place cell editor for the results grid (text field, calendar popover, cell menu) |
 | `src/ai.c` | Ask Claude: request body, Claude API call (libcurl), reply parsing, editor text, destructive-statement check |
@@ -400,6 +431,8 @@ a primary key and a read-only view, and the welcome screen at launch and after
   `DEFINER`, as `SHOW CREATE VIEW` writes it; loading them as another user
   may need the privilege to set that definer. MariaDB system-versioned tables
   export their current rows only, without history.
+- Quitting sqlc-gui while an export runs doesn't ask first: the export stops
+  and its temporary `<file>.sqlc-XXXXXX` is left next to the target.
 - Ask Claude is GUI only (no `sqlc` CLI command yet), and the window is busy
   (Run disabled) until Claude answers; a request can't be cancelled.
 

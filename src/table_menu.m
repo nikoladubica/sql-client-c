@@ -154,21 +154,33 @@ char *sqlc_prompt_secret(const char *title, const char *message, const char *ok_
     return prompt(title, message, "", ok_label, 1);
 }
 
-int sqlc_confirm_danger(const char *title, const char *message, const char *ok_label,
-                        int destructive) {
+/* An alert whose default button (Return) is keep_label, not the action. */
+static int confirm_keep(const char *title, const char *message, const char *action_label,
+                        const char *keep_label, int destructive) {
     NSAlert *alert = [[NSAlert alloc] init];
     [alert setAlertStyle:NSAlertStyleWarning];
     [alert setMessageText:[NSString stringWithUTF8String:title] ?: @""];
     [alert setInformativeText:[NSString stringWithUTF8String:message] ?: @""];
-    NSButton *ok = [alert addButtonWithTitle:[NSString stringWithUTF8String:ok_label] ?: @"OK"];
-    NSButton *cancel = [alert addButtonWithTitle:@"Cancel"];
-    // Cancel is the default: Return (and Escape) choose it, not the action.
+    NSButton *ok = [alert addButtonWithTitle:[NSString stringWithUTF8String:action_label] ?: @"OK"];
+    NSButton *keep = [alert addButtonWithTitle:[NSString stringWithUTF8String:keep_label] ?: @"Cancel"];
+    // keep_label is the default: Return chooses it, never the action.
     [ok setKeyEquivalent:@""];
-    [cancel setKeyEquivalent:@"\r"];
+    [keep setKeyEquivalent:@"\r"];
     if (destructive) {
         if (@available(macOS 11.0, *)) [ok setHasDestructiveAction:YES]; // red title
     }
     int confirmed = [alert runModal] == NSAlertFirstButtonReturn;
     [alert release];
     return confirmed;
+}
+
+int sqlc_confirm_danger(const char *title, const char *message, const char *ok_label,
+                        int destructive) {
+    // A button titled "Cancel" also gets Escape from NSAlert.
+    return confirm_keep(title, message, ok_label, "Cancel", destructive);
+}
+
+int sqlc_confirm_keep(const char *title, const char *message, const char *action_label,
+                      const char *keep_label) {
+    return confirm_keep(title, message, action_label, keep_label, 1);
 }

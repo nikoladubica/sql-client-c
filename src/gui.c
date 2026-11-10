@@ -29,6 +29,7 @@
  */
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -202,6 +203,14 @@ static struct {
 
     uiMultilineEntry *editor;
     uiLabel *status;
+
+    /* next to the status line while an export runs */
+    uiProgressBar *export_bar;
+    uiButton *cancel_export_btn;
+    struct job *export_job;  /* the running export, or NULL (UI thread only) */
+    int confirming_cancel;   /* the "Cancel the export?" alert is open */
+    char *pending_title, *pending_msg; /* finish alert held back until it closes */
+    int pending_failed;
 
     /* main area: the Normal | AI | Structure switch above one page */
     uiControl *mode_switch;  /* segmented, see segmented.h */
@@ -587,7 +596,7 @@ typedef enum { ROW_UPDATE, ROW_INSERT, ROW_DELETE } row_op;
 /* JOB_ALTER: what the context menu asked for */
 typedef enum { ALTER_RENAME, ALTER_TRUNCATE, ALTER_DROP } alter_kind;
 
-typedef struct {
+typedef struct job {
     job_kind kind;
     MYSQL *conn;              /* existing connection, or the new one */
     char *host, *user, *pass, *dbname;
@@ -607,6 +616,8 @@ typedef struct {
     export_opts xopts;
     unsigned long long rows;
     export_db_stats db_stats; /* JOB_EXPORT_DB */
+    atomic_int cancel;        /* JOB_EXPORT*: set on the UI thread to stop it */
+    int cancelled;            /* ... and it did stop (EXPORT_CANCELLED) */
     char **names;             /* ... only these tables/views (malloc'd), if nnames */
     size_t nnames;
     /* JOB_AI */
@@ -770,49 +781,46 @@ static void fetch_structure(job *j) {
     free(name);
 }
 
-/* Export progress: called on the worker thread, shown on the UI thread. */
-static void show_export_progress(void *data) {
-    unsigned long long *rows = data;
-    if (app.busy) set_status("Exporting... %llu rows", *rows);
-    free(rows);
-}
-
-static void export_progress(unsigned long long rows, void *data) {
-    (void)data;
-    unsigned long long *r = malloc(sizeof *r);
-    if (!r) return;
-    *r = rows;
-    uiQueueMain(show_export_progress, r);
-}
-
-/* Database export progress: same hop, with the table being written. */
+/* Export progress: called on the worker thread, shown on the UI thread
+ * (the status sentence and the progress bar). */
 typedef struct {
-    char *table;
-    const char *what;         /* "database" or "tables" (static strings) */
-    size_t index, count;
-    unsigned long long rows;
-} db_export_progress;
+    char *table;              /* copy of p.table */
+    int dump;                 /* JOB_EXPORT_DB */
+    const char *what;         /* ... "database" or "tables" (static strings) */
+    export_progress p;
+} export_progress_msg;
 
-static void show_db_export_progress(void *data) {
-    db_export_progress *p = data;
-    if (app.busy)
-        set_status("Exporting %s... %s (%zu of %zu), %llu rows",
-                   p->what, p->table, p->index, p->count, p->rows);
-    free(p->table);
-    free(p);
+static void show_export_progress(void *data) {
+    export_progress_msg *m = data;
+    /* Not once the export is over, and not over "Cancelling export...". */
+    if (app.busy && app.export_job && !atomic_load(&app.export_job->cancel)) {
+        if (m->dump)
+            set_status("Exporting %s... %s (%zu of %zu), %llu rows",
+                       m->what, m->table, m->p.index, m->p.count, m->p.rows);
+        else if (m->p.rows > 0) /* keep "Exporting t..." until rows come */
+            set_status("Exporting... %llu rows", m->p.rows);
+        uiProgressBarSetValue(app.export_bar, export_progress_percent(&m->p));
+    }
+    free(m->table);
+    free(m);
 }
 
-static void db_export_progress_cb(const char *table, size_t index, size_t count,
-                                  unsigned long long rows, void *data) {
-    db_export_progress *p = malloc(sizeof *p);
-    if (!p) return;
-    p->table = strdup(table ? table : "");
-    if (!p->table) { free(p); return; }
-    p->what = data ? (const char *)data : "database"; /* a string literal */
-    p->index = index;
-    p->count = count;
-    p->rows = rows;
-    uiQueueMain(show_db_export_progress, p);
+/* data is the job; returns nonzero (stop) once Cancel export was confirmed. */
+static int export_progress_cb(const export_progress *p, void *data) {
+    job *j = data;
+    export_progress_msg *m = malloc(sizeof *m);
+    if (m && !(m->table = strdup(p->table ? p->table : ""))) {
+        free(m);
+        m = NULL;
+    }
+    if (m) {
+        m->dump = j->kind == JOB_EXPORT_DB;
+        m->what = j->nnames ? "tables" : "database";
+        m->p = *p;
+        m->p.table = m->table;
+        uiQueueMain(show_export_progress, m);
+    }
+    return atomic_load(&j->cancel);
 }
 
 static void *worker(void *data) {
@@ -850,16 +858,20 @@ static void *worker(void *data) {
     } else if (j->kind == JOB_STRUCTURE) {
         fetch_structure(j);
     } else if (j->kind == JOB_EXPORT) {
-        j->ok = export_table(j->conn, j->table, j->is_view, j->fmt, &j->xopts, j->path,
-                             export_progress, NULL, &j->rows, &j->error) == 0;
+        int rc = export_table(j->conn, j->table, j->is_view, j->fmt, &j->xopts, j->path,
+                              export_progress_cb, j, &j->rows, &j->error);
+        j->ok = rc == 0;
+        j->cancelled = rc == EXPORT_CANCELLED;
     } else if (j->kind == JOB_EXPORT_DB) {
+        int rc;
         if (j->nnames)
-            j->ok = export_tables(j->conn, (const char *const *)j->names, j->nnames, &j->xopts,
-                                  j->path, db_export_progress_cb, (void *)"tables",
-                                  &j->db_stats, &j->error) == 0;
+            rc = export_tables(j->conn, (const char *const *)j->names, j->nnames, &j->xopts,
+                               j->path, export_progress_cb, j, &j->db_stats, &j->error);
         else
-            j->ok = export_database(j->conn, &j->xopts, j->path, db_export_progress_cb, NULL,
-                                    &j->db_stats, &j->error) == 0;
+            rc = export_database(j->conn, &j->xopts, j->path, export_progress_cb, j,
+                                 &j->db_stats, &j->error);
+        j->ok = rc == 0;
+        j->cancelled = rc == EXPORT_CANCELLED;
     } else {
         j->ok = 1; /* JOB_TABLES: just the refresh below */
     }
@@ -870,13 +882,34 @@ static void *worker(void *data) {
     return NULL;
 }
 
+/* The progress bar and Cancel next to the status line, for export j. */
+static void show_export_bar(job *j) {
+    app.export_job = j;
+    uiProgressBarSetValue(app.export_bar, 0);
+    uiControlEnable(uiControl(app.cancel_export_btn));
+    uiControlShow(uiControl(app.export_bar));
+    uiControlShow(uiControl(app.cancel_export_btn));
+}
+
+/* ... hidden and reset when it ends, whatever the outcome. */
+static void hide_export_bar(void) {
+    app.export_job = NULL;
+    uiProgressBarSetValue(app.export_bar, 0); /* also ends an indeterminate bar */
+    uiControlHide(uiControl(app.export_bar));
+    uiControlHide(uiControl(app.cancel_export_btn));
+}
+
 static void start_job(job *j) {
     pthread_t th;
     app.job_kind = j->kind;
     set_busy(1);
     if (j->kind == JOB_CONNECT) set_connecting(1);
     else if (j->kind == JOB_TABLES) set_refreshing(1);
+    int exporting = j->kind == JOB_EXPORT || j->kind == JOB_EXPORT_DB;
+    atomic_init(&j->cancel, 0);
+    if (exporting) show_export_bar(j);
     if (pthread_create(&th, NULL, worker, j) != 0) {
+        if (exporting) hide_export_bar();
         set_busy(0);
         set_status("Could not start worker thread");
         job_free(j);
@@ -1136,9 +1169,82 @@ static void alter_done(job *j) {
 }
 
 /* Back on the UI thread. */
+/* The alert at the end of an export: sound, Dock bounce if in the
+ * background, modal alert. Held back while the "Cancel the export?" alert
+ * is open (job_done can run during it) and shown when that closes. */
+static void notify_export(const char *title, const char *message, int failed) {
+#ifdef SQLC_AUTOTEST
+    printf("[notify] %s: %s\n", title, message);
+    (void)failed;
+#else
+    if (app.confirming_cancel) {
+        free(app.pending_title);
+        free(app.pending_msg);
+        app.pending_title = strdup(title);
+        app.pending_msg = strdup(message);
+        app.pending_failed = failed;
+        return;
+    }
+    sqlc_notify_done(title, message, failed);
+#endif
+}
+
+/* "Export finished in 2m 14s - 12 tables, 1,204,331 rows, saved to ~/dump.sql." */
+static void notify_export_done(const job *j) {
+    char took[32], rows[40], where[1024], msg[2048];
+    export_format_duration(took, sizeof took, j->seconds);
+    export_tilde_path(where, sizeof where, j->path, getenv("HOME"));
+    if (j->kind == JOB_EXPORT) {
+        export_format_count(rows, sizeof rows, j->rows);
+        snprintf(msg, sizeof msg, "Export finished in %s - %s row%s of %s, saved to %s.",
+                 took, rows, j->rows == 1 ? "" : "s", j->table, where);
+    } else {
+        const export_db_stats *st = &j->db_stats;
+        char views[64] = "";
+        if (st->views) snprintf(views, sizeof views, ", %zu view%s", st->views, st->views == 1 ? "" : "s");
+        export_format_count(rows, sizeof rows, st->rows);
+        snprintf(msg, sizeof msg, "Export finished in %s - %zu table%s%s, %s row%s, saved to %s.",
+                 took, st->tables, st->tables == 1 ? "" : "s", views,
+                 rows, st->rows == 1 ? "" : "s", where);
+    }
+    notify_export("Export finished", msg, 0);
+}
+
+static void notify_export_failed(const char *title, const job *j) {
+    char took[32], msg[2048];
+    export_format_duration(took, sizeof took, j->seconds);
+    snprintf(msg, sizeof msg, "%s\n\nFailed after %s.", j->error ? j->error : "Unknown error", took);
+    notify_export(title, msg, 1);
+}
+
+/* Cancel next to the progress bar: ask first, Keep exporting is the default.
+ * The export goes on while the alert is open; if it ends meanwhile,
+ * confirming does nothing. */
+static void on_cancel_export(uiButton *b, void *data) {
+    (void)b; (void)data;
+    if (!app.export_job || app.confirming_cancel) return;
+    app.confirming_cancel = 1;
+    int yes = sqlc_confirm_keep("Cancel the export?", "The partial file will be deleted.",
+                                "Cancel export", "Keep exporting");
+    app.confirming_cancel = 0;
+    if (yes && app.export_job) {
+        atomic_store(&app.export_job->cancel, 1);
+        uiControlDisable(uiControl(app.cancel_export_btn));
+        set_status("Cancelling export...");
+    }
+    if (app.pending_msg) { /* it ended while the alert was open */
+        char *title = app.pending_title, *msg = app.pending_msg;
+        app.pending_title = app.pending_msg = NULL;
+        sqlc_notify_done(title ? title : "Export", msg, app.pending_failed);
+        free(title);
+        free(msg);
+    }
+}
+
 static void job_done(void *data) {
     job *j = data;
     set_busy(0);
+    if (app.export_job == j) hide_export_bar();
 
     /* The sidebar's selection, to keep when its list is replaced below
      * (following a rename). Not across connections. */
@@ -1213,16 +1319,21 @@ static void job_done(void *data) {
                 set_status("Claude didn't write a query - see the comments in the editor.");
         }
     } else if (j->kind == JOB_EXPORT) {
-        if (j->ok) {
+        if (j->cancelled) {
+            set_status("Export cancelled.");
+        } else if (j->ok) {
             set_status("Exported %llu row%s of %s to %s (%.2f s)", j->rows, j->rows == 1 ? "" : "s",
                        j->table, j->path, j->seconds);
+            notify_export_done(j);
         } else {
             set_status("Export failed: %s", j->error ? j->error : "unknown error");
-            show_error("Export failed", j->error ? j->error : "");
+            notify_export_failed("Export failed", j);
         }
     } else if (j->kind == JOB_EXPORT_DB) {
         const export_db_stats *st = &j->db_stats;
-        if (j->ok && j->nnames) {
+        if (j->cancelled) {
+            set_status("Export cancelled.");
+        } else if (j->ok && j->nnames) {
             set_status("Exported %zu selected table%s from %s: %zu table%s, %zu view%s, %llu row%s "
                        "to %s (%.2f s)%s",
                        j->nnames, j->nnames == 1 ? "" : "s",
@@ -1230,16 +1341,18 @@ static void job_done(void *data) {
                        st->views, st->views == 1 ? "" : "s",
                        st->rows, st->rows == 1 ? "" : "s", j->path, j->seconds,
                        st->skipped ? " - some objects skipped, see the file" : "");
+            notify_export_done(j);
         } else if (j->ok) {
             set_status("Exported database %s: %zu table%s, %zu view%s, %llu row%s to %s (%.2f s)%s",
                        j->table, st->tables, st->tables == 1 ? "" : "s",
                        st->views, st->views == 1 ? "" : "s",
                        st->rows, st->rows == 1 ? "" : "s", j->path, j->seconds,
                        st->skipped ? " - some objects skipped, see the file" : "");
+            notify_export_done(j);
         } else {
             const char *title = j->nnames ? "Export failed" : "Database export failed";
             set_status("%s: %s", title, j->error ? j->error : "unknown error");
-            show_error(title, j->error ? j->error : "");
+            notify_export_failed(title, j);
         }
     } else if (j->kind == JOB_TABLES) {
         const db_set *t = j->tables.nsets ? &j->tables.sets[0] : NULL;
@@ -3488,8 +3601,21 @@ static void build_window(void) {
     uiBoxAppend(main_box, app.structure_view, 1);
     app.mode = MODE_NORMAL;
 
+    /* status line; while an export runs, a progress bar and Cancel next to it */
+    uiBox *status_row = uiNewHorizontalBox();
+    uiBoxSetPadded(status_row, 1);
     app.status = uiNewLabel("Not connected.");
-    uiBoxAppend(root, uiControl(app.status), 0);
+    uiBoxAppend(status_row, uiControl(app.status), 1);
+    app.export_bar = uiNewProgressBar();
+    sqlc_control_set_width(uiControl(app.export_bar), 300);
+    uiControlHide(uiControl(app.export_bar));
+    uiBoxAppend(status_row, uiControl(app.export_bar), 0);
+    app.cancel_export_btn = uiNewButton("Cancel");
+    uiButtonOnClicked(app.cancel_export_btn, on_cancel_export, NULL);
+    sqlc_button_set_small(app.cancel_export_btn);
+    uiControlHide(uiControl(app.cancel_export_btn));
+    uiBoxAppend(status_row, uiControl(app.cancel_export_btn), 0);
+    uiBoxAppend(root, uiControl(status_row), 0);
 
     app.edit.new_row = -1;
     app.last_tip = SIZE_MAX; /* no tip shown yet */
@@ -3537,6 +3663,8 @@ int main(void) {
         free(app.browsing);
         free(app.current_db);
         free(app.pending_browse);
+        free(app.pending_title);
+        free(app.pending_msg);
         free(app.st.table);
         free_set_model(app.st.cols_model);
         free_set_model(app.st.idx_model);

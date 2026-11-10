@@ -1,8 +1,11 @@
 #include "export.h"
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* An INSERT is closed after this many rows or (roughly) bytes, well below
  * the default max_allowed_packet (16 MB in MariaDB/MySQL 8). */
@@ -504,5 +507,110 @@ done:
     free(waiting);
     free(mentions);
     if (rc != 0) for (size_t i = 0; i < n; i++) order[i] = i;
+    return rc;
+}
+
+/* ---------- progress ---------- */
+
+int export_progress_percent(const export_progress *p) {
+    if (!p || p->count == 0) return -1;
+    double pct;
+    if (p->count == 1) {
+        if (p->est == 0) return -1;
+        pct = (double)p->rows * 100.0 / (double)p->est;
+    } else {
+        size_t index = p->index ? p->index : 1;
+        if (index > p->count) index = p->count;
+        unsigned long long within = p->rows < p->est ? p->rows : p->est;
+        double done = (double)p->est_before + (double)(index - 1) + (double)within;
+        double total = (double)p->est_total + (double)p->count;
+        pct = done * 100.0 / total;
+    }
+    if (pct < 0) pct = 0;
+    if (pct > 99) pct = 99;
+    return (int)pct;
+}
+
+void export_format_duration(char *buf, size_t size, double seconds) {
+    if (!buf || size == 0) return;
+    unsigned long long s = seconds > 0 ? (unsigned long long)seconds : 0;
+    if (s < 60)
+        snprintf(buf, size, "%llus", s);
+    else if (s < 3600)
+        snprintf(buf, size, "%llum %02llus", s / 60, s % 60);
+    else
+        snprintf(buf, size, "%lluh %02llum", s / 3600, s % 3600 / 60);
+}
+
+void export_format_count(char *buf, size_t size, unsigned long long n) {
+    if (!buf || size == 0) return;
+    char digits[32], out[48];
+    int nd = snprintf(digits, sizeof digits, "%llu", n);
+    size_t k = 0;
+    for (int i = 0; i < nd; i++) {
+        if (i > 0 && (nd - i) % 3 == 0) out[k++] = ',';
+        out[k++] = digits[i];
+    }
+    out[k] = '\0';
+    snprintf(buf, size, "%s", out);
+}
+
+void export_tilde_path(char *buf, size_t size, const char *path, const char *home) {
+    if (!buf || size == 0) return;
+    if (!path) { buf[0] = '\0'; return; }
+    size_t hl = home ? strlen(home) : 0;
+    while (hl > 1 && home[hl - 1] == '/') hl--; /* "/Users/me/" */
+    if (hl > 1 && strncmp(path, home, hl) == 0 && (path[hl] == '/' || path[hl] == '\0'))
+        snprintf(buf, size, "~%s", path + hl);
+    else
+        snprintf(buf, size, "%s", path);
+}
+
+/* ---------- writing a file safely ---------- */
+
+static char *path_error(const char *what, const char *path, int errnum) {
+    size_t n = strlen(what) + strlen(path) + 128;
+    char *s = malloc(n);
+    if (s) snprintf(s, n, "%s %s: %s", what, path, strerror(errnum));
+    return s;
+}
+
+FILE *export_temp_open(const char *path, char **tmp, char **err) {
+    size_t n = strlen(path) + 16;
+    *tmp = malloc(n);
+    if (!*tmp) { *err = strdup("Out of memory"); return NULL; }
+    snprintf(*tmp, n, "%s.sqlc-XXXXXX", path);
+    int fd = mkstemp(*tmp);
+    if (fd < 0) {
+        *err = path_error("Could not create", path, errno);
+        free(*tmp);
+        *tmp = NULL;
+        return NULL;
+    }
+    fchmod(fd, 0644);
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        *err = path_error("Could not write", path, errno);
+        close(fd);
+        unlink(*tmp);
+        free(*tmp);
+        *tmp = NULL;
+    }
+    return f;
+}
+
+int export_temp_finish(FILE *f, char *tmp, const char *path, int ok, int write_errno,
+                       char **err) {
+    int rc = -1;
+    if (ok && !write_errno && (fflush(f) != 0 || fsync(fileno(f)) != 0)) write_errno = errno ? errno : EIO;
+    if (fclose(f) != 0 && ok && !write_errno) write_errno = errno ? errno : EIO;
+    if (write_errno) {
+        if (!*err) *err = path_error("Could not write", path, write_errno);
+    } else if (ok) {
+        if (rename(tmp, path) == 0) rc = 0;
+        else if (!*err) *err = path_error("Could not save", path, errno);
+    }
+    if (rc != 0) unlink(tmp);
+    free(tmp);
     return rc;
 }

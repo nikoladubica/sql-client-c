@@ -51,4 +51,10 @@ char *sqlc_prompt_secret(const char *title, const char *message, const char *ok_
 int sqlc_confirm_danger(const char *title, const char *message, const char *ok_label,
                         int destructive);
 
+/* The same with a named keep button ("Keep exporting") as the default:
+ * Return chooses it, Escape does nothing, action_label (red on macOS 11+)
+ * only by clicking it. Returns 1 only if action_label was clicked. */
+int sqlc_confirm_keep(const char *title, const char *message, const char *action_label,
+                      const char *keep_label);
+
 #endif

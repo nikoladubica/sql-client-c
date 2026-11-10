@@ -116,6 +116,60 @@ void export_dump_basename(char *buf, size_t size, const char *db, size_t nselect
 int export_view_order(size_t n, const char *const *names, const char *const *defs,
                       size_t *order);
 
+/* ---- progress, for the GUI's progress bar (see export_db.h) ---- */
+
+/* Where an export is: passed to the progress callback from the exporting
+ * thread. Estimates are information_schema.TABLES.TABLE_ROWS, which for
+ * InnoDB can be off by tens of percent; 0 means none (a view, or unknown). */
+typedef struct {
+    const char *table;             /* object being written */
+    size_t index, count;           /* from 1, of count objects (1: a single table) */
+    unsigned long long rows;       /* rows of it written so far */
+    unsigned long long est;        /* its row estimate */
+    unsigned long long est_before; /* the estimates of the objects before it, summed */
+    unsigned long long est_total;  /* every object's estimate, summed */
+} export_progress;
+
+/*
+ * The progress bar's value, 0..99 (100 only comes from the caller when the
+ * export has really finished), or -1 for an indeterminate bar.
+ *
+ * One object (count 1): rows against its estimate, or -1 with no estimate.
+ * Several: each object weighs its estimate + 1, so a huge table moves the
+ * bar for as long as it takes, rows move it within a table (up to the
+ * estimate), and with no estimates at all it steps "i of n".
+ */
+int export_progress_percent(const export_progress *p);
+
+/* Elapsed time for people: "14s" under a minute, "2m 14s" under an hour,
+ * then "1h 05m". Negative counts as 0. Truncated to fit size. */
+void export_format_duration(char *buf, size_t size, double seconds);
+
+/* n with thousands separators: "1,204,331". Truncated to fit size. */
+void export_format_count(char *buf, size_t size, unsigned long long n);
+
+/* path with a leading home directory written as "~" ("~/dump.sql"), else
+ * path as is. home NULL or empty: as is. Truncated to fit size. */
+void export_tilde_path(char *buf, size_t size, const char *path, const char *home);
+
+/* ---- writing a file safely ---- */
+
+/* Open a temporary file next to path ("<path>.sqlc-XXXXXX", mode 0644) for
+ * writing. Returns the FILE with *tmp set to its name (malloc'd), or NULL
+ * with *err set to a malloc'd message (and *tmp NULL). */
+FILE *export_temp_open(const char *path, char **tmp, char **err);
+
+/*
+ * Close f. With ok (and write_errno 0, and the flush going through) move
+ * tmp over path; otherwise remove tmp, leaving path (if it exists) as it
+ * was - a failed or cancelled export never leaves a partial file. Frees
+ * tmp. Returns 0 if path was written, else -1 with *err set (a malloc'd
+ * message about the write error) unless *err was already set or there was
+ * nothing to report (!ok without a write error, as for a cancel).
+ */
+int export_temp_finish(FILE *f, char *tmp, const char *path, int ok, int write_errno,
+                       char **err);
+
 /* ---- escaping, exposed for tests ---- */
 
 /* 'text' with \0 \n \r \\ ' " and Ctrl-Z escaped (as mysql_real_escape_string). */

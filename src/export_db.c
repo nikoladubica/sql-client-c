@@ -5,8 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include "db.h"
 
@@ -135,14 +133,18 @@ static void set_time_zone(MYSQL *conn, const char *tz) {
 /*
  * Write one table or view into the open file f (the export_writer part of
  * an export). create is its CREATE statement if the caller already has it,
- * or NULL to ask the server. Returns 0; or -1 with *err set (server error,
- * out of memory) or with *write_errno set (writing f failed). *rows_out is
- * the number of rows written either way.
+ * or NULL to ask the server. With progress, pp says where the export is
+ * (table, index, estimates); its rows are updated and progress(pp, data)
+ * is called every PROGRESS_EVERY rows. Returns 0; or -1 with *err set
+ * (server error, out of memory), with *write_errno set (writing f failed)
+ * or with *cancelled set (progress asked to stop). *rows_out is the number
+ * of rows written either way.
  */
 static int write_table(MYSQL *conn, FILE *f, const char *table, int is_view,
                        export_format fmt, const export_opts *opts, const char *create,
-                       export_progress_fn progress, void *data,
-                       unsigned long long *rows_out, int *write_errno, char **err) {
+                       export_progress_fn progress, void *data, export_progress *pp,
+                       unsigned long long *rows_out, int *write_errno, int *cancelled,
+                       char **err) {
     unsigned long long rows = 0;
     char *qtable = db_quote_ident(table);
     char *own_create = NULL, *sql = NULL, *tz = NULL;
@@ -187,7 +189,10 @@ static int write_table(MYSQL *conn, FILE *f, const char *table, int is_view,
             *write_errno = errno ? errno : EIO;
             goto done;
         }
-        if (++rows % PROGRESS_EVERY == 0 && progress) progress(rows, data);
+        if (++rows % PROGRESS_EVERY == 0 && progress) {
+            pp->rows = rows;
+            if (progress(pp, data)) { *cancelled = 1; goto done; }
+        }
     }
     if (res && mysql_errno(conn)) { *err = db_error_string(conn); goto done; }
 
@@ -198,7 +203,8 @@ static int write_table(MYSQL *conn, FILE *f, const char *table, int is_view,
 
 done:
     if (w) export_end(w);
-    if (res) mysql_free_result(res); /* reads any rows left, keeping conn usable */
+    if (res) mysql_free_result(res); /* reads any rows left (after a cancel too),
+                                        keeping conn usable */
     if (tz_changed) {
         if (tz) set_time_zone(conn, tz);
         else mysql_query(conn, "SET time_zone = DEFAULT");
@@ -211,49 +217,27 @@ done:
     return rc;
 }
 
-/* A temporary file next to path ("<path>.sqlc-XXXXXX"), opened for writing.
- * Returns the FILE with *tmp set to its name (malloc'd), or NULL with *err set. */
-static FILE *open_temp(const char *path, char **tmp, char **err) {
-    size_t n = strlen(path) + 16;
-    *tmp = malloc(n);
-    if (!*tmp) { *err = strdup("Out of memory"); return NULL; }
-    snprintf(*tmp, n, "%s.sqlc-XXXXXX", path);
-    int fd = mkstemp(*tmp);
-    if (fd < 0) {
-        *err = fmt_error("Could not create %s: %s", path, strerror(errno));
-        free(*tmp);
-        *tmp = NULL;
-        return NULL;
+/* The table's row estimate (information_schema.TABLES.TABLE_ROWS), or 0
+ * when there is none or it can't be read. */
+static unsigned long long table_estimate(MYSQL *conn, const char *table) {
+    size_t n = strlen(table);
+    char *esc = malloc(2 * n + 1);
+    char *sql = esc ? malloc(2 * n + 160) : NULL;
+    unsigned long long est = 0;
+    if (sql) {
+        mysql_real_escape_string(conn, esc, table, (unsigned long)n);
+        snprintf(sql, 2 * n + 160, "SELECT TABLE_ROWS FROM information_schema.TABLES "
+                 "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '%s'", esc);
+        char *err = NULL;
+        MYSQL_RES *r = query_store(conn, sql, &err);
+        free(err);
+        MYSQL_ROW row = r ? mysql_fetch_row(r) : NULL;
+        if (row && row[0]) est = strtoull(row[0], NULL, 10);
+        if (r) mysql_free_result(r);
     }
-    fchmod(fd, 0644);
-    FILE *f = fdopen(fd, "w");
-    if (!f) {
-        *err = fmt_error("Could not write %s: %s", path, strerror(errno));
-        close(fd);
-        unlink(*tmp);
-        free(*tmp);
-        *tmp = NULL;
-    }
-    return f;
-}
-
-/* Close f; if ok (and every write went through) move tmp over path, else
- * remove tmp. Frees tmp. Returns 0, or -1 with *err set (unless the caller
- * already set it). */
-static int finish_temp(FILE *f, char *tmp, const char *path, int ok, int write_errno,
-                       char **err) {
-    int rc = -1;
-    if (ok && !write_errno && (fflush(f) != 0 || fsync(fileno(f)) != 0)) write_errno = errno ? errno : EIO;
-    if (fclose(f) != 0 && ok && !write_errno) write_errno = errno ? errno : EIO;
-    if (write_errno) {
-        if (!*err) *err = fmt_error("Could not write %s: %s", path, strerror(write_errno));
-    } else if (ok) {
-        if (rename(tmp, path) == 0) rc = 0;
-        else *err = fmt_error("Could not save %s: %s", path, strerror(errno));
-    }
-    if (rc != 0) unlink(tmp);
-    free(tmp);
-    return rc;
+    free(sql);
+    free(esc);
+    return est;
 }
 
 int export_table(MYSQL *conn, const char *table, int is_view, export_format fmt,
@@ -263,17 +247,27 @@ int export_table(MYSQL *conn, const char *table, int is_view, export_format fmt,
     export_opts opts = opts_in ? *opts_in : export_default_opts();
     opts.sql_in_dump = 0;
     unsigned long long rows = 0;
-    int rc = -1, write_errno = 0;
+    int rc = -1, write_errno = 0, cancelled = 0;
     char *tmp = NULL;
+    export_progress pp = { .table = table, .index = 1, .count = 1 };
     *err = NULL;
 
-    FILE *f = open_temp(path, &tmp, err);
+    if (progress) {
+        if (!is_view) pp.est = pp.est_total = table_estimate(conn, table);
+        if (progress(&pp, data)) cancelled = 1;
+    }
+    FILE *f = cancelled ? NULL : export_temp_open(path, &tmp, err);
     if (f) {
-        int ok = write_table(conn, f, table, is_view, fmt, &opts, NULL, progress, data,
-                             &rows, &write_errno, err) == 0;
-        rc = finish_temp(f, tmp, path, ok, write_errno, err);
+        int ok = write_table(conn, f, table, is_view, fmt, &opts, NULL, progress, data, &pp,
+                             &rows, &write_errno, &cancelled, err) == 0;
+        rc = export_temp_finish(f, tmp, path, ok, write_errno, err);
     }
     if (rows_out) *rows_out = rows;
+    if (cancelled && rc != 0) {
+        free(*err);
+        *err = strdup("Export cancelled");
+        return EXPORT_CANCELLED;
+    }
     if (rc != 0 && !*err) *err = strdup("Export failed");
     return rc;
 }
@@ -283,6 +277,7 @@ int export_table(MYSQL *conn, const char *table, int is_view, export_format fmt,
 typedef struct {
     char *name, *type;
     export_obj_kind kind;
+    unsigned long long est;    /* tables: TABLE_ROWS estimate (0 = none) */
     char *create;              /* views: CREATE VIEW, fetched up front */
 } db_object;
 
@@ -299,7 +294,7 @@ static void objects_free(db_object *o, size_t n) {
 static db_object *list_objects(MYSQL *conn, size_t *n_out, char **err) {
     *n_out = 0;
     MYSQL_RES *r = query_store(conn,
-        "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
+        "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS FROM information_schema.TABLES "
         "WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME", err);
     if (!r) return NULL;
     size_t n = (size_t)mysql_num_rows(r);
@@ -312,6 +307,7 @@ static db_object *list_objects(MYSQL *conn, size_t *n_out, char **err) {
         o[k].name = strdup(row[0]);
         o[k].type = row[1] ? strdup(row[1]) : NULL;
         o[k].kind = export_object_kind(row[1]);
+        o[k].est = o[k].kind == EXPORT_OBJ_TABLE && row[2] ? strtoull(row[2], NULL, 10) : 0;
         if (!o[k].name || (row[1] && !o[k].type)) {
             objects_free(o, k + 1);
             mysql_free_result(r);
@@ -325,22 +321,10 @@ static db_object *list_objects(MYSQL *conn, size_t *n_out, char **err) {
     return o;
 }
 
-typedef struct {
-    export_db_progress_fn fn;
-    void *data;
-    const char *table;
-    size_t index, count;
-} db_progress;
-
-static void table_progress(unsigned long long rows, void *data) {
-    db_progress *p = data;
-    p->fn(p->table, p->index, p->count, rows, p->data);
-}
-
 /* export_database (nsel == 0) and export_tables (the nsel names in sel). */
 static int dump(MYSQL *conn, const char *const *sel, size_t nsel,
                 const export_opts *opts_in, const char *path,
-                export_db_progress_fn progress, void *data,
+                export_progress_fn progress, void *data,
                 export_db_stats *stats_out, char **err) {
     export_opts opts = opts_in ? *opts_in : export_default_opts();
     opts.sql_in_dump = 1;
@@ -351,7 +335,8 @@ static int dump(MYSQL *conn, const char *const *sel, size_t nsel,
     const char **vnames = NULL, **vdefs = NULL;
     size_t *vidx = NULL, nviews = 0, ntables = 0;
     FILE *f = NULL;
-    int rc = -1, write_errno = 0, ok = 0;
+    int rc = -1, write_errno = 0, ok = 0, cancelled = 0;
+    unsigned long long est_total = 0;
     *err = NULL;
 
     /* Everything that can fail on the server up front, before the file. */
@@ -394,7 +379,7 @@ static int dump(MYSQL *conn, const char *const *sel, size_t nsel,
         if (*err) goto done;
     }
     for (size_t i = 0; i < nobjs; i++) {
-        if (objs[i].kind == EXPORT_OBJ_TABLE) ntables++;
+        if (objs[i].kind == EXPORT_OBJ_TABLE) { ntables++; est_total += objs[i].est; }
         else if (objs[i].kind == EXPORT_OBJ_VIEW && opts.sql_structure) nviews++;
     }
 
@@ -421,10 +406,10 @@ static int dump(MYSQL *conn, const char *const *sel, size_t nsel,
         goto done;
     }
 
-    if (!(f = open_temp(path, &tmp, err))) goto done;
+    if (!(f = export_temp_open(path, &tmp, err))) goto done;
     export_sql_dump_header(f, db, ntables, nviews, nsel != 0);
 
-    db_progress dp = { .fn = progress, .data = data, .count = ntables + nviews };
+    export_progress pp = { .count = ntables + nviews, .est_total = est_total };
     size_t index = 0;
     for (size_t i = 0; i < nobjs; i++) {
         if (objs[i].kind == EXPORT_OBJ_SKIP) {
@@ -433,16 +418,19 @@ static int dump(MYSQL *conn, const char *const *sel, size_t nsel,
             continue;
         }
         if (objs[i].kind != EXPORT_OBJ_TABLE) continue;
-        dp.table = objs[i].name;
-        dp.index = ++index;
-        if (progress) progress(dp.table, dp.index, dp.count, 0, data);
+        pp.table = objs[i].name;
+        pp.index = ++index;
+        pp.rows = 0;
+        pp.est = objs[i].est;
+        if (progress && progress(&pp, data)) { cancelled = 1; goto done; }
         unsigned long long rows = 0;
         int trc = write_table(conn, f, objs[i].name, 0, EXPORT_SQL, &opts, NULL,
-                              progress ? table_progress : NULL, &dp,
-                              &rows, &write_errno, err);
+                              progress, data, &pp,
+                              &rows, &write_errno, &cancelled, err);
         stats.rows += rows;
+        pp.est_before += pp.est;
         if (trc != 0) {
-            if (*err) {
+            if (*err && !cancelled) {
                 char *e = fmt_error("Table %s: %s", objs[i].name, *err);
                 if (e) { free(*err); *err = e; }
             }
@@ -452,12 +440,14 @@ static int dump(MYSQL *conn, const char *const *sel, size_t nsel,
     }
     for (size_t k = 0; k < nviews; k++) {
         db_object *o = &objs[vidx[view_order[k]]];
-        dp.table = o->name;
-        dp.index = ++index;
-        if (progress) progress(dp.table, dp.index, dp.count, 0, data);
+        pp.table = o->name;
+        pp.index = ++index;
+        pp.rows = 0;
+        pp.est = 0;
+        if (progress && progress(&pp, data)) { cancelled = 1; goto done; }
         unsigned long long rows = 0;
-        if (write_table(conn, f, o->name, 1, EXPORT_SQL, &opts, o->create, NULL, NULL,
-                        &rows, &write_errno, err) != 0) {
+        if (write_table(conn, f, o->name, 1, EXPORT_SQL, &opts, o->create, NULL, NULL, &pp,
+                        &rows, &write_errno, &cancelled, err) != 0) {
             if (*err) {
                 char *e = fmt_error("View %s: %s", o->name, *err);
                 if (e) { free(*err); *err = e; }
@@ -471,7 +461,7 @@ static int dump(MYSQL *conn, const char *const *sel, size_t nsel,
     ok = !write_errno;
 
 done:
-    if (f) rc = finish_temp(f, tmp, path, ok, write_errno, err);
+    if (f) rc = export_temp_finish(f, tmp, path, ok, write_errno, err);
     free(view_order);
     free(vidx);
     free(vdefs);
@@ -479,19 +469,24 @@ done:
     objects_free(objs, nobjs);
     free(db);
     if (stats_out) *stats_out = stats;
+    if (cancelled && rc != 0) {
+        free(*err);
+        *err = strdup("Export cancelled");
+        return EXPORT_CANCELLED;
+    }
     if (rc != 0 && !*err) *err = strdup("Export failed");
     return rc;
 }
 
 int export_database(MYSQL *conn, const export_opts *opts, const char *path,
-                    export_db_progress_fn progress, void *data,
+                    export_progress_fn progress, void *data,
                     export_db_stats *stats, char **err) {
     return dump(conn, NULL, 0, opts, path, progress, data, stats, err);
 }
 
 int export_tables(MYSQL *conn, const char *const *names, size_t n,
                   const export_opts *opts, const char *path,
-                  export_db_progress_fn progress, void *data,
+                  export_progress_fn progress, void *data,
                   export_db_stats *stats, char **err) {
     if (n == 0) {
         *err = strdup("No tables selected");

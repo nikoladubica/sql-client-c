@@ -6,8 +6,19 @@
 
 #include "export.h"
 
-/* Called every few thousand rows from the exporting thread. */
-typedef void (*export_progress_fn)(unsigned long long rows, void *data);
+/*
+ * Progress, from the exporting thread: once at the start of each table or
+ * view (rows = 0) and every few thousand rows of a table. See
+ * export_progress in export.h (p->table and p are only valid during the
+ * call). Return 0 to go on, or nonzero to stop the export: it then ends at
+ * that point with -2 ("Export cancelled"), its temporary file is removed
+ * and the target file is not created or touched.
+ */
+typedef int (*export_progress_fn)(const export_progress *p, void *data);
+
+/* What export_table / export_database / export_tables return when the
+ * progress callback asked to stop. */
+#define EXPORT_CANCELLED (-2)
 
 /*
  * Export a table (or view) of the current database to path, streaming rows
@@ -22,19 +33,20 @@ typedef void (*export_progress_fn)(unsigned long long rows, void *data);
  * left out of the INSERTs. A view gets its CREATE VIEW only. A standalone
  * file always: opts->sql_in_dump is ignored.
  *
- * Returns 0, or -1 with *err set to a malloc'd message. *rows is set to the
- * number of rows written either way (may be NULL).
+ * With a progress callback, the table's row estimate is read from
+ * information_schema first (not for a view), and progress is called once
+ * before the first row (index 1, count 1).
+ *
+ * Returns 0, -1 with *err set to a malloc'd message, or EXPORT_CANCELLED
+ * with *err set to "Export cancelled". *rows is set to the number of rows
+ * written either way (may be NULL). The connection stays usable after a
+ * cancel: the rest of the table's result is read and dropped first, which
+ * can take a moment on a big table.
  */
 int export_table(MYSQL *conn, const char *table, int is_view, export_format fmt,
                  const export_opts *opts, const char *path,
                  export_progress_fn progress, void *data,
                  unsigned long long *rows, char **err);
-
-/* Progress of export_database, from the exporting thread: at the start of
- * each table or view (rows = 0) and every few thousand rows of a table.
- * index counts from 1 up to count (tables + views). */
-typedef void (*export_db_progress_fn)(const char *table, size_t index, size_t count,
-                                      unsigned long long rows, void *data);
 
 typedef struct {
     size_t tables;           /* tables written */
@@ -59,12 +71,16 @@ typedef struct {
  * database that is being written to. Blocks; run it on a worker thread.
  * Written to a temporary file and renamed over path only when complete.
  *
+ * Progress: index counts from 1 up to count (tables + views written), with
+ * each table's row estimate from information_schema (views: 0).
+ *
  * Returns 0, or -1 with *err set to a malloc'd message (no database
- * selected, a server error naming the table, or a write error). *stats
- * (may be NULL) is filled in either way.
+ * selected, a server error naming the table, or a write error), or
+ * EXPORT_CANCELLED as export_table. *stats (may be NULL) is filled in
+ * either way.
  */
 int export_database(MYSQL *conn, const export_opts *opts, const char *path,
-                    export_db_progress_fn progress, void *data,
+                    export_progress_fn progress, void *data,
                     export_db_stats *stats, char **err);
 
 /*
@@ -77,11 +93,12 @@ int export_database(MYSQL *conn, const export_opts *opts, const char *path,
  *
  * A name that is not in the database (dropped or renamed since the list was
  * loaded) fails the export before the file is created. Read-only on the
- * server, as export_database. Returns 0, or -1 with *err set (malloc'd).
+ * server, as export_database. Returns 0, -1 with *err set (malloc'd), or
+ * EXPORT_CANCELLED.
  */
 int export_tables(MYSQL *conn, const char *const *names, size_t n,
                   const export_opts *opts, const char *path,
-                  export_db_progress_fn progress, void *data,
+                  export_progress_fn progress, void *data,
                   export_db_stats *stats, char **err);
 
 #endif
