@@ -46,6 +46,7 @@
 
 #include "ai.h"
 #include "ai_db.h"
+#include "browse.h"
 #include "db.h"
 #include "macos_menu.h"
 #include "segmented.h"
@@ -168,6 +169,9 @@ typedef struct {
     int new_row;             /* the unsaved new row, or -1 */
     unsigned char *new_set;  /* ... its columns typed into */
     uiButton *add_btn, *del_btn, *reload_btn, *clear_btn;
+    /* the page bar under a browsed table's grid (all NULL for a query's rows) */
+    uiButton *prev_btn, *next_btn;
+    uiLabel *page_label;
 } grid_edit_state;
 
 /* One tab: a workspace with its own connection (welcome screen until it
@@ -218,6 +222,25 @@ typedef struct tab {
 
     uiMultilineEntry *editor;
     uiLabel *status;
+
+    /* The filter bar above the editor (Normal view), for the browsed table:
+     * column, operator, value, Apply, Reset. Enabled only while browsing. */
+    uiCombobox *filter_col, *filter_op;
+    uiEntry *filter_value;
+    uiButton *filter_apply, *filter_reset;
+    char **filter_cols;      /* the column dropdown's items (malloc'd copies) */
+    size_t nfilter_cols;
+    size_t filter_default;   /* its default item: the first key column, else 0 */
+    /* What the browse shows (see start_browse): the applied filter
+     * (applied_col NULL = none), the page's first row, and from the last
+     * browse read: a next page exists, the table has no primary key (pages
+     * aren't in a fixed order), the key columns it was ordered by. */
+    char *applied_col, *applied_value;
+    browse_op applied_op;
+    unsigned long long page_offset;
+    int page_has_next, page_keyless;
+    char **page_keys;
+    size_t npage_keys;
 
     /* next to the status line while an export runs */
     uiProgressBar *export_bar;
@@ -315,6 +338,24 @@ static void forget_login(tab *t) {
     t->conn_port = 0;
 }
 
+static void free_strings(char **v, size_t n) {
+    for (size_t i = 0; v && i < n; i++) free(v[i]);
+    free(v);
+}
+
+/* The browse's applied filter, page and key columns (memory only). */
+static void free_browse_state(tab *t) {
+    free(t->applied_col);
+    free(t->applied_value);
+    t->applied_col = t->applied_value = NULL;
+    t->applied_op = BROWSE_EQ;
+    t->page_offset = 0;
+    t->page_has_next = t->page_keyless = 0;
+    free_strings(t->page_keys, t->npage_keys);
+    t->page_keys = NULL;
+    t->npage_keys = 0;
+}
+
 /* Free a tab's memory and close its connection. Only once its widgets are
  * gone (closed, or the window destroyed: the models outlive their grids)
  * and nothing still points at it (jobs == 0). */
@@ -330,6 +371,8 @@ static void tab_free(tab *t) {
     free(t->side_index);
     free(t->menu_table);
     free(t->browsing);
+    free_browse_state(t);
+    free_strings(t->filter_cols, t->nfilter_cols);
     free(t->current_db);
     free(t->pending_browse);
     free(t->pending_title);
@@ -385,18 +428,65 @@ static void show_error(const char *title, const char *msg) {
 #endif
 }
 
+static void enable_if(uiControl *c, int on) {
+    if (on) uiControlEnable(c);
+    else uiControlDisable(c);
+}
+
+/* The filter bar above the editor and the page bar under a browsed
+ * table's grid: usable only while a table is browsed (not for the user's
+ * own query), connected and idle. */
+static void update_browse_bars(tab *t) {
+    int on = t->browsing && t->conn && !t->busy;
+    enable_if(uiControl(t->filter_col), on && t->nfilter_cols > 0);
+    enable_if(uiControl(t->filter_op), on);
+    enable_if(uiControl(t->filter_apply), on);
+    int op = uiComboboxSelected(t->filter_op);
+    enable_if(uiControl(t->filter_value), on && (op < 0 || browse_op_takes_value((browse_op)op)));
+    enable_if(uiControl(t->filter_reset), on && (t->applied_col || t->page_offset > 0));
+
+    grid_edit_state *e = &t->edit;
+    if (!e->page_label) return;
+    enable_if(uiControl(e->prev_btn), on && t->page_offset > 0);
+    enable_if(uiControl(e->next_btn), on && t->page_has_next);
+    /* the rows on screen: after deleting some, fewer than were read */
+    size_t n = e->set ? e->set->nrows - (e->new_row >= 0 ? 1 : 0) : 0;
+    char label[160];
+    browse_page_label(label, sizeof label, t->page_offset, n);
+    if (t->page_keyless && (t->page_offset > 0 || t->page_has_next)) {
+        size_t l = strlen(label);
+        snprintf(label + l, sizeof label - l, " (no primary key: order not guaranteed)");
+    }
+    uiLabelSetText(e->page_label, label);
+}
+
 /* Toolbar under a browsed table's grid. */
 static void update_edit_buttons(tab *t) {
     grid_edit_state *e = &t->edit;
-    if (!e->grid) return;
-    int can = !t->busy && !e->readonly;
-    uiButton *editing[] = { e->add_btn, e->del_btn, e->clear_btn };
-    for (int i = 0; i < 3; i++) {
-        if (can) uiControlEnable(uiControl(editing[i]));
-        else uiControlDisable(uiControl(editing[i]));
+    if (e->grid) {
+        int can = !t->busy && !e->readonly;
+        uiButton *editing[] = { e->add_btn, e->del_btn, e->clear_btn };
+        for (int i = 0; i < 3; i++) enable_if(uiControl(editing[i]), can);
+        enable_if(uiControl(e->reload_btn), !t->busy);
     }
-    if (t->busy) uiControlDisable(uiControl(e->reload_btn));
-    else uiControlEnable(uiControl(e->reload_btn));
+    update_browse_bars(t);
+}
+
+/* No table is browsed any more (the user's own SQL, Claude's, a drop, a
+ * new connection, Disconnect): forget it with its filter and page, and
+ * empty the filter bar (disabled until the next browse fills it). */
+static void browse_forget(tab *t) {
+    free(t->browsing);
+    t->browsing = NULL;
+    free_browse_state(t);
+    free_strings(t->filter_cols, t->nfilter_cols);
+    t->filter_cols = NULL;
+    t->nfilter_cols = 0;
+    t->filter_default = 0;
+    uiComboboxClear(t->filter_col);
+    uiComboboxSetSelected(t->filter_op, BROWSE_EQ);
+    uiEntrySetText(t->filter_value, "");
+    update_browse_bars(t);
 }
 
 static void set_connecting(tab *t, int on);
@@ -762,6 +852,18 @@ typedef struct job {
      * fetch that table's columns into meta (to edit them) */
     char *browse;
     db_outcome meta;
+    /* ... browsing (see run_browse): the filter (filter_col NULL = none) and
+     * the page's first row; the worker builds sql (the page plus one row, to
+     * see if there's a next) and editor_sql (what the editor shows) */
+    char *filter_col, *filter_value;
+    browse_op filter_op;
+    unsigned long long offset;
+    int fresh;                /* from the sidebar: the filter bar starts over */
+    int keep_editor;          /* reconnected: the editor keeps the user's text */
+    char *editor_sql;
+    const char **keys;        /* the primary key's columns, pointers into meta */
+    size_t nkeys;
+    int has_next;             /* more rows after this page */
     /* JOB_ROWS */
     row_op op;
     db_set *edit_set;         /* the grid's rows when it started */
@@ -798,6 +900,10 @@ static void job_free(job *j) {
     if (j->api_key) { memset(j->api_key, 0, strlen(j->api_key)); free(j->api_key); }
     ai_result_free(&j->ai);
     free(j->browse);
+    free(j->filter_col);
+    free(j->filter_value);
+    free(j->editor_sql);
+    free(j->keys);            /* the names are in meta */
     db_outcome_free(&j->meta);
     free(j->value);
     free(j->typed);
@@ -909,6 +1015,47 @@ static const db_set *editable_query_set(const job *j) {
     if (j->kind != JOB_QUERY || j->browse || j->out.error || j->out.nsets != 1) return NULL;
     const db_set *s = &j->out.sets[0];
     return s->has_rows && s->org_table && s->org_db ? s : NULL;
+}
+
+static unsigned long escape_value(char *to, const char *from, unsigned long len, void *data);
+static row_edit_escaper escaper(tab *t);
+
+/* A browse (JOB_QUERY with j->browse) on the worker thread. The table's
+ * columns come first: the page is ordered by its primary key, so every
+ * page's SQL is known only then. The value is escaped on this connection
+ * (it knows the server's charset and sql_mode); the editor gets the same
+ * SELECT with the page's LIMIT 1000, the server is asked for 1001 rows and
+ * the set keeps 1000 (truncated = there is a next page). */
+static void run_browse(job *j) {
+    fetch_table_meta(j, j->browse, NULL);
+    if (j->meta.error) { /* e.g. the connection is gone */
+        j->out.error = strdup(j->meta.error);
+        return;
+    }
+    /* No columns (the table is gone, or out of memory): no key, and the
+     * SELECT below brings the server's own error. */
+    const db_set *cols = j->meta.nsets ? &j->meta.sets[0] : NULL;
+    if (cols && browse_key_columns(cols, &j->keys, &j->nkeys) != 0) {
+        j->out.error = strdup("Out of memory");
+        return;
+    }
+    browse_filter f = { j->filter_col, j->filter_op, j->filter_value };
+    row_edit_escaper esc = { escape_value, j->conn };
+    char err[256] = "Out of memory";
+    const char *const *order = (const char *const *)j->keys;
+    j->sql = browse_select_sql(j->browse, &f, order, j->nkeys, j->offset,
+                               BROWSE_PAGE_ROWS + 1, &esc, err, sizeof err);
+    if (j->sql)
+        j->editor_sql = browse_select_sql(j->browse, &f, order, j->nkeys, j->offset,
+                                          BROWSE_PAGE_ROWS, &esc, err, sizeof err);
+    if (!j->sql || !j->editor_sql) {
+        j->out.error = strdup(err);
+        return;
+    }
+    j->eo.max_rows = BROWSE_PAGE_ROWS;
+    j->ok = db_execute(j->conn, j->sql, &j->eo, &j->out) == 0;
+    j->has_next = j->ok && j->out.nsets == 1 && j->out.sets[0].has_rows &&
+                  j->out.sets[0].truncated;
 }
 
 /* JOB_STRUCTURE on the worker thread: three result sets in j->out -
@@ -1056,11 +1203,11 @@ static void *worker(void *data) {
     } else if (j->kind == JOB_CONNECT) {
         j->conn = db_connect(j->host, j->user, j->pass, j->dbname, j->port, &j->error);
         j->ok = j->conn != NULL;
+    } else if (j->kind == JOB_QUERY && j->browse) {
+        run_browse(j);
     } else if (j->kind == JOB_QUERY || j->kind == JOB_ALTER) {
         j->ok = db_execute(j->conn, j->sql, &j->eo, &j->out) == 0;
-        if (j->ok && j->browse) {
-            fetch_table_meta(j, j->browse, NULL);
-        } else if (j->ok) {
+        if (j->ok) {
             const db_set *s = editable_query_set(j);
             if (s) fetch_table_meta(j, s->org_table, s->org_db);
         }
@@ -1170,6 +1317,10 @@ static void start_job(tab *t, job *j) {
 static void reload_browse(tab *t);
 static void reload_rows(tab *t);
 static int browse_table(tab *t, const char *name);
+enum { BROWSE_FRESH = 1, BROWSE_KEEP_EDITOR = 2 }; /* start_browse flags */
+static int start_browse(tab *t, const char *name, const char *col, browse_op op,
+                        const char *value, unsigned long long offset, int flags);
+static void browse_page(tab *t, unsigned long long offset);
 static void rows_done(tab *t, job *j);
 
 static void show_message_page(tab *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -1181,17 +1332,6 @@ static void show_message_page(tab *t, const char *fmt, ...) {
     va_end(ap);
     clear_results(t);
     show_results_control(t, message_page(buf));
-}
-
-/* "SELECT * FROM `name` LIMIT 1000;" (malloc'd) */
-static char *browse_sql(const char *name) {
-    char *q = db_quote_ident(name);
-    if (!q) return NULL;
-    size_t n = strlen(q) + 40;
-    char *sql = malloc(n);
-    if (sql) snprintf(sql, n, "SELECT * FROM %s LIMIT 1000;", q);
-    free(q);
-    return sql;
 }
 
 /* ---------- Structure page ---------- */
@@ -1406,25 +1546,102 @@ static void alter_done(tab *t, job *j) {
             if (renamed) { free(t->edit.table); t->edit.table = renamed; }
         }
         if (shown) { /* same rows, new name: just follow it */
-            free(t->browsing);
-            t->browsing = strdup(j->new_name);
-            char *sql = browse_sql(j->new_name);
-            if (sql) uiMultilineEntrySetText(t->editor, sql);
+            char *renamed = strdup(j->new_name);
+            if (renamed) { free(t->browsing); t->browsing = renamed; }
+            /* the editor's SELECT with the new name (the value is escaped
+             * on the connection: none if it was lost, then it stays) */
+            browse_filter f = { t->applied_col, t->applied_op, t->applied_value };
+            row_edit_escaper esc = escaper(t);
+            char err[256];
+            char *sql = t->conn
+                ? browse_select_sql(t->browsing, &f, (const char *const *)t->page_keys,
+                                    t->npage_keys, t->page_offset, BROWSE_PAGE_ROWS,
+                                    &esc, err, sizeof err)
+                : NULL;
+            if (sql) {
+                uiMultilineEntrySetText(t->editor, sql);
+                t->ai_in_editor = 0;
+            }
             free(sql);
         }
         break;
     case ALTER_TRUNCATE:
         set_status(t, "Truncated table %s", j->table);
-        if (shown) reload_browse(t); /* an empty grid, still editable */
+        if (shown) browse_page(t, 0); /* an empty grid, still editable */
         break;
     case ALTER_DROP:
         set_status(t, "Dropped %s %s", what, j->table);
         if (shown) {
             show_message_page(t, "The %s %s was dropped.", what, j->table);
-            free(t->browsing);
-            t->browsing = NULL;
+            browse_forget(t);
         }
         break;
+    }
+}
+
+/* Point the filter bar's column dropdown at name (its default if name is
+ * NULL or not a column). */
+static void select_filter_column(tab *t, const char *name) {
+    size_t sel = t->filter_default;
+    for (size_t i = 0; name && i < t->nfilter_cols; i++)
+        if (strcmp(t->filter_cols[i], name) == 0) { sel = i; break; }
+    if (sel < t->nfilter_cols) uiComboboxSetSelected(t->filter_col, (int)sel);
+}
+
+/* The filter bar's column dropdown from the browsed table's columns (meta's
+ * first set), refilled only when they changed (another table, or ALTER). */
+static void fill_filter_columns(tab *t, const db_set *cols) {
+    size_t n = cols->nrows;
+    int same = n == t->nfilter_cols;
+    for (size_t i = 0; same && i < n; i++) {
+        const char *name = db_cell(cols, i, 0);
+        same = name && strcmp(name, t->filter_cols[i]) == 0;
+    }
+    t->filter_default = browse_default_column(cols);
+    if (same) return;
+    free_strings(t->filter_cols, t->nfilter_cols);
+    t->filter_cols = NULL;
+    t->nfilter_cols = 0;
+    uiComboboxClear(t->filter_col);
+    char **names = calloc(n ? n : 1, sizeof *names);
+    if (!names) return;
+    for (size_t i = 0; i < n; i++) {
+        const char *name = db_cell(cols, i, 0);
+        names[i] = strdup(name ? name : "");
+        if (!names[i]) { free_strings(names, i); uiComboboxClear(t->filter_col); return; }
+        uiComboboxAppend(t->filter_col, names[i]);
+    }
+    t->filter_cols = names;
+    t->nfilter_cols = n;
+    select_filter_column(t, t->applied_col);
+}
+
+/* A browse of t->browsing came back (before its rows are shown): the
+ * editor's SELECT, the filter bar's columns, and what the page bar needs. */
+static void browse_done(tab *t, job *j) {
+    if (j->editor_sql && !j->keep_editor) {
+        uiMultilineEntrySetText(t->editor, j->editor_sql);
+        t->ai_in_editor = 0;
+    }
+    const db_set *cols = j->meta.nsets && !j->meta.error ? &j->meta.sets[0] : NULL;
+    if (cols && cols->ncols >= 4) fill_filter_columns(t, cols);
+    if (j->fresh) { /* from the sidebar: the bar starts over too */
+        select_filter_column(t, NULL);
+        uiComboboxSetSelected(t->filter_op, BROWSE_EQ);
+        uiEntrySetText(t->filter_value, "");
+    }
+    t->page_has_next = j->has_next;
+    t->page_keyless = j->ok && j->nkeys == 0;
+    if (j->ok) { /* the ORDER BY columns, to write the SELECT again after a rename */
+        free_strings(t->page_keys, t->npage_keys);
+        t->page_keys = NULL;
+        t->npage_keys = 0;
+        char **keys = j->nkeys ? calloc(j->nkeys, sizeof *keys) : NULL;
+        size_t n = 0;
+        while (keys && n < j->nkeys && (keys[n] = strdup(j->keys[n]))) n++;
+        if (keys && n < j->nkeys) { free_strings(keys, n); keys = NULL; n = 0; }
+        t->page_keys = keys;
+        t->npage_keys = n;
     }
 }
 
@@ -1556,6 +1773,7 @@ static void connection_lost(tab *t, const char *err) {
     uiControlShow(uiControl(t->reconnect_btn));
     set_status(t, "Lost the connection to the server%s%s - press Reconnect.",
                err ? ": " : "", err ? err : "");
+    update_browse_bars(t); /* nothing can be browsed until Reconnect */
 }
 
 /* Why nothing runs while not connected. */
@@ -1655,8 +1873,7 @@ static void job_done(void *data) {
             /* The old connection's list is stale whether or not we reload it. */
             db_outcome_free(&t->tables_raw);
             t->tables_loaded = 0;
-            free(t->browsing);
-            t->browsing = NULL;
+            browse_forget(t);
             structure_message(t, "");
         }
         show_screen(t); /* off the welcome screen */
@@ -1676,8 +1893,7 @@ static void job_done(void *data) {
             if (text) {
                 uiMultilineEntrySetText(t->editor, text);
                 t->ai_in_editor = 1;
-                free(t->browsing);
-                t->browsing = NULL;
+                browse_forget(t);
                 show_mode(t, MODE_NORMAL); /* the SQL is in the editor: show it */
             }
             free(text);
@@ -1705,9 +1921,18 @@ static void job_done(void *data) {
             if (s->has_rows) { rows += s->nrows; row_sets++; truncated |= s->truncated; }
             else affected += s->affected;
         }
-        if (j->out.error)
+        int browsed = j->browse && t->browsing && strcmp(j->browse, t->browsing) == 0;
+        if (browsed) browse_done(t, j);
+        if (j->out.error) {
             set_status(t, "%s", j->out.error);
-        else if (row_sets)
+        } else if (browsed && row_sets) { /* the page, not the 10000-row cap */
+            char page[64];
+            browse_page_label(page, sizeof page, j->offset, rows);
+            page[0] = (char)tolower((unsigned char)page[0]); /* "rows 1,001–2,000" */
+            set_status(t, "%zu row%s in %.3f s - %s%s%s", rows, rows == 1 ? "" : "s", j->seconds,
+                       page, j->current_db ? " - database: " : "",
+                       j->current_db ? j->current_db : "");
+        } else if (row_sets)
             set_status(t, "%zu row%s in %.3f s%s%s%s", rows, rows == 1 ? "" : "s", j->seconds,
                        truncated ? " (grid shows the first 10000 rows per result)" : "",
                        j->current_db ? " - database: " : "",
@@ -1715,7 +1940,6 @@ static void job_done(void *data) {
         else
             set_status(t, "Query OK, %llu row%s affected in %.3f s", affected,
                        affected == 1 ? "" : "s", j->seconds);
-        int browsed = j->browse && t->browsing && strcmp(j->browse, t->browsing) == 0;
         /* A query's rows from one table of the current database (the edits
          * name the table without its database) can be edited too. */
         const db_set *qs = browsed || j->lost ? NULL : editable_query_set(j);
@@ -1764,18 +1988,14 @@ static void job_done(void *data) {
         browse_table(t, name);
         free(name);
     } else if (rebrowse) {
-        /* Read the browsed table again, but leave the editor's text (and
-         * the mode) as they were: they may hold the user's own query. */
-        char *text = uiMultilineEntryText(t->editor);
-        int ai_text = t->ai_in_editor, mode = t->mode;
-        if (browse_table(t, t->browsing) && text) {
-            uiMultilineEntrySetText(t->editor, text);
-            t->ai_in_editor = ai_text;
-            show_mode(t, mode);
-        }
-        uiFreeText(text);
+        /* Read the browsed table again (its page, with its filter), but
+         * leave the editor's text and the mode as they were: they may hold
+         * the user's own query. */
+        start_browse(t, t->browsing, t->applied_col, t->applied_op, t->applied_value,
+                     t->page_offset, BROWSE_KEEP_EDITOR);
     }
     structure_sync(t);
+    update_browse_bars(t); /* browsing may have started or ended above */
 #ifdef SQLC_AUTOTEST
     autotest_next();
 #endif
@@ -1893,29 +2113,119 @@ static int run_query(tab *t, const char *sql, const char *browse) {
 
 static int run_sql(tab *t, const char *sql) { return run_query(t, sql, NULL); }
 
-/* SELECT * FROM a table, into an editable grid. Returns 1 if started. */
-static int browse_table(tab *t, const char *name) {
-    char *copy = strdup(name); /* name may be t->browsing */
-    char *sql = copy ? browse_sql(copy) : NULL;
-    int started = 0;
-    if (sql) {
-        uiMultilineEntrySetText(t->editor, sql);
-        t->ai_in_editor = 0;
-        show_mode(t, MODE_NORMAL); /* the editor's text was replaced: show what runs */
-        started = run_query(t, sql, copy);
-        if (started) {
-            free(t->browsing);
-            t->browsing = copy;
-            copy = NULL;
-        }
+/*
+ * Browse table `name` into an editable grid: one page of BROWSE_PAGE_ROWS
+ * rows from row offset, filtered by col / op / value (col NULL, or an
+ * inactive filter, see browse_filter_active: none). The SQL is built on the
+ * worker (run_browse) and written into the editor when the rows are back,
+ * unless BROWSE_KEEP_EDITOR; BROWSE_FRESH also resets the filter bar.
+ * The arguments may point at t's own browse state. Returns 1 if started.
+ */
+static int start_browse(tab *t, const char *name, const char *col, browse_op op,
+                        const char *value, unsigned long long offset, int flags) {
+    if (t->busy) return 0;
+    if (!t->conn) { set_status(t, "%s", not_connected_msg(t)); return 0; }
+    browse_filter f = { col, op, value };
+    int filtered = browse_filter_active(&f);
+    int takes_value = filtered && browse_op_takes_value(op);
+    job *j = calloc(1, sizeof *j);
+    char *table = strdup(name);
+    if (j) {
+        j->browse = strdup(name);
+        j->filter_col = filtered ? strdup(col) : NULL;
+        j->filter_value = takes_value ? strdup(value) : NULL;
     }
-    free(sql);
-    free(copy);
-    return started;
+    char *applied_col = filtered ? strdup(col) : NULL;
+    char *applied_value = takes_value ? strdup(value) : NULL;
+    if (!j || !table || !j->browse || (filtered && (!j->filter_col || !applied_col)) ||
+        (takes_value && (!j->filter_value || !applied_value))) {
+        if (j) job_free(j);
+        free(table);
+        free(applied_col);
+        free(applied_value);
+        set_status(t, "Out of memory");
+        return 0;
+    }
+    j->kind = JOB_QUERY;
+    j->conn = t->conn;
+    j->filter_op = filtered ? op : BROWSE_EQ;
+    j->offset = offset;
+    j->fresh = (flags & BROWSE_FRESH) != 0;
+    j->keep_editor = (flags & BROWSE_KEEP_EDITOR) != 0;
+    j->eo.hide_views = uiCheckboxChecked(t->hide_views);
+    j->load_tables = load_after_queries(t);
+    j->hide_views = j->eo.hide_views;
+
+    /* only now: the arguments may be these */
+    free(t->browsing);
+    t->browsing = table;
+    free(t->applied_col);
+    free(t->applied_value);
+    t->applied_col = applied_col;
+    t->applied_value = applied_value;
+    t->applied_op = j->filter_op;
+    t->page_offset = offset;
+
+    set_status(t, "Running...");
+    /* the editor's text is replaced: show it (not when it is kept) */
+    if (!j->keep_editor) show_mode(t, MODE_NORMAL);
+    start_job(t, j);
+    return 1;
 }
 
+/* SELECT * FROM a table, into an editable grid: its first page, no
+ * filter. Returns 1 if started. */
+static int browse_table(tab *t, const char *name) {
+    return start_browse(t, name, NULL, BROWSE_EQ, NULL, 0, BROWSE_FRESH);
+}
+
+/* The browsed table's page from row offset, with the applied filter. */
+static void browse_page(tab *t, unsigned long long offset) {
+    if (t->browsing)
+        start_browse(t, t->browsing, t->applied_col, t->applied_op, t->applied_value, offset, 0);
+}
+
+/* The browsed table's current page again (Reload). */
 static void reload_browse(tab *t) {
-    if (t->browsing) browse_table(t, t->browsing);
+    browse_page(t, t->page_offset);
+}
+
+/* ---- the filter bar ---- */
+
+/* Apply (or Return in the value): the bar's filter, from the first page.
+ * An empty value with a value operator shows every row. */
+static void apply_filter(tab *t) {
+    if (t->busy || !t->browsing) return;
+    int ci = uiComboboxSelected(t->filter_col);
+    int op = uiComboboxSelected(t->filter_op);
+    const char *col = ci >= 0 && (size_t)ci < t->nfilter_cols ? t->filter_cols[ci] : NULL;
+    if (op < 0 || op >= BROWSE_NOPS) op = BROWSE_EQ;
+    char *value = uiEntryText(t->filter_value);
+    start_browse(t, t->browsing, col, (browse_op)op, value ? value : "", 0, 0);
+    uiFreeText(value);
+}
+
+static void on_filter_apply(uiButton *b, void *data) {
+    (void)b;
+    apply_filter(data);
+}
+
+static void on_filter_return(void *data) { apply_filter(data); }
+
+/* Reset: no filter, the default column, =, the first page. */
+static void on_filter_reset(uiButton *b, void *data) {
+    (void)b; tab *t = data;
+    if (t->busy || !t->browsing) return;
+    select_filter_column(t, NULL);
+    uiComboboxSetSelected(t->filter_op, BROWSE_EQ);
+    uiEntrySetText(t->filter_value, "");
+    start_browse(t, t->browsing, NULL, BROWSE_EQ, NULL, 0, 0);
+}
+
+/* IS NULL / IS NOT NULL take no value: its field is disabled. */
+static void on_filter_op(uiCombobox *c, void *data) {
+    (void)c;
+    update_browse_bars(data);
 }
 
 /* Read the editable grid's rows again: its query, or the browsed table. */
@@ -1958,8 +2268,7 @@ static void on_run_menu(tab *t) {
     char *sql = uiMultilineEntryText(t->editor);
     if (t->busy || !t->conn || confirm_ai_sql(t, sql ? sql : "")) {
         if (run_sql(t, sql ? sql : "")) { /* the user's own SQL: no longer browsing a table */
-            free(t->browsing);
-            t->browsing = NULL;
+            browse_forget(t);
             t->ai_in_editor = 0;
         }
     }
@@ -2927,7 +3236,23 @@ static uiButton *toolbar_button(tab *t, uiBox *bar, const char *text, void (*f)(
     return b;
 }
 
-/* The grid of a browsed table, with + / - / Reload / Delete All Rows below.
+/* < and > under a browsed table's grid: the page before / after, with the
+ * same filter. */
+static void on_prev_page(uiButton *b, void *data) {
+    (void)b; tab *t = data;
+    if (t->busy || !t->browsing || t->page_offset == 0) return;
+    browse_page(t, t->page_offset > BROWSE_PAGE_ROWS ? t->page_offset - BROWSE_PAGE_ROWS : 0);
+}
+
+static void on_next_page(uiButton *b, void *data) {
+    (void)b; tab *t = data;
+    if (t->busy || !t->browsing || !t->page_has_next) return;
+    if (t->page_offset > ULLONG_MAX - BROWSE_PAGE_ROWS) return;
+    browse_page(t, t->page_offset + BROWSE_PAGE_ROWS);
+}
+
+/* The grid of a browsed table, with + / - / Reload / Delete All Rows below,
+ * and for a browse (query NULL) the page bar < label > under that.
  * meta: its columns (sets[0]) and TABLE_TYPE (sets[1]). */
 static uiControl *editable_page(tab *t, set_model *sm, const db_outcome *meta,
                                const char *table, const char *query) {
@@ -2990,6 +3315,15 @@ static uiControl *editable_page(tab *t, set_model *sm, const db_outcome *meta,
     }
     uiBoxAppend(bar, uiControl(uiNewLabel(hint)), 0);
     uiBoxAppend(page, uiControl(bar), 0);
+    if (!e->query) { /* a browsed table: its pages (labelled by update_browse_bars) */
+        uiBox *pages = uiNewHorizontalBox();
+        uiBoxSetPadded(pages, 1);
+        e->prev_btn = toolbar_button(t, pages, "<", on_prev_page);
+        e->page_label = uiNewLabel("");
+        uiBoxAppend(pages, uiControl(e->page_label), 0);
+        e->next_btn = toolbar_button(t, pages, ">", on_next_page);
+        uiBoxAppend(page, uiControl(pages), 0);
+    }
     update_edit_buttons(t);
     return uiControl(page);
 }
@@ -3273,8 +3607,7 @@ static void on_disconnect(uiButton *b, void *data) {
     t->tables_loaded = 0;
     uiButtonSetText(t->load_tables_btn, "Load tables");
     rebuild_sidebar_keeping(t, NULL, 0);
-    free(t->browsing);
-    t->browsing = NULL;
+    browse_forget(t);
     free(t->pending_browse);
     t->pending_browse = NULL;
     free(t->current_db);
@@ -3380,6 +3713,33 @@ static void autotest_structure(const char *what) {
 static void autotest_resume(void *data) {
     (void)data;
     autotest_next();
+}
+
+/* The filter bar, the page bar and the editor's first line. */
+static void autotest_browse(const char *what) {
+    tab *t = cur_tab(); /* the autotest drives the front (first) tab */
+    char *sql = uiMultilineEntryText(t->editor);
+    char *label = t->edit.page_label ? uiLabelText(t->edit.page_label) : NULL;
+    int ci = uiComboboxSelected(t->filter_col);
+    printf("[browse] %s: browsing %s, editor [%.*s]\n", what, t->browsing ? t->browsing : "-",
+           sql ? (int)strcspn(sql, "\n") : 0, sql ? sql : "");
+    printf("[browse] %s: filter bar %s, column %s, value field %s, reset %s; page bar %s%s%s, "
+           "< %s, > %s\n", what,
+           uiControlEnabled(uiControl(t->filter_apply)) ? "on" : "off",
+           ci >= 0 && (size_t)ci < t->nfilter_cols ? t->filter_cols[ci] : "-",
+           uiControlEnabled(uiControl(t->filter_value)) ? "on" : "off",
+           uiControlEnabled(uiControl(t->filter_reset)) ? "on" : "off",
+           label ? "[" : "none", label ? label : "", label ? "]" : "",
+           t->edit.prev_btn && uiControlEnabled(uiControl(t->edit.prev_btn)) ? "on" : "off",
+           t->edit.next_btn && uiControlEnabled(uiControl(t->edit.next_btn)) ? "on" : "off");
+    uiFreeText(label);
+    uiFreeText(sql);
+    autotest_status(what);
+}
+
+/* A step that may not have started a job: go on anyway. */
+static void autotest_continue_if_idle(void) {
+    if (!cur_tab()->busy) uiQueueMain(autotest_resume, NULL);
 }
 
 static void autotest_next(void) {
@@ -3863,6 +4223,45 @@ static void autotest_next(void) {
         on_run_menu(t);
         printf("[structure] cmd-return on Structure: busy %d, results page shown %d\n",
                t->busy, uiControlVisible(t->query_split));
+        show_mode(t, MODE_NORMAL);
+        /* filter bar and pages on the browsed customers table */
+        autotest_browse("browse customers");
+        uiComboboxSetSelected(t->filter_op, BROWSE_IS_NOT_NULL);
+        on_filter_op(t->filter_op, t);
+        printf("[browse] IS NOT NULL picked: value field %s\n",
+               uiControlEnabled(uiControl(t->filter_value)) ? "on" : "off");
+        apply_filter(t);
+        autotest_continue_if_idle();
+        break;
+    case 46:
+        autotest_browse("IS NOT NULL");
+        /* a quote in a LIKE value: escaped in the editor's SELECT */
+        uiComboboxSetSelected(t->filter_op, BROWSE_LIKE);
+        on_filter_op(t->filter_op, t);
+        uiEntrySetText(t->filter_value, "O'%");
+        apply_filter(t);
+        autotest_continue_if_idle();
+        break;
+    case 47:
+        autotest_browse("LIKE quote");
+        on_filter_reset(t->filter_reset, t);
+        autotest_continue_if_idle();
+        break;
+    case 48:
+        autotest_browse("reset");
+        on_next_page(t->edit.next_btn, t); /* only with more than 1000 customers */
+        printf("[browse] next page started: %s\n", t->busy ? "yes" : "no");
+        autotest_continue_if_idle();
+        break;
+    case 49:
+        autotest_browse("after next");
+        /* the user's own query: no filter bar, no page bar */
+        uiMultilineEntrySetText(t->editor, "SELECT * FROM customers LIMIT 2");
+        on_run_menu(t);
+        autotest_continue_if_idle();
+        break;
+    case 50:
+        autotest_browse("own query");
         /* Disconnect: back to the welcome screen, nothing of the server left */
         on_disconnect(t->disconnect_btn, t);
         printf("[welcome] after disconnect: connected %d, welcome shown %d, layout shown %d, "
@@ -4201,7 +4600,7 @@ static void build_tab_page(tab *t) {
     uiBoxAppend(main_box, uiControl(switch_row), 0);
 
     t->split = sqlc_new_sidebar_split(uiControl(t->side_box), uiControl(main_box),
-                                       220, 120, "SidebarWidth");
+                                       360, 120, NULL); /* always opens at 360 */
     uiBoxAppend(workspace, t->split, 1);
     t->workspace = uiControl(workspace);
     uiBoxAppend(root, t->workspace, 1); /* shown until main() has laid it out */
@@ -4212,9 +4611,32 @@ static void build_tab_page(tab *t) {
     uiBox *editor_pane = uiNewVerticalBox();
     uiBoxSetPadded(editor_pane, 1);
 
-    /* Normal view: the SQL editor and the run row */
+    /* Normal view: the filter bar, the SQL editor and the run row */
     uiBox *normal = uiNewVerticalBox();
     uiBoxSetPadded(normal, 1);
+
+    /* filter bar for the browsed table (update_browse_bars enables it) */
+    uiBox *filter = uiNewHorizontalBox();
+    uiBoxSetPadded(filter, 1);
+    uiBoxAppend(filter, uiControl(uiNewLabel("Filter")), 0);
+    t->filter_col = uiNewCombobox(); /* filled by a browse, see fill_filter_columns */
+    uiBoxAppend(filter, uiControl(t->filter_col), 0);
+    t->filter_op = uiNewCombobox();
+    for (int op = 0; op < BROWSE_NOPS; op++) uiComboboxAppend(t->filter_op, browse_op_label((browse_op)op));
+    uiComboboxSetSelected(t->filter_op, BROWSE_EQ);
+    uiComboboxOnSelected(t->filter_op, on_filter_op, t);
+    uiBoxAppend(filter, uiControl(t->filter_op), 0);
+    t->filter_value = uiNewEntry();
+    sqlc_entry_on_return(t->filter_value, on_filter_return, t);
+    uiBoxAppend(filter, uiControl(t->filter_value), 1); /* only the value stretches */
+    t->filter_apply = uiNewButton("Apply");
+    uiButtonOnClicked(t->filter_apply, on_filter_apply, t);
+    uiBoxAppend(filter, uiControl(t->filter_apply), 0);
+    t->filter_reset = uiNewButton("Reset");
+    uiButtonOnClicked(t->filter_reset, on_filter_reset, t);
+    uiBoxAppend(filter, uiControl(t->filter_reset), 0);
+    uiBoxAppend(normal, uiControl(filter), 0);
+
     t->editor = uiNewNonWrappingMultilineEntry();
     uiMultilineEntrySetText(t->editor, "SHOW TABLES;");
     uiBoxAppend(normal, uiControl(t->editor), 1);
@@ -4308,6 +4730,7 @@ static void build_tab_page(tab *t) {
     uiBoxAppend(root, uiControl(status_row), 0);
 
     t->edit.new_row = -1;
+    update_browse_bars(t); /* disabled: nothing is browsed yet */
     rebuild_sidebar(t);
 }
 

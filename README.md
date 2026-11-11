@@ -40,10 +40,12 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
   sidebar, with its engine, row estimate and collation; switching keeps the
   query, its results and the selection
 - Sidebar listing the tables in the current database, with a **Load tables** /
-  **Refresh tables** button; drag its right edge to resize it (the width is remembered).
+  **Refresh tables** button; drag its right edge to resize it (every launch and new tab starts it at 360 points).
   Shift-click selects a range of tables, ⌘-click adds or removes one (on a Mac,
   Ctrl-click is a right-click)
-- Double-click a table to browse it (`SELECT * ... LIMIT 1000`), then **edit its
+- Double-click a table to browse it, 1000 rows a page (`SELECT * ... ORDER BY <key>
+  LIMIT 1000`) with **<** / **>** to page through it and a **filter bar** above the
+  editor (column, operator, value, **Apply**, **Reset**), then **edit its
   rows in place**: double-click a cell to change it (with a calendar for dates),
   **+** adds a row, **−** deletes the selected rows, **Reload**, **Delete All Rows…**;
   your own `SELECT`'s rows from one table can be edited the same way
@@ -137,7 +139,8 @@ on screen is cleared: the editor's text, the results, the table list and the
 mode stay, and running SQL just repeats the hint until you reconnect.
 **Reconnect** opens a new connection with the same login, to the database
 that was in use (also after `USE`), keeps the sidebar selection and, if a
-table was being browsed, reads it again, leaving the editor's text as it was.
+table was being browsed, reads it again (the same page, with its filter),
+leaving the editor's text as it was.
 The query that hit the lost connection isn't run again, press **Run** for
 that. Session state (variables, temporary tables, an open transaction) is
 gone with the old connection. If reconnecting fails, an error is shown and
@@ -157,7 +160,8 @@ editor's height is saved and restored on the next launch, clamped so that
 both panes still fit; when the window is resized, the editor keeps its height
 and the results take the difference.
 
-**Normal** shows the SQL editor with the **Run** button in the query pane, and
+**Normal** shows the SQL editor with the **Run** button in the query pane
+(and the [filter bar](#browsing-a-table) above the editor), and
 **AI** shows [Ask Claude](#ask-claude-ai-query-assistant) in its place; the
 results pane below doesn't change when you switch between the two.
 Double-clicking a table in the sidebar switches to **Normal**, since it
@@ -278,6 +282,45 @@ request fails, the switch stays on **AI**.
 - Errors (no or invalid key, network, rate limits, overload) are shown in a
   dialog and the status bar.
 
+### Browsing a table
+
+Double-clicking a table in the sidebar browses it: its first 1000 rows,
+ordered by its primary key (every key column, for a composite key), into an
+editable grid (see [Editing rows](#editing-rows)). The `SELECT` is written
+into the editor, e.g. ``SELECT * FROM `orders` ORDER BY `id` LIMIT 1000;``
+(the server is asked for 1001 rows, to know whether there is a next page).
+
+Under the grid, a page bar shows **<**, the rows on screen (`Rows 1–1,000`,
+`Rows 1,001–2,000`, `No rows`) and **>**. **<** is disabled on the first page
+and **>** when no rows come after this page; each page adds `OFFSET 1000`,
+`OFFSET 2000`, ... to the editor's `SELECT`. There is no total row count
+(no `COUNT(*)` on a large table). A table without a primary key isn't
+ordered, so the server may return the rows in a different order on each
+page; the label says so: `Rows 1,001–2,000 (no primary key: order not guaranteed)`.
+
+The **filter bar** above the editor (Normal view) filters the browsed table
+by one column: a column dropdown, an operator (`=`, `!=`, `<`, `>`, `<=`,
+`>=`, `LIKE`, `NOT LIKE`, `IS NULL`, `IS NOT NULL`), a value, **Apply** and
+**Reset**. The column starts on the first primary key column (else the
+table's first column) and is refilled when another table is browsed.
+**Apply**, or Return in the value field, shows the first page of the
+matching rows, e.g. ``SELECT * FROM `orders` WHERE `status` = 'paid' ORDER BY `id`
+LIMIT 1000;``, and **<** / **>** then page through those. The value is
+escaped for the server and the column name quoted, so any text is safe to
+type. `LIKE` and `NOT LIKE` search for the value anywhere in the column
+when it has no wildcard (`john` runs `LIKE '%john%'`); a value with `%` or
+`_` is used as typed (`john%` = starts with john). The value field is disabled for
+`IS NULL` and `IS NOT NULL`, and an empty value means no filter (so `= ''`
+can't be asked for here; type that query in the editor). **Reset** clears
+the value, puts the column back to its default and the operator to `=`, and
+shows the first page with no filter; it is disabled while no filter is
+applied and the first page is shown.
+
+Both bars only work for a browsed table: running your own SQL (or Claude's)
+disables the filter bar and shows no page bar, since that SQL may have its
+own `LIMIT`. Both are disabled while a query runs, and the filter bar while
+nothing is browsed.
+
 ### Editing rows
 
 Double-click a table in the sidebar to browse it; its grid can then be edited,
@@ -319,8 +362,12 @@ columns.
   The row is then read back, so auto-increment ids and defaults show up.
 - **−** deletes the selected rows (⌘-click or ⇧-click selects several) after
   asking; they're deleted in one transaction.
-- **Reload** reads the table again; **Delete All Rows…** truncates it (asks
-  first).
+- **Reload** reads the table again: for a browse, the same page with the same
+  filter (after deleting rows a page may come back with fewer rows, or none:
+  `No rows`, with **<** still there). **Delete All Rows…** truncates it (asks
+  first) and shows the first page.
+- Editing works the same on any page and with a filter applied: rows are
+  saved by their key, whatever page they are on.
 - If the server refuses a change (wrong type, constraint, duplicate key), the
   error is shown and the editor reopens with what you typed, so you can fix it.
 - Rows are found by their primary key. Without one, they're matched on all
@@ -484,7 +531,7 @@ with the same structure / `DROP … IF EXISTS` / data options:
 | `src/db.c`, `src/db.h` | Shared core: run SQL, collect results, views filter |
 | `src/main.c`, `src/complete.c` | CLI and its tab completion |
 | `src/gui.c` | GUI (libui-ng) |
-| `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), File › New Tab (⌘T) and Close Tab (⌘W), which libui-ng lacks; small control sizes and widths; the end-of-export sound, Dock bounce and alert |
+| `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), File › New Tab (⌘T) and Close Tab (⌘W), which libui-ng lacks; small control sizes and widths; Return in a text field (the filter bar's value); the end-of-export sound, Dock bounce and alert |
 | `src/splitview.m` | Resizable panes (sidebar, editor / results, columns / indexes): an `NSSplitView` wrapped as a libui control |
 | `src/loading.m` | The loading spinner with a tip under it (connecting, refreshing tables): an `NSProgressIndicator` and a wrapping label wrapped as a libui control |
 | `src/sql_tips.c` | The 50 SQL tips shown while connecting or loading tables, and the no-repeat random pick |
@@ -496,10 +543,12 @@ with the same structure / `DROP … IF EXISTS` / data options:
 | `src/export_dialog.m` | Native export options dialogs (table, database or selected tables) and save panel |
 | `src/table_menu.m` | Sidebar right-click menu, rename and API-key prompts, confirmations (Cancel / Keep exporting as the default), clipboard |
 | `src/row_edit.c` | Row editing without UI: column kinds, value checks, `UPDATE` / `INSERT` / `DELETE` SQL |
+| `src/browse.c` | Browsing a table without UI: the page's `SELECT` (filter, `ORDER BY` the key, `LIMIT` / `OFFSET`), its key columns, the page bar's label |
 | `src/grid_edit.m` | In-place cell editor for the results grid (text field, calendar popover, cell menu) |
 | `src/ai.c` | Ask Claude: request body, Claude API call (libcurl), reply parsing, editor text, destructive-statement check |
 | `src/ai_db.c` | Current database's schema as text for the prompt |
 | `src/json.c` | Small JSON builder and parser used by `ai.c` |
+| `tests/` | Unit tests (`make test`), e.g. `tests/browse_test.c` for `src/browse.c` |
 | `third_party/libui-ng` | libui-ng submodule |
 
 ## Development
@@ -508,7 +557,8 @@ with the same structure / `DROP … IF EXISTS` / data options:
 writers' escaping/quoting, the database dump's header, comments, view
 ordering and table selection, Ask Claude's request/response handling, comment formatting and
 destructive-statement check, the row editor's value checks and generated
-SQL, the SQL tips' length, format and no-repeat pick, the tab titles and
+SQL, the browse page's `SELECT` (filter operators, escaping, `ORDER BY` the
+key, `OFFSET`), key columns and page labels, the SQL tips' length, format and no-repeat pick, the tab titles and
 running-jobs list (truncation, UTF-8), and which errors mean a lost
 connection (no database or network needed).
 
@@ -525,8 +575,9 @@ table and database export, sidebar multi-select, `-A`, the context-menu actions 
 for destructive SQL from Claude, without calling the API, and row editing on
 scratch tables `edit_tmp` and `nopk_tmp`: cell edits, the calendar, invalid
 values, Set to NULL, adding, deleting several, Delete All Rows, a table without
-a primary key and a read-only view, and the welcome screen at launch and after
-**Disconnect**). It expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
+a primary key and a read-only view, the filter bar (`IS NOT NULL`, `LIKE` with
+a quote, **Reset**), the page bar, and that the user's own query disables both,
+and the welcome screen at launch and after **Disconnect**). It expects a database (`SQLC_TEST_DB`, default `test_sqlc_demo`) with tables
 `customers` and `orders` plus a view.
 
 ## Limitations
@@ -537,8 +588,10 @@ a primary key and a read-only view, and the welcome screen at launch and after
 - Column widths are counted in bytes, so non-ASCII text may misalign.
 - No `\G` vertical output, TLS options or prepared statements yet.
 - GUI: only rows from a single table can be edited (a browsed table, or a
-  query's rows from one table, see [Editing rows](#editing-rows)); a browse
-  shows the first 1000 rows.
+  query's rows from one table, see [Editing rows](#editing-rows)). A browse
+  shows 1000 rows a page (not configurable) with no total row count; without
+  a primary key the order between pages isn't guaranteed. The filter bar
+  filters by one column, and can't ask for an empty value (`= ''`).
   There's no syntax highlighting, and it always runs the whole editor (not just
   the selection). A running query can't be cancelled yet.
 - Database and multi-table export are SQL only and GUI only. The consistent

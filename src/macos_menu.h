@@ -27,6 +27,10 @@ void sqlc_button_set_small(uiButton *b);
  * to whatever its box gives it. */
 void sqlc_control_set_width(uiControl *c, double width);
 
+/* Call f(data) on the main thread when Return (or Enter) is pressed in e,
+ * a plain uiEntry (not a search entry, whose action libui uses). */
+void sqlc_entry_on_return(uiEntry *e, void (*f)(void *data), void *data);
+
 /* A long job ended: bounce the Dock icon once if the app is in the
  * background, play a sound ("Glass", or the system alert sound when
  * failed), then show a modal alert (warning style when failed). */

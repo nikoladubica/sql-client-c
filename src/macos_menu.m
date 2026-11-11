@@ -1,8 +1,10 @@
 // Native macOS menus: the standard Edit menu, Query > Run (Cmd+Return), and
-// File > New Tab (Cmd+T) / Close Tab (Cmd+W).
+// File > New Tab (Cmd+T) / Close Tab (Cmd+W), plus small control tweaks
+// (small buttons, fixed widths, Return in a uiEntry).
 // Edit menu: libui-ng doesn't create one, and without it
 // Cmd+C / Cmd+V / Cmd+A / Cmd+Z do nothing in text fields.
 #import <Cocoa/Cocoa.h>
+#import <objc/runtime.h>
 
 #include "macos_menu.h"
 
@@ -139,4 +141,39 @@ void sqlc_notify_done(const char *title, const char *message, int failed) {
     [alert addButtonWithTitle:@"OK"];
     [alert runModal];
     [alert release];
+}
+
+/* Return in a uiEntry: libui gives a plain entry a delegate (for its
+ * on-changed) but no target/action, so NSTextField's action is free. */
+@interface SqlcReturnTarget : NSObject {
+@public
+    void (*fn)(void *);
+    void *data;
+}
+- (void)onReturn:(id)sender;
+@end
+
+@implementation SqlcReturnTarget
+- (void)onReturn:(id)sender {
+    (void)sender;
+    /* only Return / Enter (keys 36 / 76), not editing ending on a click elsewhere */
+    NSEvent *ev = [NSApp currentEvent];
+    if (ev == nil || [ev type] != NSEventTypeKeyDown) return;
+    if ([ev keyCode] != 36 && [ev keyCode] != 76) return;
+    if (fn) fn(data);
+}
+@end
+
+static char return_target_key;
+
+void sqlc_entry_on_return(uiEntry *e, void (*f)(void *data), void *data) {
+    NSTextField *tf = (NSTextField *) uiControlHandle(uiControl(e));
+    SqlcReturnTarget *target = [[SqlcReturnTarget alloc] init];
+    target->fn = f;
+    target->data = data;
+    [tf setTarget:target];   /* not retained by the field ... */
+    [tf setAction:@selector(onReturn:)];
+    /* ... so the field keeps it (released with the field) */
+    objc_setAssociatedObject(tf, &return_target_key, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [target release];
 }
