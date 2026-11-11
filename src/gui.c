@@ -154,9 +154,13 @@ typedef struct {
     char *table;                  /* table shown (or tried), NULL = none */
 } structure_page;
 
-/* The grid of a browsed table, when its rows can be edited. */
+/* The grid of a browsed table, or of a query's rows from one table, when
+ * its rows can be edited. */
 typedef struct {
-    uiTable *grid;           /* NULL = the results aren't a browsed table */
+    uiTable *grid;           /* NULL = the results can't be edited */
+    char *table;             /* the table the edits go to */
+    char *query;             /* a query's rows: its SQL, run again by Reload;
+                              * NULL for a browsed table (t->browsing) */
     set_model *model;
     db_set *set;             /* t->shown.sets[0] */
     table_info info;
@@ -267,6 +271,12 @@ typedef struct tab {
     MYSQL *conn;
     int busy;                /* a job runs on conn (exports don't count) */
     int job_kind;            /* of the running job, while busy */
+    /* The server closed the connection (idle timeout, restart, killed):
+     * conn is NULL, but the layout stays (editor, results, sidebar, the
+     * browsed table) and Reconnect, next to the status line, opens a new
+     * connection with the kept login. */
+    int lost;
+    uiButton *reconnect_btn;
 } tab;
 
 /* What all tabs share. */
@@ -403,6 +413,7 @@ static void set_busy(tab *t, int busy) {
     }
     update_edit_buttons(t);
     if (busy) {
+        uiControlDisable(uiControl(t->reconnect_btn));
         uiControlDisable(uiControl(t->connect_btn));
         uiControlDisable(uiControl(t->disconnect_btn));
         uiControlDisable(uiControl(t->run_btn));
@@ -410,6 +421,7 @@ static void set_busy(tab *t, int busy) {
         uiControlDisable(uiControl(t->ai_btn));
         uiControlDisable(uiControl(t->st.refresh_btn));
     } else {
+        uiControlEnable(uiControl(t->reconnect_btn));
         uiControlEnable(uiControl(t->connect_btn));
         uiControlEnable(uiControl(t->disconnect_btn));
         uiControlEnable(uiControl(t->run_btn));
@@ -436,6 +448,8 @@ static void clear_edit_state(tab *t) {
     if (e->grid) sqlc_grid_detach(e->grid); /* before the grid goes away */
     table_info_free(&e->info);
     free(e->new_set);
+    free(e->table);
+    free(e->query);
     memset(e, 0, sizeof *e);
     e->new_row = -1;
 }
@@ -466,11 +480,15 @@ static uiControl *message_page(const char *text) {
     return uiControl(b);
 }
 
-static uiControl *editable_page(tab *t, set_model *sm, const db_outcome *meta);
+static uiControl *editable_page(tab *t, set_model *sm, const db_outcome *meta,
+                               const char *table, const char *query);
 
-/* Takes ownership of out. meta: the columns of the browsed table (see
- * fetch_browse_meta), to make its grid editable; NULL for other queries. */
-static void show_outcome(tab *t, db_outcome *out, const db_outcome *meta) {
+/* Takes ownership of out. meta: the columns of `table` (see
+ * fetch_table_meta), to make its grid editable; NULL for other results.
+ * query: the SQL that read a query's rows (Reload runs it again), NULL for
+ * a browsed table. */
+static void show_outcome(tab *t, db_outcome *out, const db_outcome *meta,
+                         const char *table, const char *query) {
     clear_results(t);
     t->shown = *out;
     memset(out, 0, sizeof *out);
@@ -489,8 +507,9 @@ static void show_outcome(tab *t, db_outcome *out, const db_outcome *meta) {
         if (s->has_rows) {
             set_model *sm = new_set_model(&t->shown.sets[i]);
             t->models[t->nmodels++] = sm;
-            int editable = meta && t->shown.nsets == 1 && !t->shown.error;
-            pages[p] = editable ? editable_page(t, sm, meta) : uiControl(new_grid(sm));
+            int editable = meta && table && t->shown.nsets == 1 && !t->shown.error;
+            pages[p] = editable ? editable_page(t, sm, meta, table, query)
+                                : uiControl(new_grid(sm));
         } else {
             char msg[128];
             snprintf(msg, sizeof msg, "Query OK, %llu row%s affected",
@@ -624,11 +643,12 @@ static void update_titles(tab *t);
  * Also the tab's title, which names the database. */
 static void update_conn_label(tab *t) {
     update_titles(t);
-    if (!t->conn) return;
+    if (!t->conn && !t->lost) return;
     char port[16] = "";
     if (t->conn_port) snprintf(port, sizeof port, ":%u", t->conn_port);
     char buf[1024];
-    snprintf(buf, sizeof buf, "Connected to %s%s%s%s - %s%s",
+    snprintf(buf, sizeof buf, "%s %s%s%s%s - %s%s",
+             t->conn ? "Connected to" : "Connection lost:",
              t->conn_user ? t->conn_user : "", t->conn_user && *t->conn_user ? "@" : "",
              t->conn_host ? t->conn_host : "", port,
              t->current_db ? "database: " : "no database selected",
@@ -677,9 +697,10 @@ static void set_refreshing(tab *t, int on) {
     start_loading_with_tip(t->side_loading);
 }
 
-/* Welcome screen while not connected, the full layout once connected. */
+/* Welcome screen while not connected, the full layout once connected (and
+ * after the connection was lost, until Reconnect or Disconnect). */
 static void show_screen(tab *t) {
-    if (t->conn) {
+    if (t->conn || t->lost) {
         update_conn_label(t);
         sync_bar_hide_views(t);
         uiControlHide(t->welcome);
@@ -695,7 +716,7 @@ static void show_screen(tab *t) {
 /* ---------- worker thread ---------- */
 
 typedef enum { JOB_CONNECT, JOB_QUERY, JOB_TABLES, JOB_EXPORT, JOB_EXPORT_DB, JOB_ALTER,
-               JOB_AI, JOB_ROWS, JOB_STRUCTURE } job_kind;
+               JOB_AI, JOB_ROWS, JOB_STRUCTURE, JOB_PING } job_kind;
 
 /* JOB_ROWS: a change to the rows of the browsed table's grid */
 typedef enum { ROW_UPDATE, ROW_INSERT, ROW_DELETE } row_op;
@@ -717,6 +738,7 @@ typedef struct job {
     char *sql;
     db_exec_opts eo;
     char *profile;            /* saved connection used to connect, if any */
+    int reconnect;            /* JOB_CONNECT: Reconnect after the connection was lost */
     int load_tables;          /* refresh the table list afterwards */
     int hide_views;           /* ... leaving views out of it */
     /* JOB_EXPORT, JOB_EXPORT_DB (table = the database's name), JOB_ALTER,
@@ -736,7 +758,8 @@ typedef struct job {
     /* JOB_AI */
     char *task, *api_key;
     ai_result ai;
-    /* JOB_QUERY browsing a table: also fetch its columns into meta */
+    /* JOB_QUERY browsing a table, or whose rows come from one table: also
+     * fetch that table's columns into meta (to edit them) */
     char *browse;
     db_outcome meta;
     /* JOB_ROWS */
@@ -756,6 +779,10 @@ typedef struct job {
     db_outcome tables;        /* refreshed table list (if load_tables) */
     char *current_db;
     double seconds;
+    /* jobs on the main connection: the server closed it (see db_conn_lost);
+     * no table list or current database was read then */
+    int lost;
+    char *lost_error;         /* ... the server's message for it */
 } job;
 
 static void job_free(job *j) {
@@ -777,6 +804,7 @@ static void job_free(job *j) {
     free(j->del_rows);
     db_outcome_free(&j->out);
     db_outcome_free(&j->tables);
+    free(j->lost_error);
     free(j);
 }
 
@@ -822,6 +850,11 @@ static void ask_claude(job *j) {
         cur.sets[0].nrows && db_cell(&cur.sets[0], 0, 0))
         dbname = strdup(db_cell(&cur.sets[0], 0, 0));
     db_outcome_free(&cur);
+    if (db_conn_lost(j->conn)) { /* no schema to send: don't ask (worker() says why) */
+        j->ai.error = strdup("The connection to the server was lost.");
+        free(dbname);
+        return;
+    }
 
     char *schema = dbname ? ai_schema(j->conn, AI_SCHEMA_BYTES) : NULL;
     char *body = ai_build_request(AI_MODEL, mysql_get_server_info(j->conn), dbname,
@@ -833,26 +866,49 @@ static void ask_claude(job *j) {
     free(dbname);
 }
 
-/* Columns and type of the browsed table j->browse; runs on the worker thread. */
-static void fetch_browse_meta(job *j) {
-    size_t n = strlen(j->browse);
-    char *name = malloc(2 * n + 1);
-    if (!name) return;
-    mysql_real_escape_string(j->conn, name, j->browse, (unsigned long)n);
-    size_t len = 2 * strlen(name) + 400;
-    char *sql = malloc(len);
-    if (sql) {
-        snprintf(sql, len,
+/* malloc'd 'value' as a quoted SQL string literal, or NULL. Worker thread. */
+static char *sql_string(MYSQL *conn, const char *value) {
+    size_t n = strlen(value);
+    char *q = malloc(2 * n + 3);
+    if (!q) return NULL;
+    q[0] = '\'';
+    unsigned long m = mysql_real_escape_string(conn, q + 1, value, (unsigned long)n);
+    if (m == (unsigned long)-1) { free(q); return NULL; }
+    q[m + 1] = '\'';
+    q[m + 2] = '\0';
+    return q;
+}
+
+/* Columns and type of table `table` into j->meta: in database db, or the
+ * current one (db NULL). Runs on the worker thread. */
+static void fetch_table_meta(job *j, const char *table, const char *db) {
+    char *name = sql_string(j->conn, table);
+    char *schema = db ? sql_string(j->conn, db) : strdup("DATABASE()");
+    char *sql = NULL;
+    if (name && schema &&
+        asprintf(&sql,
                  "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA "
-                 "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
-                 "AND TABLE_NAME = '%s' ORDER BY ORDINAL_POSITION;"
+                 "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = %s "
+                 "AND TABLE_NAME = %s ORDER BY ORDINAL_POSITION;"
                  "SELECT TABLE_TYPE FROM information_schema.TABLES "
-                 "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '%s'", name, name);
+                 "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+                 schema, name, schema, name) < 0)
+        sql = NULL;
+    if (sql) {
         db_exec_opts eo = { 0 };
         db_execute(j->conn, sql, &eo, &j->meta);
     }
     free(sql);
+    free(schema);
     free(name);
+}
+
+/* The rows of a query that can be edited: one result set, every column a
+ * real column of one table (see db_set's org_table). */
+static const db_set *editable_query_set(const job *j) {
+    if (j->kind != JOB_QUERY || j->browse || j->out.error || j->out.nsets != 1) return NULL;
+    const db_set *s = &j->out.sets[0];
+    return s->has_rows && s->org_table && s->org_db ? s : NULL;
 }
 
 /* JOB_STRUCTURE on the worker thread: three result sets in j->out -
@@ -1002,7 +1058,12 @@ static void *worker(void *data) {
         j->ok = j->conn != NULL;
     } else if (j->kind == JOB_QUERY || j->kind == JOB_ALTER) {
         j->ok = db_execute(j->conn, j->sql, &j->eo, &j->out) == 0;
-        if (j->ok && j->browse) fetch_browse_meta(j);
+        if (j->ok && j->browse) {
+            fetch_table_meta(j, j->browse, NULL);
+        } else if (j->ok) {
+            const db_set *s = editable_query_set(j);
+            if (s) fetch_table_meta(j, s->org_table, s->org_db);
+        }
     } else if (j->kind == JOB_ROWS) {
         j->ok = db_execute(j->conn, j->sql, &j->eo, &j->out) == 0;
         if (!j->ok && j->op == ROW_DELETE) { /* undo the deletes that worked */
@@ -1014,6 +1075,10 @@ static void *worker(void *data) {
         ask_claude(j);
     } else if (j->kind == JOB_STRUCTURE) {
         fetch_structure(j);
+    } else if (j->kind == JOB_PING) {
+        /* MYSQL_OPT_RECONNECT is off: a dead connection fails, it isn't
+         * silently replaced (which would lose the session's state) */
+        j->ok = mysql_ping(j->conn) == 0;
     } else if (j->kind == JOB_EXPORT) {
         int rc = export_table(j->conn, j->table, j->is_view, j->fmt, &j->xopts, j->path,
                               export_progress_cb, j, &j->rows, &j->error);
@@ -1035,7 +1100,19 @@ static void *worker(void *data) {
     if (exporting && j->own_conn && j->conn) export_close(j);
     j->seconds = now_seconds() - t0;
 
-    if (j->conn) load_tables(j);
+    /* A job on the main connection may find it closed by the server (most
+     * often wait_timeout after sitting idle). Then nothing more is read on
+     * it, and job_done offers Reconnect. */
+    int main_conn = !exporting && j->kind != JOB_CONNECT && j->conn;
+    if (main_conn) j->lost = j->kind == JOB_PING ? !j->ok : db_conn_lost(j->conn);
+    if (j->conn && !j->lost && j->kind != JOB_PING) {
+        load_tables(j);
+        if (main_conn) j->lost = db_conn_lost(j->conn);
+    }
+    if (j->lost) {
+        j->lost_error = db_error_string(j->conn);
+        j->load_tables = 0; /* the list read (if any) failed: keep the old one */
+    }
     uiQueueMain(job_done, j);
     return NULL;
 }
@@ -1065,7 +1142,10 @@ static void start_job(tab *t, job *j) {
     pthread_t th;
     int exporting = j->kind == JOB_EXPORT || j->kind == JOB_EXPORT_DB;
     j->t = t;
-    if (!exporting) {
+    if (j->kind == JOB_PING) {
+        t->job_kind = j->kind;
+        t->busy = 1; /* quietly (it takes milliseconds): no buttons dimmed */
+    } else if (!exporting) {
         t->job_kind = j->kind;
         set_busy(t, 1);
         if (j->kind == JOB_CONNECT) set_connecting(t, 1);
@@ -1088,6 +1168,7 @@ static void start_job(tab *t, job *j) {
 }
 
 static void reload_browse(tab *t);
+static void reload_rows(tab *t);
 static int browse_table(tab *t, const char *name);
 static void rows_done(tab *t, job *j);
 
@@ -1209,7 +1290,11 @@ static void start_structure(tab *t, const char *table) {
  * it if it isn't the one shown). Called whenever that might have changed. */
 static void structure_sync(tab *t) {
     if (t->mode != MODE_STRUCTURE) return;
-    if (!t->conn) { structure_message(t, "Not connected."); return; }
+    if (!t->conn) {
+        structure_message(t, t->lost ? "The connection to the server was lost - press Reconnect."
+                                     : "Not connected.");
+        return;
+    }
     size_t nsel = selected_count(t);
     if (nsel > 1) {
         char msg[128];
@@ -1316,6 +1401,10 @@ static void alter_done(tab *t, job *j) {
     switch (j->alter) {
     case ALTER_RENAME:
         set_status(t, "Renamed %s %s to %s", what, j->table, j->new_name);
+        if (t->edit.table && strcmp(t->edit.table, j->table) == 0) { /* edits go there now */
+            char *renamed = strdup(j->new_name);
+            if (renamed) { free(t->edit.table); t->edit.table = renamed; }
+        }
         if (shown) { /* same rows, new name: just follow it */
             free(t->browsing);
             t->browsing = strdup(j->new_name);
@@ -1457,6 +1546,24 @@ static void export_done(tab *t, job *j) {
 #endif
 }
 
+/* The server closed t's connection (err: its message, may be NULL). Says so
+ * at once and shows Reconnect; everything on screen stays as it is. */
+static void connection_lost(tab *t, const char *err) {
+    if (t->conn) mysql_close(t->conn);
+    t->conn = NULL;
+    t->lost = 1;
+    update_conn_label(t);
+    uiControlShow(uiControl(t->reconnect_btn));
+    set_status(t, "Lost the connection to the server%s%s - press Reconnect.",
+               err ? ": " : "", err ? err : "");
+}
+
+/* Why nothing runs while not connected. */
+static const char *not_connected_msg(const tab *t) {
+    return t->lost ? "The connection to the server was lost - press Reconnect."
+                   : "Not connected - connect from the welcome screen first.";
+}
+
 static void job_done(void *data) {
     job *j = data;
     tab *t = j->t;
@@ -1471,13 +1578,22 @@ static void job_done(void *data) {
     }
     tab_release(t); /* an open tab stays */
     if (exporting) { export_done(t, j); return; }
+    if (j->kind == JOB_PING) { /* quiet unless the connection is gone */
+        t->busy = 0;
+        if (j->lost) connection_lost(t, j->lost_error);
+        job_free(j);
+        return;
+    }
     set_busy(t, 0);
+    /* Before the handlers below: they may start a follow-up job (a reload),
+     * which then finds no connection instead of the dead one. */
+    if (j->lost) connection_lost(t, j->lost_error);
 
     /* The sidebar's selection, to keep when its list is replaced below
-     * (following a rename). Not across connections. */
+     * (following a rename). Not across connections, but across a reconnect. */
     char **keep = NULL;
     size_t nkeep = 0;
-    if (j->load_tables && j->kind != JOB_CONNECT) {
+    if (j->load_tables && (j->kind != JOB_CONNECT || j->reconnect)) {
         if (selected_tables(t, &keep, &nkeep) != 0) nkeep = 0;
         if (j->kind == JOB_ALTER && j->ok && j->alter == ALTER_RENAME) {
             for (size_t i = 0; i < nkeep; i++) {
@@ -1488,10 +1604,18 @@ static void job_done(void *data) {
         }
     }
 
+    int rebrowse = 0; /* reconnected: show the browsed table again */
     if (j->kind == JOB_CONNECT) {
         if (!j->ok) {
-            set_status(t, "%s", j->error ? j->error : "Connection failed");
-            uiMsgBoxError(app.win, "Connection failed", j->error ? j->error : "");
+            if (j->reconnect) { /* still lost: Reconnect stays */
+                set_status(t, "Could not reconnect: %s - press Reconnect to try again.",
+                           j->error ? j->error : "connection failed");
+                show_error("Could not reconnect", j->error ? j->error : "");
+            } else {
+                set_status(t, "%s", j->error ? j->error : "Connection failed");
+                uiMsgBoxError(app.win, "Connection failed", j->error ? j->error : "");
+            }
+            free_names(keep, nkeep);
             job_free(j);
             return;
         }
@@ -1510,19 +1634,31 @@ static void job_done(void *data) {
         free(t->profile); /* the tab's title names it */
         t->profile = j->profile;
         j->profile = NULL;
-        set_status(t, "Connected to %s (server %s)%s%s%s",
-                   mysql_get_host_info(t->conn), mysql_get_server_info(t->conn),
-                   j->current_db ? " - database: " : "",
-                   j->current_db ? j->current_db : "",
-                   !j->load_tables ? " - table list not loaded (-A)"
-                   : uiCheckboxChecked(t->tables_once) ? " - tables only, not refreshed after queries"
-                   : "");
-        /* The old connection's list is stale whether or not we reload it. */
-        db_outcome_free(&t->tables_raw);
-        t->tables_loaded = 0;
-        free(t->browsing);
-        t->browsing = NULL;
-        structure_message(t, "");
+        if (j->reconnect) {
+            /* The same server: the editor, results, structure and table
+             * list stay (the list is reloaded unless -A); the browsed table
+             * is read again below. */
+            t->lost = 0;
+            uiControlHide(uiControl(t->reconnect_btn));
+            set_status(t, "Reconnected to %s%s%s", mysql_get_host_info(t->conn),
+                       j->current_db ? " - database: " : "",
+                       j->current_db ? j->current_db : "");
+            rebrowse = t->browsing != NULL;
+        } else {
+            set_status(t, "Connected to %s (server %s)%s%s%s",
+                       mysql_get_host_info(t->conn), mysql_get_server_info(t->conn),
+                       j->current_db ? " - database: " : "",
+                       j->current_db ? j->current_db : "",
+                       !j->load_tables ? " - table list not loaded (-A)"
+                       : uiCheckboxChecked(t->tables_once) ? " - tables only, not refreshed after queries"
+                       : "");
+            /* The old connection's list is stale whether or not we reload it. */
+            db_outcome_free(&t->tables_raw);
+            t->tables_loaded = 0;
+            free(t->browsing);
+            t->browsing = NULL;
+            structure_message(t, "");
+        }
         show_screen(t); /* off the welcome screen */
     } else if (j->kind == JOB_STRUCTURE) {
         structure_done(t, j);
@@ -1580,11 +1716,21 @@ static void job_done(void *data) {
             set_status(t, "Query OK, %llu row%s affected in %.3f s", affected,
                        affected == 1 ? "" : "s", j->seconds);
         int browsed = j->browse && t->browsing && strcmp(j->browse, t->browsing) == 0;
-        show_outcome(t, &j->out, browsed ? &j->meta : NULL);
+        /* A query's rows from one table of the current database (the edits
+         * name the table without its database) can be edited too. */
+        const db_set *qs = browsed || j->lost ? NULL : editable_query_set(j);
+        char *qtable = qs && j->current_db && strcmp(qs->org_db, j->current_db) == 0
+                       ? strdup(qs->org_table) : NULL;
+        if (browsed)
+            show_outcome(t, &j->out, &j->meta, t->browsing, NULL);
+        else
+            show_outcome(t, &j->out, qtable ? &j->meta : NULL, qtable, j->sql);
+        free(qtable);
     }
 
-    /* The worker read DATABASE() after the job (see load_tables). */
-    if (j->conn) {
+    /* The worker read DATABASE() after the job (see load_tables), unless the
+     * connection was lost: the last one known is the one to reconnect to. */
+    if (j->conn && !j->lost) {
         free(t->current_db);
         t->current_db = j->current_db;
         j->current_db = NULL;
@@ -1600,16 +1746,34 @@ static void job_done(void *data) {
     }
     uiButtonSetText(t->load_tables_btn, t->tables_loaded ? "Refresh tables" : "Load tables");
     /* Only when the list changed, so the selection survives e.g. an export. */
-    if (j->kind == JOB_CONNECT || j->load_tables) rebuild_sidebar_keeping(t, keep, nkeep);
+    if ((j->kind == JOB_CONNECT && !j->reconnect) || j->load_tables)
+        rebuild_sidebar_keeping(t, keep, nkeep);
     free_names(keep, nkeep);
 
+    /* again after the job's own messages, so this one is left in the status line */
+    if (j->lost) connection_lost(t, j->lost_error);
     job_free(j);
+    if (t->lost) { /* nothing more can run until Reconnect */
+        free(t->pending_browse);
+        t->pending_browse = NULL;
+    }
     /* a double-click that came while the structure was loading */
     if (t->pending_browse) {
         char *name = t->pending_browse;
         t->pending_browse = NULL;
         browse_table(t, name);
         free(name);
+    } else if (rebrowse) {
+        /* Read the browsed table again, but leave the editor's text (and
+         * the mode) as they were: they may hold the user's own query. */
+        char *text = uiMultilineEntryText(t->editor);
+        int ai_text = t->ai_in_editor, mode = t->mode;
+        if (browse_table(t, t->browsing) && text) {
+            uiMultilineEntrySetText(t->editor, text);
+            t->ai_in_editor = ai_text;
+            show_mode(t, mode);
+        }
+        uiFreeText(text);
     }
     structure_sync(t);
 #ifdef SQLC_AUTOTEST
@@ -1650,10 +1814,59 @@ static void on_connect(uiButton *b, void *data) {
     start_job(t, j);
 }
 
+/* After the connection was lost: a new one with the kept login, to the
+ * database in use when it was lost (it may have changed via USE). */
+static void on_reconnect(uiButton *b, void *data) {
+    (void)b; tab *t = data;
+    if (t->busy || !t->lost) return;
+    job *j = calloc(1, sizeof *j);
+    if (!j) return;
+    const char *db = t->current_db ? t->current_db : t->conn_db;
+    j->kind = JOB_CONNECT;
+    j->reconnect = 1;
+    j->host = strdup(t->conn_host ? t->conn_host : "localhost");
+    j->user = strdup(t->conn_user ? t->conn_user : "");
+    j->pass = strdup(t->conn_pass ? t->conn_pass : "");
+    j->dbname = db ? strdup(db) : NULL;
+    j->profile = t->profile ? strdup(t->profile) : NULL;
+    if (!j->host || !j->user || !j->pass || (db && !j->dbname) || (t->profile && !j->profile)) {
+        job_free(j);
+        set_status(t, "Out of memory");
+        return;
+    }
+    j->port = t->conn_port;
+    j->load_tables = load_on_connect(t);
+    j->hide_views = uiCheckboxChecked(t->hide_views);
+    set_status(t, "Reconnecting to %s...", j->host);
+    start_job(t, j);
+}
+
+#ifndef SQLC_AUTOTEST /* it would race the scripted steps */
+/* Every minute, each idle tab's connection is pinged: that keeps the server
+ * from closing it for inactivity (wait_timeout) and, if it was closed anyway
+ * (restart, killed, network, sleep), says so right away with Reconnect. */
+enum { KEEPALIVE_MS = 60 * 1000 };
+
+static int keepalive_tick(void *data) {
+    (void)data;
+    if (app.gone) return 0; /* the timer stops */
+    for (size_t i = 0; i < app.ntabs; i++) {
+        tab *t = app.list[i];
+        if (!t->conn || t->busy || t->closed) continue;
+        job *j = calloc(1, sizeof *j);
+        if (!j) continue;
+        j->kind = JOB_PING;
+        j->conn = t->conn;
+        start_job(t, j);
+    }
+    return 1;
+}
+#endif
+
 /* Returns 1 if the query was started. browse: the table it shows (for editing). */
 static int run_query(tab *t, const char *sql, const char *browse) {
     if (t->busy) return 0;
-    if (!t->conn) { set_status(t, "Not connected - connect from the welcome screen first."); return 0; }
+    if (!t->conn) { set_status(t, "%s", not_connected_msg(t)); return 0; }
 
     const char *p = sql;
     while (isspace((unsigned char)*p)) p++;
@@ -1703,6 +1916,14 @@ static int browse_table(tab *t, const char *name) {
 
 static void reload_browse(tab *t) {
     if (t->browsing) browse_table(t, t->browsing);
+}
+
+/* Read the editable grid's rows again: its query, or the browsed table. */
+static void reload_rows(tab *t) {
+    if (!t->edit.query) { reload_browse(t); return; }
+    char *sql = strdup(t->edit.query); /* the grid (and its query) is replaced */
+    if (sql) run_query(t, sql, NULL);
+    free(sql);
 }
 
 /* Claude's SQL is about to run: ask first if it destroys data or structure.
@@ -1811,7 +2032,11 @@ static void on_remove_api_key(uiMenuItem *m, uiWindow *w, void *data) {
 
 static void ask_claude_now(tab *t) {
     if (t->busy) return;
-    if (!t->conn) { set_status(t, "Connect first, so Claude can see the database's tables."); return; }
+    if (!t->conn) {
+        set_status(t, "%s", t->lost ? not_connected_msg(t)
+                                    : "Connect first, so Claude can see the database's tables.");
+        return;
+    }
     char *txt = uiMultilineEntryText(t->ai_task);
     char *task = strdup(txt ? txt : "");
     uiFreeText(txt);
@@ -1845,12 +2070,12 @@ static void on_ask_claude_menu(uiMenuItem *m, uiWindow *w, void *data) {
     (void)m; (void)w; (void)data;
     tab *t = cur_tab();
     show_mode(t, MODE_AI); /* on the welcome screen: shown once connected */
-    if (!t->conn) set_status(t, "Not connected - connect from the welcome screen first.");
+    if (!t->conn) set_status(t, "%s", not_connected_msg(t));
 }
 
 static void load_tables_now(tab *t) {
     if (t->busy) return;
-    if (!t->conn) { set_status(t, "Not connected - connect from the welcome screen first."); return; }
+    if (!t->conn) { set_status(t, "%s", not_connected_msg(t)); return; }
     job *j = calloc(1, sizeof *j);
     if (!j) return;
     j->kind = JOB_TABLES;
@@ -1986,7 +2211,7 @@ static void export_tables_flow(tab *t, char **names, size_t n);
 /* Export…: the whole database with nothing selected in the sidebar, the one
  * selected table (SQL / CSV / XML), or the selected tables into one SQL file. */
 static void export_sidebar_selection(tab *t) {
-    if (!t->conn) { set_status(t, "Not connected - connect from the welcome screen first."); return; }
+    if (!t->conn) { set_status(t, "%s", not_connected_msg(t)); return; }
     if (export_running(t)) return;
     char **names = NULL;
     size_t n = 0;
@@ -2070,7 +2295,7 @@ static void export_tables_flow(tab *t, char **names, size_t n) {
 }
 
 static void export_database_flow(tab *t) {
-    if (!t->conn) { set_status(t, "Not connected - connect from the welcome screen first."); return; }
+    if (!t->conn) { set_status(t, "%s", not_connected_msg(t)); return; }
     if (export_running(t)) return;
     if (!t->current_db) {
         uiMsgBoxError(app.win, "Export Database",
@@ -2319,7 +2544,7 @@ static int next_editable(tab *t, int row, int col, int dir) {
 
 static int edit_job_ok(tab *t) {
     if (t->busy) { set_status(t, "Busy - wait for the running query to finish, then try again."); return 0; }
-    if (!t->conn || !t->browsing) { set_status(t, "Not connected."); return 0; }
+    if (!t->conn || !t->edit.table) { set_status(t, "%s", not_connected_msg(t)); return 0; }
     return 1;
 }
 
@@ -2340,7 +2565,7 @@ static void start_row_update(tab *t, int row, int col, const char *value, const 
     if (!edit_job_ok(t)) { begin_cell_edit(t, row, col, typed); return; }
     char err[512];
     row_edit_escaper esc = escaper(t);
-    char *sql = row_edit_update_sql(t->browsing, &t->edit.info, t->edit.set, (size_t)row,
+    char *sql = row_edit_update_sql(t->edit.table, &t->edit.info, t->edit.set, (size_t)row,
                                     (unsigned)col, value, &esc, err, sizeof err);
     if (!sql) { set_status(t, "%s", err); show_error("Can't save this change", err); return; }
     job *j = new_rows_job(t, ROW_UPDATE, sql);
@@ -2361,7 +2586,7 @@ static void start_row_insert(tab *t, int col) {
     if (!edit_job_ok(t)) return;
     char err[512];
     row_edit_escaper esc = escaper(t);
-    char *sql = row_edit_insert_sql(t->browsing, &e->info, e->set, (size_t)e->new_row,
+    char *sql = row_edit_insert_sql(t->edit.table, &e->info, e->set, (size_t)e->new_row,
                                     e->new_set, &esc, err, sizeof err);
     if (!sql) { set_status(t, "%s", err); show_error("Can't add this row", err); return; }
     job *j = new_rows_job(t, ROW_INSERT, sql);
@@ -2506,8 +2731,8 @@ static void delete_selected_rows(tab *t) {
 
     char title[600], msg[300];
     size_t total = nsaved + (size_t)drop_new;
-    if (total == 1) snprintf(title, sizeof title, "Delete 1 row from `%s`?", t->browsing);
-    else snprintf(title, sizeof title, "Delete %zu rows from `%s`?", total, t->browsing);
+    if (total == 1) snprintf(title, sizeof title, "Delete 1 row from `%s`?", e->table);
+    else snprintf(title, sizeof title, "Delete %zu rows from `%s`?", total, e->table);
     snprintf(msg, sizeof msg, "%s", nsaved ? "This can't be undone." : "The new row isn't saved yet; it will be discarded.");
     if (!confirm_danger(title, msg, "Delete", 1)) { free(rows); return; }
 
@@ -2519,7 +2744,7 @@ static void delete_selected_rows(tab *t) {
     }
     char err[512];
     row_edit_escaper esc = escaper(t);
-    char *sql = row_edit_delete_sql(t->browsing, &e->info, e->set, rows, nsaved, &esc, err, sizeof err);
+    char *sql = row_edit_delete_sql(e->table, &e->info, e->set, rows, nsaved, &esc, err, sizeof err);
     if (!sql) { free(rows); set_status(t, "%s", err); show_error("Can't delete these rows", err); return; }
     job *j = new_rows_job(t, ROW_DELETE, sql);
     if (!j) { free(rows); return; }
@@ -2539,14 +2764,15 @@ static void on_reload_rows(uiButton *b, void *data) {
     (void)b; tab *t = data;
     if (t->busy) return;
     if (t->edit.new_row >= 0) set_status(t, "Reloading: the unsaved new row was discarded.");
-    reload_browse(t);
+    reload_rows(t);
 }
 
 /* Delete all rows: TRUNCATE TABLE, then the grid reloads (see alter_done). */
 static void on_clear_rows(uiButton *b, void *data) {
     (void)b; tab *t = data;
     if (!t->edit.grid || t->edit.readonly || !edit_job_ok(t)) return;
-    char *name = strdup(t->browsing);
+    if (t->edit.query) return; /* hidden for a query's rows */
+    char *name = strdup(t->edit.table);
     if (!name) return;
     char title[600];
     snprintf(title, sizeof title, "Delete all rows of `%s`?", name);
@@ -2596,7 +2822,7 @@ static void rows_done(tab *t, job *j) {
         }
         unsigned long long n = j->out.nsets ? j->out.sets[0].affected : 0;
         set_status(t, n ? "Saved %s in row %d of %s." : "%s in row %d of %s: no change.",
-                   e->info.cols[j->col].name, j->row + 1, t->browsing);
+                   e->info.cols[j->col].name, j->row + 1, e->table);
         if (j->next_col >= 0) begin_cell_edit(t, j->row, j->next_col, NULL);
         break;
     }
@@ -2609,8 +2835,8 @@ static void rows_done(tab *t, job *j) {
         }
         const db_set *r = refreshed_row(t, j);
         if (!r) { /* can't find it again (no key): read the table back */
-            set_status(t, "Added 1 row to %s.", t->browsing);
-            reload_browse(t);
+            set_status(t, "Added 1 row to %s.", e->table);
+            reload_rows(t);
             break;
         }
         int row = e->new_row;
@@ -2620,7 +2846,7 @@ static void rows_done(tab *t, job *j) {
         free(e->new_set);
         e->new_set = NULL;
         replace_grid_row(t, row, r);
-        set_status(t, "Added 1 row to %s.", t->browsing);
+        set_status(t, "Added 1 row to %s.", e->table);
         break;
     }
     case ROW_DELETE: {
@@ -2633,7 +2859,7 @@ static void rows_done(tab *t, job *j) {
         for (size_t i = 0; i < j->out.nsets; i++) gone += j->out.sets[i].affected;
         if (j->drop_new && e->new_row >= 0) remove_grid_row(t, e->new_row);
         for (size_t i = j->ndel; i-- > 0;) remove_grid_row(t, (int)j->del_rows[i]);
-        set_status(t, "Deleted %llu row%s from %s.", gone, gone == 1 ? "" : "s", t->browsing);
+        set_status(t, "Deleted %llu row%s from %s.", gone, gone == 1 ? "" : "s", e->table);
         break;
     }
     }
@@ -2703,19 +2929,28 @@ static uiButton *toolbar_button(tab *t, uiBox *bar, const char *text, void (*f)(
 
 /* The grid of a browsed table, with + / - / Reload / Delete All Rows below.
  * meta: its columns (sets[0]) and TABLE_TYPE (sets[1]). */
-static uiControl *editable_page(tab *t, set_model *sm, const db_outcome *meta) {
+static uiControl *editable_page(tab *t, set_model *sm, const db_outcome *meta,
+                               const char *table, const char *query) {
     grid_edit_state *e = &t->edit;
     clear_edit_state(t);
     e->model = sm;
     e->set = sm->set;
+    e->table = strdup(table);
+    e->query = query ? strdup(query) : NULL;
 
     const db_set *cols = meta->nsets > 0 ? &meta->sets[0] : NULL;
     const db_set *type = meta->nsets > 1 ? &meta->sets[1] : NULL;
     const char *ttype = type && type->nrows ? db_cell(type, 0, 0) : NULL;
-    if (is_view(ttype))
+    if (!e->table || (query && !e->query))
+        e->readonly = "Out of memory: these rows can't be edited.";
+    else if (is_view(ttype))
         e->readonly = "Views are read-only here: browse the table itself to edit rows.";
     else if (table_info_load(&e->info, cols, sm->set) != 0)
-        e->readonly = "This table's columns couldn't be read, so its rows can't be edited.";
+        e->readonly = query ? "These rows can't be edited: only plain columns of one table can "
+                              "(no expressions, and no column twice)."
+                            : "This table's columns couldn't be read, so its rows can't be edited.";
+    else if (!e->info.npk && !e->info.whole)
+        e->readonly = "Add the table's primary key to the query to edit these rows.";
 
     uiTable *grid = new_grid(sm);
     e->grid = grid;
@@ -2740,11 +2975,19 @@ static uiControl *editable_page(tab *t, set_model *sm, const db_outcome *meta) {
     e->del_btn = toolbar_button(t, bar, "\xE2\x88\x92", on_delete_rows); /* "−" */
     e->reload_btn = toolbar_button(t, bar, "Reload", on_reload_rows);
     e->clear_btn = toolbar_button(t, bar, "Delete All Rows\xE2\x80\xA6", on_clear_rows);
+    /* a query may show only some rows: emptying the whole table from here
+     * would be a surprise (browse the table for that) */
+    if (e->query) uiControlHide(uiControl(e->clear_btn));
     const char *hint = e->readonly ? e->readonly
         : e->info.npk ? "Double-click a cell to edit: Return saves, Tab goes to the next column, "
                         "Esc cancels. Right-click for Set to NULL."
         : "Double-click a cell to edit (Return saves, Esc cancels). No primary key: rows are "
           "found by their values, one at a time.";
+    char buf[1200];
+    if (e->query && !e->readonly && e->table) { /* say which table the edits go to */
+        snprintf(buf, sizeof buf, "Rows of `%s`. %s", e->table, hint);
+        hint = buf;
+    }
     uiBoxAppend(bar, uiControl(uiNewLabel(hint)), 0);
     uiBoxAppend(page, uiControl(bar), 0);
     update_edit_buttons(t);
@@ -3002,7 +3245,7 @@ static int load_profiles(void) {
  * its text; the results, table list and structure belonged to the server. */
 static void on_disconnect(uiButton *b, void *data) {
     (void)b; tab *t = data;
-    if (t->busy || !t->conn) return; /* the worker may be using it */
+    if (t->busy || (!t->conn && !t->lost)) return; /* the worker may be using it */
     /* An export runs on its own connection, so it doesn't stop a disconnect,
      * but it doesn't outlive it either: ask, then cancel it. It ends on its
      * own and says "Export cancelled.". */
@@ -3017,8 +3260,10 @@ static void on_disconnect(uiButton *b, void *data) {
         }
     }
     int had_new_row = t->edit.new_row >= 0;
-    mysql_close(t->conn);
+    if (t->conn) mysql_close(t->conn);
     t->conn = NULL;
+    t->lost = 0;
+    uiControlHide(uiControl(t->reconnect_btn));
     forget_login(t);
     free(t->profile);
     t->profile = NULL;
@@ -3654,8 +3899,9 @@ static int tab_index(const tab *t) {
 
 /* t's title, see tab_title in tabs.h. */
 static void tab_title_of(const tab *t, char *buf, size_t size) {
-    tab_title(buf, size, t->conn ? t->profile : NULL, t->conn_user,
-              t->conn ? t->conn_host : NULL, t->current_db);
+    int on = t->conn || t->lost;
+    tab_title(buf, size, on ? t->profile : NULL, t->conn_user,
+              on ? t->conn_host : NULL, t->current_db);
 }
 
 /* The window's title follows the tab in front: "sqlc - <tab title>". */
@@ -4053,6 +4299,12 @@ static void build_tab_page(tab *t) {
     sqlc_button_set_small(t->cancel_export_btn);
     uiControlHide(uiControl(t->cancel_export_btn));
     uiBoxAppend(status_row, uiControl(t->cancel_export_btn), 0);
+    /* only after the server closed the connection, see connection_lost */
+    t->reconnect_btn = uiNewButton("Reconnect");
+    uiButtonOnClicked(t->reconnect_btn, on_reconnect, t);
+    sqlc_button_set_small(t->reconnect_btn);
+    uiControlHide(uiControl(t->reconnect_btn));
+    uiBoxAppend(status_row, uiControl(t->reconnect_btn), 0);
     uiBoxAppend(root, uiControl(status_row), 0);
 
     t->edit.new_row = -1;
@@ -4155,6 +4407,8 @@ int main(void) {
     uiControlShow(uiControl(app.win));
 #ifdef SQLC_AUTOTEST
     uiQueueMain(autotest_start, NULL);
+#else
+    uiTimer(KEEPALIVE_MS, keepalive_tick, NULL);
 #endif
     uiMain();
 

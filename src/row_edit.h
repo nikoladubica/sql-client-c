@@ -37,18 +37,23 @@ typedef struct {
     unsigned int ncols;  /* same columns, same order as the browsed rows */
     col_info *cols;
     unsigned int npk;    /* primary key columns (0 = none) */
+    int whole;           /* the rows hold every column of the table */
+    int star;            /* ... in the table's order, as SELECT * has them */
 } table_info;
 
 /* Kind of an information_schema DATA_TYPE ("int", "varchar", ...). */
 col_kind row_edit_kind(const char *data_type, int *approx);
 
 /*
- * Build ti for the columns of `rows` (a SELECT * of the table) from
- * `columns`, the rows of
+ * Build ti for the columns of `rows` (a SELECT * of the table, or a query
+ * of some of its columns, in any order) from `columns`, the rows of
  *   SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA
- *   FROM information_schema.COLUMNS ...
- * Returns 0, or -1 (ti empty) if a column of `rows` isn't described there.
- * A primary key column missing from `rows` (e.g. invisible) drops the key.
+ *   FROM information_schema.COLUMNS ... ORDER BY ORDINAL_POSITION
+ * A column is matched by its real name (rows->org_names, so an alias
+ * works) or, without org_names, by its name. Returns 0, or -1 (ti empty)
+ * if a column of `rows` isn't described there (an expression) or appears
+ * twice. A primary key column missing from `rows` drops the key; rows
+ * without a key can then only be edited if they hold every column (whole).
  */
 int table_info_load(table_info *ti, const db_set *columns, const db_set *rows);
 void table_info_free(table_info *ti);

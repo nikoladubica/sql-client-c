@@ -48,20 +48,28 @@ int table_info_load(table_info *ti, const db_set *columns, const db_set *rows) {
         const char *key = db_cell(columns, r, 3);
         if (key && strcmp(key, "PRI") == 0) pk_total++;
     }
+    unsigned char *used = calloc(columns->nrows ? columns->nrows : 1, 1);
+    if (!used) { table_info_free(ti); return -1; }
+    ti->star = rows->ncols == columns->nrows;
 
     for (unsigned int c = 0; c < rows->ncols; c++) {
-        size_t r;
-        for (r = 0; r < columns->nrows; r++) {
-            const char *name = db_cell(columns, r, 0);
-            if (name && strcmp(name, rows->names[c]) == 0) break;
-        }
-        if (r == columns->nrows) { table_info_free(ti); return -1; }
+        const char *want = rows->org_names ? rows->org_names[c] : rows->names[c];
+        size_t r = columns->nrows;
+        if (want)
+            for (r = 0; r < columns->nrows; r++) {
+                const char *name = db_cell(columns, r, 0);
+                if (name && strcmp(name, want) == 0) break;
+            }
+        /* an expression, or a column shown twice (one cell, two values) */
+        if (r == columns->nrows || used[r]) { free(used); table_info_free(ti); return -1; }
+        used[r] = 1;
+        if (r != c) ti->star = 0;
         col_info *ci = &ti->cols[c];
         const char *nullable = db_cell(columns, r, 2);
         const char *key = db_cell(columns, r, 3);
         const char *extra = db_cell(columns, r, 4);
-        ci->name = strdup(rows->names[c]);
-        if (!ci->name) { table_info_free(ti); return -1; }
+        ci->name = strdup(db_cell(columns, r, 0)); /* the real name, for the SQL */
+        if (!ci->name) { free(used); table_info_free(ti); return -1; }
         ci->kind = row_edit_kind(db_cell(columns, r, 1), &ci->approx);
         ci->nullable = nullable && strcasecmp(nullable, "YES") == 0;
         ci->primary = key && strcmp(key, "PRI") == 0;
@@ -72,6 +80,8 @@ int table_info_load(table_info *ti, const db_set *columns, const db_set *rows) {
                                   strcasestr(extra, "PERSISTENT"));
         if (ci->primary) ti->npk++;
     }
+    free(used);
+    ti->whole = rows->ncols == columns->nrows; /* no repeats: so all of them */
     if (ti->npk != pk_total) { /* part of the key isn't in the rows */
         for (unsigned int c = 0; c < ti->ncols; c++) ti->cols[c].primary = 0;
         ti->npk = 0;
@@ -300,6 +310,10 @@ static int where_col(const table_info *ti, unsigned int c) {
 }
 
 static int can_identify(const table_info *ti, char *err, size_t errsize) {
+    if (!ti->npk && !ti->whole) { /* some columns only: their values may not be unique */
+        set_err(err, errsize, "Add the table's primary key to the query to edit these rows.");
+        return 0;
+    }
     for (unsigned int c = 0; c < ti->ncols; c++) if (where_col(ti, c)) return 1;
     set_err(err, errsize, "This table has no primary key and no columns that can identify a row.");
     return 0;
@@ -323,6 +337,22 @@ static void sb_where(sbuf *b, const table_info *ti, const char *const *vals,
             sb_value(b, vals[c], 0, esc);
         }
     }
+}
+
+/* "SELECT <the rows' columns> FROM `table`", to read a changed row back the
+ * way the grid shows it ("SELECT *" when that's the same). */
+static void sb_select(sbuf *b, const table_info *ti, const char *table) {
+    sb_str(b, "SELECT ");
+    if (ti->star) {
+        sb_str(b, "*");
+    } else {
+        for (unsigned int c = 0; c < ti->ncols; c++) {
+            if (c) sb_str(b, ", ");
+            sb_ident(b, ti->cols[c].name);
+        }
+    }
+    sb_str(b, " FROM ");
+    sb_ident(b, table);
 }
 
 static const char *const *row_values(const db_set *set, size_t row) {
@@ -356,8 +386,8 @@ char *row_edit_update_sql(const char *table, const table_info *ti, const db_set 
     sb_str(&b, " = ");
     sb_value(&b, value, value_raw(&ti->cols[col], value), esc);
     sb_where(&b, ti, old, esc);
-    sb_str(&b, " LIMIT 1;\nSELECT * FROM ");
-    sb_ident(&b, table);
+    sb_str(&b, " LIMIT 1;\n");
+    sb_select(&b, ti, table);
     sb_where(&b, ti, now, esc);
     sb_str(&b, " LIMIT 1");
     free(now);
@@ -398,8 +428,8 @@ char *row_edit_insert_sql(const char *table, const table_info *ti, const db_set 
         if (ci->primary && !(is_set[c] && vals[c]) && !ci->auto_increment) findable = 0;
     }
     if (findable) {
-        sb_str(&b, ";\nSELECT * FROM ");
-        sb_ident(&b, table);
+        sb_str(&b, ";\n");
+        sb_select(&b, ti, table);
         sb_str(&b, " WHERE ");
         int first = 1;
         for (unsigned int c = 0; c < ti->ncols; c++) {

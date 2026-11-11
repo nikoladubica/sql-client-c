@@ -45,7 +45,8 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
   Ctrl-click is a right-click)
 - Double-click a table to browse it (`SELECT * ... LIMIT 1000`), then **edit its
   rows in place**: double-click a cell to change it (with a calendar for dates),
-  **+** adds a row, **−** deletes the selected rows, **Reload**, **Delete All Rows…**
+  **+** adds a row, **−** deletes the selected rows, **Reload**, **Delete All Rows…**;
+  your own `SELECT`'s rows from one table can be edited the same way
 - Right-click a table for **Show Structure**, **Copy Table Name**, **Rename**, **Truncate**, **Delete**
   and **Export** (Truncate and Delete always ask first; Cancel is the default)
 - **Export…** in the sidebar (or **File › Export…**) exports what is selected:
@@ -124,6 +125,23 @@ running, it asks first ("An export is running. Disconnecting cancels it and
 deletes the partial file."; Cancel is the default) and cancels the export.
 To change **No auto-rehash (-A)** or **Tables only, load once**, disconnect,
 change them and connect again.
+
+While a tab is connected and idle, sqlc-gui pings its server once a minute,
+so the server doesn't close the connection for inactivity (`wait_timeout`).
+If the connection is lost anyway (server restart, killed, network, the Mac
+slept), the next ping or query says so at once: the status line reads
+`Lost the connection to the server: ERROR 2006 (HY000): Server has gone away
+- press Reconnect.`, the bar shows `Connection lost: user@host...` and a
+**Reconnect** button appears at the right end of the status line. Nothing
+on screen is cleared: the editor's text, the results, the table list and the
+mode stay, and running SQL just repeats the hint until you reconnect.
+**Reconnect** opens a new connection with the same login, to the database
+that was in use (also after `USE`), keeps the sidebar selection and, if a
+table was being browsed, reads it again, leaving the editor's text as it was.
+The query that hit the lost connection isn't run again, press **Run** for
+that. Session state (variables, temporary tables, an open transaction) is
+gone with the old connection. If reconnecting fails, an error is shown and
+**Reconnect** stays; **Disconnect** goes back to the welcome screen.
 
 sqlc-gui keeps the login (including the password) in memory while you're
 connected, so an export can open its own connection (see [Export](#export)).
@@ -264,6 +282,28 @@ request fails, the switch stays on **AI**.
 
 Double-click a table in the sidebar to browse it; its grid can then be edited,
 with a toolbar below it.
+
+The rows of your own query (or one Claude wrote) can be edited the same way
+when every column is a plain column of one table in the current database:
+`SELECT * FROM orders WHERE total > 100`, `SELECT id, name AS n FROM
+customers ORDER BY n` and `SELECT o.* FROM orders o JOIN ...` all qualify. The server says
+where each column comes from, so aliases and any column order work. The
+toolbar names the table ("Rows of `orders`. ..."), and edits work as below
+with two differences: **Reload** runs the query again (the one that made the grid, not the editor's current text), and
+**Delete All Rows…** isn't offered, since the query may show only some of
+the rows. A grid stays read-only, with the reason in the toolbar, when:
+
+- a column is an expression (`COUNT(*)`, `price * qty`, a literal) or appears
+  twice, or the columns come from more than one table (`SELECT o.id, c.name ...`);
+- the query leaves out the primary key (or, without a key, leaves out some
+  columns), so a row can't be told apart from others: add the key to the
+  query;
+- the table is a view, or in another database (`SELECT * FROM other.t`);
+- the editor ran several statements (only a single result set is editable).
+
+Inserting a row into a grid that shows only some columns gives the others
+their defaults. After a change, the row is read back with the grid's
+columns.
 
 - **Edit a cell**: double-click it, type, and press **Return** to save
   (`UPDATE`), **Tab** / **Shift-Tab** to save and move to the next / previous
@@ -468,8 +508,9 @@ with the same structure / `DROP … IF EXISTS` / data options:
 writers' escaping/quoting, the database dump's header, comments, view
 ordering and table selection, Ask Claude's request/response handling, comment formatting and
 destructive-statement check, the row editor's value checks and generated
-SQL, the SQL tips' length, format and no-repeat pick, and the tab titles and
-running-jobs list (truncation, UTF-8) (no database or network needed).
+SQL, the SQL tips' length, format and no-repeat pick, the tab titles and
+running-jobs list (truncation, UTF-8), and which errors mean a lost
+connection (no database or network needed).
 
 `make export-test` exports an edge-case table in every format and checks the
 result: the SQL is re-imported into an empty database and compared with
@@ -495,8 +536,9 @@ a primary key and a read-only view, and the welcome screen at launch and after
 - A `;` at the end of a line inside a quoted string ends the statement early.
 - Column widths are counted in bytes, so non-ASCII text may misalign.
 - No `\G` vertical output, TLS options or prepared statements yet.
-- GUI: only a browsed table's grid (double-click in the sidebar) can be
-  edited, not the results of your own queries; it shows the first 1000 rows.
+- GUI: only rows from a single table can be edited (a browsed table, or a
+  query's rows from one table, see [Editing rows](#editing-rows)); a browse
+  shows the first 1000 rows.
   There's no syntax highlighting, and it always runs the whole editor (not just
   the selection). A running query can't be cancelled yet.
 - Database and multi-table export are SQL only and GUI only. The consistent

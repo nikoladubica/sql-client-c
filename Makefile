@@ -69,7 +69,8 @@ test: tests/profiles_test.c src/profiles.c src/profiles.h tests/export_test.c sr
       tests/ai_test.c src/ai.c src/ai.h src/json.c src/json.h \
       tests/row_edit_test.c src/row_edit.c src/row_edit.h \
       tests/sql_tips_test.c src/sql_tips.c src/sql_tips.h \
-      tests/tabs_test.c src/tabs.c src/tabs.h
+      tests/tabs_test.c src/tabs.c src/tabs.h \
+      tests/db_lost_test.c src/db.h
 	@mkdir -p $(BUILD)
 	$(CC) $(TEST_CFLAGS) -o $(BUILD)/profiles_test tests/profiles_test.c src/profiles.c
 	$(BUILD)/profiles_test $(BUILD)/test-profiles
@@ -83,6 +84,8 @@ test: tests/profiles_test.c src/profiles.c src/profiles.h tests/export_test.c sr
 	$(BUILD)/sql_tips_test
 	$(CC) $(TEST_CFLAGS) -o $(BUILD)/tabs_test tests/tabs_test.c src/tabs.c
 	$(BUILD)/tabs_test
+	$(CC) $(TEST_CFLAGS) $(CPPFLAGS) -o $(BUILD)/db_lost_test tests/db_lost_test.c
+	$(BUILD)/db_lost_test
 
 # Export round trip against a real server: SQL re-import, XML and CSV checks.
 # Creates and drops the databases test_sqlc_export_src and test_sqlc_export_dst.

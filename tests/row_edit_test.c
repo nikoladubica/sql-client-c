@@ -286,12 +286,101 @@ static void test_sql_no_pk(void) {
     free_set(&frow);
 }
 
+/* make_set's rows as a query returns them: real column names (NULL = an
+ * expression), as the server reports them in org_name */
+static void set_origin(db_set *s, const char *const *org) {
+    s->org_names = calloc(s->ncols, sizeof *s->org_names);
+    for (unsigned int c = 0; c < s->ncols; c++) s->org_names[c] = org[c] ? strdup(org[c]) : NULL;
+}
+
+static void free_origin(db_set *s) {
+    for (unsigned int c = 0; c < s->ncols; c++) free(s->org_names[c]);
+    free(s->org_names);
+    s->org_names = NULL;
+}
+
+/* A query's rows: some columns, any order, aliases (SELECT name AS n, id ...). */
+static void test_query_rows(void) {
+    const char *cols[] = {
+        "id", "int", "NO", "PRI", "auto_increment",
+        "name", "varchar", "YES", "", "",
+        "qty", "int", "YES", "", "",
+    };
+    db_set info = make_set(COLNAMES, 3, cols);
+    char err[256] = "";
+    char *sql;
+    table_info ti;
+
+    const char *names[] = { "n", "id", NULL };
+    const char *cells[] = { "Ann", "1" };
+    db_set rows = make_set(names, 1, cells);
+    const char *org[] = { "name", "id" };
+    set_origin(&rows, org);
+    CHECK(table_info_load(&ti, &info, &rows) == 0);
+    CHECK(ti.npk == 1 && !ti.whole && !ti.star);
+    EXPECT_STR(ti.cols[0].name, "name"); /* the real name, not the alias */
+    CHECK(ti.cols[1].primary);
+    sql = row_edit_update_sql("t", &ti, &rows, 0, 0, "Bo", &esc, err, sizeof err);
+    EXPECT_STR(sql, "UPDATE `t` SET `name` = 'Bo' WHERE `id` = '1' LIMIT 1;\n"
+                    "SELECT `name`, `id` FROM `t` WHERE `id` = '1' LIMIT 1");
+    free(sql);
+    unsigned char set1[] = { 1, 0 };
+    sql = row_edit_insert_sql("t", &ti, &rows, 0, set1, &esc, err, sizeof err);
+    EXPECT_STR(sql, "INSERT INTO `t` (`name`) VALUES ('Ann');\n"
+                    "SELECT `name`, `id` FROM `t` WHERE `id` = LAST_INSERT_ID() LIMIT 1");
+    free(sql);
+    table_info_free(&ti);
+    free_origin(&rows);
+
+    /* an expression (COUNT(*), a + 1) or a column twice: not editable */
+    const char *expr[] = { "name", NULL };
+    set_origin(&rows, expr);
+    CHECK(table_info_load(&ti, &info, &rows) == -1 && ti.ncols == 0);
+    free_origin(&rows);
+    const char *twice[] = { "id", "id" };
+    set_origin(&rows, twice);
+    CHECK(table_info_load(&ti, &info, &rows) == -1 && ti.ncols == 0);
+    free_origin(&rows);
+    free_set(&rows);
+
+    /* some columns without the key: loads, but rows can't be found again */
+    const char *one[] = { "name", NULL };
+    const char *ocell[] = { "Ann" };
+    db_set part = make_set(one, 1, ocell);
+    CHECK(table_info_load(&ti, &info, &part) == 0 && ti.npk == 0 && !ti.whole);
+    err[0] = 0;
+    sql = row_edit_update_sql("t", &ti, &part, 0, 0, "Bo", &esc, err, sizeof err);
+    CHECK(sql == NULL && strstr(err, "primary key"));
+    size_t r0 = 0;
+    sql = row_edit_delete_sql("t", &ti, &part, &r0, 1, &esc, err, sizeof err);
+    CHECK(sql == NULL);
+    table_info_free(&ti);
+    free_set(&part);
+    free_set(&info);
+
+    /* every column of a table without a key, reordered: matched on all of them */
+    const char *nk[] = { "a", "int", "YES", "", "", "b", "varchar", "YES", "", "" };
+    db_set nkinfo = make_set(COLNAMES, 2, nk);
+    const char *ba[] = { "b", "a", NULL };
+    const char *bacell[] = { "x", "1" };
+    db_set all = make_set(ba, 1, bacell);
+    CHECK(table_info_load(&ti, &nkinfo, &all) == 0 && ti.whole && !ti.star && ti.npk == 0);
+    sql = row_edit_update_sql("t", &ti, &all, 0, 0, "y", &esc, err, sizeof err);
+    EXPECT_STR(sql, "UPDATE `t` SET `b` = 'y' WHERE `b` <=> 'x' AND `a` <=> '1' LIMIT 1;\n"
+                    "SELECT `b`, `a` FROM `t` WHERE `b` <=> 'y' AND `a` <=> '1' LIMIT 1");
+    free(sql);
+    table_info_free(&ti);
+    free_set(&all);
+    free_set(&nkinfo);
+}
+
 int main(void) {
     test_kinds();
     test_normalize();
     test_info();
     test_sql_pk();
     test_sql_no_pk();
+    test_query_rows();
     if (failures) { fprintf(stderr, "row_edit_test: %d failure(s)\n", failures); return 1; }
     printf("row_edit_test: all passed\n");
     return 0;

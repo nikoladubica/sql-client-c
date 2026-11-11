@@ -101,6 +101,42 @@ static char *dup_or_null(const char *s, unsigned long len) {
  * type_col >= 0: skip rows whose value there contains "VIEW";
  * drop_col >= 0: leave that column out of the copy.
  */
+static int nonempty(const char *s) { return s && *s; }
+
+/* s->org_names, and s->org_table / org_db when every column is a real
+ * column of one table (see db_set). Out of memory just leaves it unset:
+ * the result is then read-only, nothing else depends on it. */
+static void collect_origin(const MYSQL_FIELD *fields, unsigned int n, int drop_col, db_set *s) {
+    if (s->ncols == 0) return;
+    s->org_names = calloc(s->ncols, sizeof *s->org_names);
+    if (!s->org_names) return;
+    const char *table = NULL, *db = NULL;
+    int one = 1;
+    for (unsigned int i = 0, o = 0; i < n; i++) {
+        if ((int)i == drop_col) continue;
+        const MYSQL_FIELD *f = &fields[i];
+        if (nonempty(f->org_name)) {
+            s->org_names[o] = strdup(f->org_name);
+            if (!s->org_names[o]) one = 0;
+        } else {
+            one = 0; /* an expression: COUNT(*), a + 1, 'x' */
+        }
+        o++;
+        if (!nonempty(f->org_table) || !nonempty(f->db)) { one = 0; continue; }
+        if (!table) { table = f->org_table; db = f->db; }
+        else if (strcmp(table, f->org_table) != 0 || strcmp(db, f->db) != 0) one = 0; /* a join */
+    }
+    if (one && table) {
+        s->org_table = strdup(table);
+        s->org_db = strdup(db);
+        if (!s->org_table || !s->org_db) {
+            free(s->org_table);
+            free(s->org_db);
+            s->org_table = s->org_db = NULL;
+        }
+    }
+}
+
 static int collect_rows(MYSQL_RES *res, db_set *s, size_t max_rows,
                         int type_col, int drop_col) {
     unsigned int src_cols = mysql_num_fields(res);
@@ -118,6 +154,7 @@ static int collect_rows(MYSQL_RES *res, db_set *s, size_t max_rows,
         s->numeric[o] = IS_NUM(fields[i].type);
         o++;
     }
+    collect_origin(fields, src_cols, drop_col, s);
 
     size_t cap = 0;
     MYSQL_ROW row;
@@ -199,9 +236,13 @@ void db_outcome_free(db_outcome *out) {
         db_set *s = &out->sets[i];
         for (unsigned int c = 0; c < s->ncols; c++) free(s->names ? s->names[c] : NULL);
         for (size_t k = 0; s->cells && k < s->nrows * s->ncols; k++) free(s->cells[k]);
+        for (unsigned int c = 0; s->org_names && c < s->ncols; c++) free(s->org_names[c]);
         free(s->names);
         free(s->numeric);
         free(s->cells);
+        free(s->org_names);
+        free(s->org_table);
+        free(s->org_db);
     }
     free(out->sets);
     free(out->error);
