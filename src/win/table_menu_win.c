@@ -11,6 +11,7 @@
 #include "ui.h"
 #include "ui_windows.h"
 #include "table_menu.h"
+#include "dlg_win.h"
 #include "win_util.h"
 
 /* ---------- context menu ---------- */
@@ -215,41 +216,6 @@ char *sqlc_clipboard_text(void) {
 
 /* ---------- text prompt: a dialog built in memory ---------- */
 
-typedef struct {
-    WORD *buf;
-    size_t n, cap;
-    int failed; /* out of memory: the template is incomplete, don't use it */
-} tmpl;
-
-static void t_put(tmpl *t, WORD w) {
-    if (t->failed) return;
-    if (t->n == t->cap) {
-        size_t ncap = t->cap ? t->cap * 2 : 512;
-        WORD *b = realloc(t->buf, ncap * sizeof *b);
-        if (!b) { t->failed = 1; return; }
-        t->buf = b;
-        t->cap = ncap;
-    }
-    t->buf[t->n++] = w;
-}
-
-static void t_dword(tmpl *t, DWORD d) { t_put(t, LOWORD(d)); t_put(t, HIWORD(d)); }
-static void t_str(tmpl *t, const WCHAR *s) { do t_put(t, *s); while (*s++); }
-static void t_align(tmpl *t) { if (t->n % 2) t_put(t, 0); } /* DWORD boundary */
-
-/* One control: class atom 0x80 button, 0x81 edit, 0x82 static. */
-static void t_item(tmpl *t, DWORD style, short x, short y, short cx, short cy, WORD id,
-                   WORD cls, const WCHAR *text) {
-    t_align(t);
-    t_dword(t, style | WS_CHILD | WS_VISIBLE);
-    t_dword(t, 0);           /* exStyle */
-    t_put(t, (WORD)x); t_put(t, (WORD)y); t_put(t, (WORD)cx); t_put(t, (WORD)cy);
-    t_put(t, id);
-    t_put(t, 0xFFFF); t_put(t, cls);
-    t_str(t, text);
-    t_put(t, 0);             /* no creation data */
-}
-
 #define ID_TITLE 200
 #define ID_MESSAGE 201
 #define ID_FIELD 202
@@ -295,57 +261,37 @@ static INT_PTR CALLBACK prompt_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
     return FALSE;
 }
 
-/* Lines a message needs at about 60 characters a line. */
-static int message_lines(const char *s) {
-    int lines = 1, col = 0;
-    for (; s && *s; s++) {
-        if (*s == '\n') { lines++; col = 0; continue; }
-        if ((*s & 0xC0) == 0x80) continue; /* UTF-8 continuation byte */
-        if (++col > 60) { lines++; col = 0; }
-    }
-    return lines;
-}
-
 static char *prompt(const char *title, const char *message, const char *initial,
                     const char *ok_label, int secure) {
     WCHAR *wt = sqlc_w_wide(title), *wm = sqlc_w_wide(message), *wi = sqlc_w_wide(initial),
           *wo = sqlc_w_wide(ok_label ? ok_label : "OK");
     char *out = NULL;
-    tmpl t = { 0 };
+    dlg_tmpl t = { 0 };
     if (!wt || !wm || !wi || !wo) goto done;
 
     const short W = 260, M = 7;          /* dialog units */
-    short msg_h = (short)(8 * message_lines(message));
+    short msg_h = (short)(8 * dlg_message_lines(message, 60));
     short y = M;
     short title_y = y; y += 10 + 4;
     short msg_y = y; y += msg_h + 6;
     short field_y = y; y += 14 + 10;
     short btn_y = y; y += 14 + M;
 
-    t_dword(&t, DS_MODALFRAME | DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU);
-    t_dword(&t, 0);
-    t_put(&t, 5);                         /* controls */
-    t_put(&t, 0); t_put(&t, 0); t_put(&t, (WORD)W); t_put(&t, (WORD)y);
-    t_put(&t, 0); t_put(&t, 0);           /* no menu, default class */
-    t_str(&t, L"sqlc");
-    t_put(&t, 9); t_str(&t, L"Segoe UI");
-
-    t_item(&t, SS_LEFT | SS_NOPREFIX, M, title_y, W - 2 * M, 10, ID_TITLE, 0x82, wt);
-    t_item(&t, SS_LEFT | SS_NOPREFIX, M, msg_y, W - 2 * M, msg_h, ID_MESSAGE, 0x82, wm);
-    t_item(&t, ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP | (secure ? ES_PASSWORD : 0),
-           M, field_y, W - 2 * M, 14, ID_FIELD, 0x81, L"");
-    t_item(&t, BS_DEFPUSHBUTTON | WS_TABSTOP, W - M - 50 - 4 - 50, btn_y, 50, 14, IDOK, 0x80, wo);
-    t_item(&t, BS_PUSHBUTTON | WS_TABSTOP, W - M - 50, btn_y, 50, 14, IDCANCEL, 0x80, L"Cancel");
-    if (t.failed || !t.buf) goto done;
+    dlg_begin(&t, W, y);
+    dlg_item(&t, SS_LEFT | SS_NOPREFIX, M, title_y, W - 2 * M, 10, ID_TITLE, DLG_STATIC, wt);
+    dlg_item(&t, SS_LEFT | SS_NOPREFIX, M, msg_y, W - 2 * M, msg_h, ID_MESSAGE, DLG_STATIC, wm);
+    dlg_item(&t, ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP | (secure ? ES_PASSWORD : 0),
+             M, field_y, W - 2 * M, 14, ID_FIELD, DLG_EDIT, L"");
+    dlg_item(&t, BS_DEFPUSHBUTTON | WS_TABSTOP, W - M - 50 - 4 - 50, btn_y, 50, 14, IDOK, DLG_BUTTON, wo);
+    dlg_item(&t, BS_PUSHBUTTON | WS_TABSTOP, W - M - 50, btn_y, 50, 14, IDCANCEL, DLG_BUTTON, L"Cancel");
 
     prompt_state ps = { wi, NULL };
-    if (DialogBoxIndirectParamW(GetModuleHandleW(NULL), (LPCDLGTEMPLATEW)t.buf, sqlc_w_owner(),
-                                prompt_proc, (LPARAM)&ps) == IDOK)
+    if (dlg_run(&t, prompt_proc, (LPARAM)&ps) == IDOK)
         out = ps.result;
     else
         free(ps.result);
 done:
-    free(t.buf);
+    dlg_free(&t);
     free(wt);
     free(wm);
     free(wi);

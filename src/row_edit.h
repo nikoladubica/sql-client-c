@@ -76,6 +76,17 @@ int row_edit_editable(const table_info *ti, unsigned int col);
 char *row_edit_normalize(const col_info *c, const char *text, int *is_null,
                          char *err, size_t errsize);
 
+/*
+ * The date (and time) a cell editor's calendar should show for typed text,
+ * read the way row_edit_normalize reads a date or datetime ("2024-1-5",
+ * "2024/01/05", "2024-01-05 9:30", "2024-01-05T09:30:00.5"; fractions are
+ * dropped), spaces around it ignored. 1 with the fields set (time 00:00:00
+ * when there is none), or 0 when it isn't a day a calendar has (empty
+ * text, "0000-00-00", February 30, ...).
+ */
+int row_edit_calendar_value(const char *text, int *year, int *month, int *day,
+                            int *hour, int *minute, int *second);
+
 /* Escapes len bytes of from into to (2 * len + 1 bytes), returns the length:
  * mysql_real_escape_string() in the app, which knows the server's sql_mode. */
 typedef unsigned long (*row_edit_escape_fn)(char *to, const char *from,

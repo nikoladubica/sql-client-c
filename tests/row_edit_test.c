@@ -374,6 +374,29 @@ static void test_query_rows(void) {
     free_set(&nkinfo);
 }
 
+static void test_calendar_value(void) {
+    int y, m, d, h, mi, s;
+    CHECK(row_edit_calendar_value("2024-01-05", &y, &m, &d, &h, &mi, &s));
+    CHECK(y == 2024 && m == 1 && d == 5 && h == 0 && mi == 0 && s == 0);
+    CHECK(row_edit_calendar_value("  2024/1/5  ", &y, &m, &d, &h, &mi, &s) && m == 1 && d == 5);
+    CHECK(row_edit_calendar_value("2024-01-05 9:30", &y, &m, &d, &h, &mi, &s) && h == 9 && mi == 30 && s == 0);
+    CHECK(row_edit_calendar_value("2024-01-05T23:59:58.25", &y, &m, &d, &h, &mi, &s) &&
+          h == 23 && mi == 59 && s == 58);
+    CHECK(row_edit_calendar_value("2024-01-05 ", &y, &m, &d, &h, &mi, &s) && h == 0);
+    CHECK(row_edit_calendar_value("2024-02-29", &y, &m, &d, &h, &mi, &s));   /* leap year */
+    CHECK(!row_edit_calendar_value("2023-02-29", &y, &m, &d, &h, &mi, &s));
+    CHECK(!row_edit_calendar_value("1900-02-29", &y, &m, &d, &h, &mi, &s));
+    CHECK(row_edit_calendar_value("2000-02-29", &y, &m, &d, &h, &mi, &s));
+    CHECK(!row_edit_calendar_value("2024-04-31", &y, &m, &d, &h, &mi, &s));
+    CHECK(!row_edit_calendar_value("0000-00-00", &y, &m, &d, &h, &mi, &s));
+    CHECK(!row_edit_calendar_value("2024-13-01", &y, &m, &d, &h, &mi, &s));
+    CHECK(!row_edit_calendar_value("2024-01-05 25:00", &y, &m, &d, &h, &mi, &s));
+    CHECK(!row_edit_calendar_value("2024-01-05x", &y, &m, &d, &h, &mi, &s));
+    CHECK(!row_edit_calendar_value("", &y, &m, &d, &h, &mi, &s));
+    CHECK(!row_edit_calendar_value(NULL, &y, &m, &d, &h, &mi, &s));
+    CHECK(!row_edit_calendar_value("NULL", &y, &m, &d, &h, &mi, &s));
+}
+
 int main(void) {
     test_kinds();
     test_normalize();
@@ -381,6 +404,7 @@ int main(void) {
     test_sql_pk();
     test_sql_no_pk();
     test_query_rows();
+    test_calendar_value();
     if (failures) { fprintf(stderr, "row_edit_test: %d failure(s)\n", failures); return 1; }
     printf("row_edit_test: all passed\n");
     return 0;

@@ -1,16 +1,19 @@
 /* Windows version of grid_edit.h: an edit control laid over the
- * double-clicked cell of a uiTable's list view, and a cell context menu.
- * Date columns get the same text field (no calendar on Windows yet). */
+ * double-clicked cell of a uiTable's list view, with a month calendar (and
+ * for date-and-time columns a time picker) in a popup under it for date
+ * columns, and a cell context menu. */
 
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "ui.h"
 #include "ui_windows.h"
 #include "grid_edit.h"
+#include "row_edit.h"
 #include "win_util.h"
 
 #define GRID_SUBCLASS_ID 0x5367
@@ -29,6 +32,10 @@ typedef struct grid_editor {
     HWND field;          /* open editor, or NULL */
     int row, col;
     int finishing;
+    grid_editor_kind kind;
+    HWND popup;          /* calendar popup (date columns), or NULL */
+    HWND cal, clock;     /* its month calendar and, for datetime, time picker */
+    int syncing;         /* field <-> calendar update in progress */
 } grid_editor;
 
 static void unref(grid_editor *e) {
@@ -87,7 +94,177 @@ static char *field_text(grid_editor *e) {
     return s;
 }
 
+/* ---------- the calendar popup ---------- */
+
+#define POPUP_CLASS L"sqlc_calendar_popup"
+#define POPUP_PAD 8 /* points */
+
+static void field_from_calendar(grid_editor *e);
+static int in_popup(grid_editor *e, HWND hwnd);
+static void finish(grid_editor *e, grid_end how);
+
+/* After the popup lost activation: if the keyboard went neither to the
+ * field nor into the popup, the user clicked elsewhere: end the edit. */
+static void check_blur(void *p) {
+    grid_editor *e = p;
+    if (!e->dead && e->field && !e->finishing) {
+        HWND f = GetFocus();
+        if (f != e->field && !in_popup(e, f)) finish(e, GRID_END_BLUR);
+    }
+    unref(e);
+}
+
+static LRESULT CALLBACK popup_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    grid_editor *e = (grid_editor *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE; /* the field keeps the keyboard */
+    case WM_ACTIVATE:
+        if (e && LOWORD(wp) == WA_INACTIVE) { /* a control in it had taken the focus */
+            e->refs++;
+            sqlc_w_post(check_blur, e);
+        }
+        break;
+    case WM_NOTIFY: {
+        const NMHDR *nm = (const NMHDR *)lp;
+        if (e && ((nm->hwndFrom == e->cal && nm->code == MCN_SELECT) ||
+                  (nm->hwndFrom == e->clock && nm->code == DTN_DATETIMECHANGE)))
+            field_from_calendar(e);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static int register_popup(void) {
+    static ATOM atom;
+    if (!atom) {
+        WNDCLASSW wc;
+        memset(&wc, 0, sizeof wc);
+        wc.lpfnWndProc = popup_proc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = POPUP_CLASS;
+        atom = RegisterClassW(&wc);
+    }
+    return atom != 0;
+}
+
+/* 1 if hwnd is the popup or inside it. */
+static int in_popup(grid_editor *e, HWND hwnd) {
+    return e->popup && hwnd && (hwnd == e->popup || IsChild(e->popup, hwnd));
+}
+
+/* Under the field (above it when there's no room below), on its screen. */
+static void place_popup(grid_editor *e) {
+    if (!e->popup || !e->field) return;
+    RECT f, p;
+    GetWindowRect(e->field, &f);
+    GetWindowRect(e->popup, &p);
+    int w = p.right - p.left, h = p.bottom - p.top;
+    MONITORINFO mi;
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    GetMonitorInfoW(MonitorFromWindow(e->field, MONITOR_DEFAULTTONEAREST), &mi);
+    int x = f.left, y = f.bottom + 2;
+    if (y + h > mi.rcWork.bottom && f.top - 2 - h >= mi.rcWork.top) y = f.top - 2 - h;
+    if (x + w > mi.rcWork.right) x = mi.rcWork.right - w;
+    if (x < mi.rcWork.left) x = mi.rcWork.left;
+    SetWindowPos(e->popup, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+/* Show the typed date (if it is one) in the calendar and clock. */
+static void calendar_from_field(grid_editor *e) {
+    if (!e->popup || e->syncing) return;
+    char *text = field_text(e);
+    int y, mo, d, h, mi, sec;
+    if (text && row_edit_calendar_value(text, &y, &mo, &d, &h, &mi, &sec)) {
+        SYSTEMTIME st = { (WORD)y, (WORD)mo, 0, (WORD)d, (WORD)h, (WORD)mi, (WORD)sec, 0 };
+        e->syncing = 1;
+        SendMessageW(e->cal, MCM_SETCURSEL, 0, (LPARAM)&st);
+        if (e->clock) SendMessageW(e->clock, DTM_SETSYSTEMTIME, GDT_VALID, (LPARAM)&st);
+        e->syncing = 0;
+    }
+    free(text);
+}
+
+/* The picked date (and time) into the field, and the keyboard back to it
+ * so Return saves and Escape cancels. */
+static void field_from_calendar(grid_editor *e) {
+    if (!e->field || e->syncing) return;
+    SYSTEMTIME day, time;
+    memset(&time, 0, sizeof time);
+    SendMessageW(e->cal, MCM_GETCURSEL, 0, (LPARAM)&day);
+    if (e->clock) SendMessageW(e->clock, DTM_GETSYSTEMTIME, 0, (LPARAM)&time);
+    WCHAR buf[32];
+    if (e->kind == GRID_EDITOR_DATE)
+        swprintf(buf, 32, L"%04u-%02u-%02u", day.wYear, day.wMonth, day.wDay);
+    else
+        swprintf(buf, 32, L"%04u-%02u-%02u %02u:%02u:%02u", day.wYear, day.wMonth, day.wDay,
+                 time.wHour, time.wMinute, time.wSecond);
+    e->syncing = 1;
+    SetWindowTextW(e->field, buf);
+    e->syncing = 0;
+    HWND root = GetAncestor(e->lv, GA_ROOT);
+    if (GetActiveWindow() != root) SetActiveWindow(root);
+    if (GetFocus() != e->field) {
+        e->finishing = 1; /* our own focus change */
+        SetFocus(e->field);
+        e->finishing = 0;
+    }
+    int len = GetWindowTextLengthW(e->field);
+    SendMessageW(e->field, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+}
+
+static void show_calendar(grid_editor *e) {
+    if (!register_popup()) return;
+    HWND root = GetAncestor(e->lv, GA_ROOT);
+    e->popup = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_CONTROLPARENT, POPUP_CLASS, L"",
+                               WS_POPUP | WS_BORDER, 0, 0, 10, 10, root, NULL, GetModuleHandleW(NULL), NULL);
+    if (!e->popup) return;
+    SetWindowLongPtrW(e->popup, GWLP_USERDATA, (LONG_PTR)e);
+    int pad = sqlc_w_scale(e->lv, POPUP_PAD);
+    e->cal = CreateWindowExW(0, MONTHCAL_CLASSW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                             pad, pad, 10, 10, e->popup, NULL, GetModuleHandleW(NULL), NULL);
+    RECT need = { 0 };
+    if (e->cal) MonthCal_GetMinReqRect(e->cal, &need);
+    int cw = need.right - need.left, ch = need.bottom - need.top;
+    if (e->cal) SetWindowPos(e->cal, NULL, pad, pad, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE);
+    int h = pad + ch + pad;
+    if (e->kind == GRID_EDITOR_DATETIME) {
+        int clock_h = sqlc_w_scale(e->lv, 24);
+        e->clock = CreateWindowExW(0, DATETIMEPICK_CLASSW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                   DTS_TIMEFORMAT | DTS_UPDOWN, pad, h, cw, clock_h, e->popup, NULL,
+                                   GetModuleHandleW(NULL), NULL);
+        if (e->clock) {
+            SendMessageW(e->clock, WM_SETFONT, SendMessageW(e->lv, WM_GETFONT, 0, 0), FALSE);
+            SendMessageW(e->clock, DTM_SETFORMATW, 0, (LPARAM)L"HH':'mm':'ss");
+        }
+        h += clock_h + pad;
+    }
+    /* start at the typed date, or today */
+    SYSTEMTIME today;
+    GetLocalTime(&today);
+    today.wHour = today.wMinute = today.wSecond = today.wMilliseconds = 0;
+    e->syncing = 1;
+    if (e->cal) SendMessageW(e->cal, MCM_SETCURSEL, 0, (LPARAM)&today);
+    if (e->clock) SendMessageW(e->clock, DTM_SETSYSTEMTIME, GDT_VALID, (LPARAM)&today);
+    e->syncing = 0;
+    calendar_from_field(e);
+    RECT wr = { 0, 0, pad + cw + pad, h };
+    AdjustWindowRectEx(&wr, WS_POPUP | WS_BORDER, FALSE, WS_EX_TOOLWINDOW);
+    SetWindowPos(e->popup, HWND_TOP, 0, 0, wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOACTIVATE);
+    place_popup(e);
+    ShowWindow(e->popup, SW_SHOWNOACTIVATE);
+}
+
 static void close_quietly(grid_editor *e) {
+    if (e->popup) {
+        HWND p = e->popup;
+        e->popup = e->cal = e->clock = NULL;
+        DestroyWindow(p);
+    }
     if (!e->field) return;
     HWND f = e->field;
     e->field = NULL;
@@ -116,6 +293,7 @@ static void place_field(grid_editor *e) {
     if (!e->field) return;
     RECT r = cell_rect(e, e->row, e->col);
     SetWindowPos(e->field, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
+    place_popup(e);
 }
 
 static void finish(grid_editor *e, grid_end how) {
@@ -151,7 +329,7 @@ static LRESULT CALLBACK field_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UI
         if (wp == '\r' || wp == '\t' || wp == 27) return 0; /* no beep */
         break;
     case WM_KILLFOCUS:
-        if (e->field == hwnd && !e->finishing) {
+        if (e->field == hwnd && !e->finishing && !in_popup(e, (HWND)wp)) {
             LRESULT r = DefSubclassProc(hwnd, msg, wp, lp);
             finish(e, GRID_END_BLUR); /* clicked elsewhere */
             return r;
@@ -164,7 +342,8 @@ static LRESULT CALLBACK field_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UI
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
-static void begin(grid_editor *e, int row, int col, const char *text, const char *placeholder) {
+static void begin(grid_editor *e, int row, int col, const char *text, const char *placeholder,
+                  grid_editor_kind kind) {
     close_quietly(e);
     int nrows = (int)SendMessageW(e->lv, LVM_GETITEMCOUNT, 0, 0);
     HWND header = (HWND)SendMessageW(e->lv, LVM_GETHEADER, 0, 0);
@@ -172,6 +351,7 @@ static void begin(grid_editor *e, int row, int col, const char *text, const char
     if (row < 0 || col < 0 || row >= nrows || col >= ncols) return;
     e->row = row;
     e->col = col;
+    e->kind = kind;
     SendMessageW(e->lv, LVM_ENSUREVISIBLE, (WPARAM)row, FALSE);
     /* scroll the column into view horizontally */
     RECT cr = cell_rect(e, row, col), client;
@@ -198,6 +378,7 @@ static void begin(grid_editor *e, int row, int col, const char *text, const char
     place_field(e);
     SetFocus(e->field);
     SendMessageW(e->field, EM_SETSEL, 0, -1);
+    if (kind != GRID_EDITOR_TEXT) show_calendar(e);
     e->finishing = 0;
 }
 
@@ -258,6 +439,12 @@ static LRESULT CALLBACK grid_proc(HWND lv, UINT msg, WPARAM wp, LPARAM lp, UINT_
         show_menu(e, p, row, col);
         return 0;
     }
+    case WM_COMMAND:
+        if ((HWND)lp == e->field && e->field && HIWORD(wp) == EN_CHANGE) {
+            calendar_from_field(e); /* typing moves the calendar */
+            return 0;
+        }
+        break;
     case WM_VSCROLL: case WM_HSCROLL: case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: case WM_SIZE: {
         LRESULT r = DefSubclassProc(lv, msg, wp, lp);
         place_field(e); /* keep the editor over its cell */
@@ -273,6 +460,8 @@ static LRESULT CALLBACK grid_proc(HWND lv, UINT msg, WPARAM wp, LPARAM lp, UINT_
     case WM_NCDESTROY:
         RemoveWindowSubclass(lv, grid_proc, id);
         e->dead = 1;
+        if (e->popup) DestroyWindow(e->popup); /* owned by the window, not the list view */
+        e->popup = e->cal = e->clock = NULL;
         e->field = NULL; /* destroyed with the list view */
         unref(e);
         break;
@@ -300,9 +489,8 @@ void sqlc_grid_enable_editing(uiTable *t, const grid_edit_callbacks *cb) {
 
 void sqlc_grid_begin_edit(uiTable *t, int row, int col, const char *text,
                           const char *placeholder, grid_editor_kind kind) {
-    (void)kind; /* dates are typed: no calendar on Windows yet */
     grid_editor *e = editor_of(t);
-    if (e && !e->dead) begin(e, row, col, text, placeholder);
+    if (e && !e->dead) begin(e, row, col, text, placeholder, kind);
 }
 
 void sqlc_grid_close_editor(uiTable *t) {
@@ -333,8 +521,8 @@ int sqlc_grid_editing(uiTable *t, int *row, int *col, char **text) {
 }
 
 int sqlc_grid_editor_has_calendar(uiTable *t) {
-    (void)t;
-    return 0;
+    grid_editor *e = editor_of(t);
+    return e && e->field && e->popup && e->cal;
 }
 
 void sqlc_grid_scroll_to_row(uiTable *t, int row) {
@@ -353,5 +541,13 @@ void sqlc_grid_test_finish(uiTable *t, const char *text, grid_end how) {
 }
 
 void sqlc_grid_test_pick_date(uiTable *t, const char *value) {
-    (void)t; (void)value; /* no calendar on Windows yet */
+    grid_editor *e = editor_of(t);
+    int y, mo, d, h, mi, sec;
+    if (!e || !e->cal || !row_edit_calendar_value(value, &y, &mo, &d, &h, &mi, &sec)) return;
+    SYSTEMTIME st = { (WORD)y, (WORD)mo, 0, (WORD)d, (WORD)h, (WORD)mi, (WORD)sec, 0 };
+    e->syncing = 1;
+    SendMessageW(e->cal, MCM_SETCURSEL, 0, (LPARAM)&st);
+    if (e->clock) SendMessageW(e->clock, DTM_SETSYSTEMTIME, GDT_VALID, (LPARAM)&st);
+    e->syncing = 0;
+    field_from_calendar(e);
 }

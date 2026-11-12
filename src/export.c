@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "platform.h"
 
@@ -443,6 +444,38 @@ void export_dump_basename(char *buf, size_t size, const char *db, size_t nselect
     if (!db || !*db) db = "database";
     if (nselected == 0) snprintf(buf, size, "%s", db);
     else snprintf(buf, size, "%s-%zu-table%s", db, nselected, nselected == 1 ? "" : "s");
+}
+
+/* 1 if name (up to its first '.') is a Windows device name. */
+static int reserved_device(const char *name) {
+    static const char *const fixed[] = { "CON", "PRN", "AUX", "NUL", NULL };
+    size_t len = strcspn(name, ".");
+    for (int i = 0; fixed[i]; i++)
+        if (len == 3 && strncasecmp(name, fixed[i], 3) == 0) return 1;
+    if (len == 4 && (strncasecmp(name, "COM", 3) == 0 || strncasecmp(name, "LPT", 3) == 0) &&
+        name[3] >= '1' && name[3] <= '9')
+        return 1;
+    return 0;
+}
+
+void export_safe_filename(char *buf, size_t size, const char *name) {
+    if (!buf || !size) return;
+    if (!name) name = "";
+    size_t o = 0;
+    if (reserved_device(name) && size > 1) buf[o++] = '_';
+    for (const char *p = name; *p; ) {
+        /* the whole UTF-8 sequence, or nothing */
+        unsigned char c = (unsigned char)*p;
+        size_t len = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        for (size_t k = 1; k < len; k++) if (!p[k]) { len = k; break; }
+        if (o + len >= size) break;
+        if (len == 1 && (c < 0x20 || c == 0x7F || strchr("/\\:*?\"<>|", c))) buf[o++] = '-';
+        else { memcpy(buf + o, p, len); o += len; }
+        p += len;
+    }
+    while (o > 0 && (buf[o - 1] == '.' || buf[o - 1] == ' ')) o--;
+    buf[o] = '\0';
+    if (o == 0) snprintf(buf, size, "export");
 }
 
 /* `name` with backticks doubled, as a string (malloc'd), or NULL. */

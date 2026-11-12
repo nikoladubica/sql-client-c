@@ -102,6 +102,13 @@ int export_select_names(size_t n, const char *const *names, size_t nsel,
  * A NULL or empty db is "database". Truncated to fit size. */
 void export_dump_basename(char *buf, size_t size, const char *db, size_t nselected);
 
+/* name made safe as a file name on Windows and macOS: / \ : * ? " < > |
+ * and control characters become '-', trailing dots and spaces go, a
+ * reserved device name (CON, NUL, COM1, LPT1, ..., also "nul.txt") gets a
+ * leading '_', and an empty result is "export". Truncated to fit size
+ * without splitting a UTF-8 character. */
+void export_safe_filename(char *buf, size_t size, const char *name);
+
 /*
  * The order to create n views in so that a view comes after the other views
  * its definition mentions (as `name`, the way SHOW CREATE VIEW quotes

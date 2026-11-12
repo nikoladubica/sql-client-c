@@ -181,6 +181,36 @@ static int parse_time(const char **p, int max_hours, int *neg, int *h, int *mi, 
     return 1;
 }
 
+static int days_in_month(int y, int m) {
+    static const int days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+    return days[m - 1];
+}
+
+int row_edit_calendar_value(const char *text, int *year, int *month, int *day,
+                            int *hour, int *minute, int *second) {
+    if (!text) return 0;
+    while (isspace((unsigned char)*text)) text++;
+    const char *p = text;
+    int y, m, d, neg, h = 0, mi = 0, s = 0;
+    char frac[16];
+    if (!parse_date(&p, &y, &m, &d)) return 0;
+    if (*p == ' ' || *p == 'T') {
+        const char *q = p + 1;
+        while (*q == ' ') q++;
+        if (*q) {
+            if (!parse_time(&q, 23, &neg, &h, &mi, &s, frac, sizeof frac)) return 0;
+            p = q;
+        }
+    }
+    while (isspace((unsigned char)*p)) p++;
+    if (*p) return 0;
+    if (y < 1 || m < 1 || d < 1 || d > days_in_month(y, m)) return 0;
+    *year = y; *month = m; *day = d;
+    *hour = h; *minute = mi; *second = s;
+    return 1;
+}
+
 char *row_edit_normalize(const col_info *c, const char *text, int *is_null,
                          char *err, size_t errsize) {
     *is_null = 0;

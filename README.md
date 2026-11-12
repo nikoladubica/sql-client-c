@@ -103,9 +103,9 @@ If you cloned without `--recursive`, the Makefile fetches the submodule for you
 
 ## Windows
 
-`sqlc-gui.exe` is the same GUI on Windows 10 and 11 (64-bit). The CLI isn't
-built for Windows. This is an early version: everything in [GUI](#gui) works
-except what is listed under [Not on Windows yet](#not-on-windows-yet).
+`sqlc-gui.exe` is the same GUI on Windows 10 and 11 (64-bit), with everything
+in [GUI](#gui). The CLI isn't built for Windows. This is an early version,
+not yet tried as widely as the macOS one.
 
 **Download:** each push builds it on GitHub Actions (workflow **Windows GUI**);
 the run's `sqlc-gui-windows-x64` artifact is a zip with `sqlc-gui.exe`, the
@@ -141,17 +141,16 @@ builds of MariaDB Connector/C and libcurl (set `WIN_DEPS_CFLAGS` and
 | Divider positions in the user defaults | Divider positions in the registry, `HKEY_CURRENT_USER\Software\sqlc` |
 | Spinner while connecting / loading tables | A moving progress bar |
 | Export saved message shows `~/...` | It shows the full path |
+| Export options in an alert, then the save panel | An **Export** dialog with the same options, then **Save As** (it asks before replacing a file) |
+| Calendar popover under a date cell's editor | A month calendar under it; for date and time columns a time field (up / down arrows) below the calendar |
 
 When a long job ends in the background, the taskbar button flashes instead
 of the Dock icon bouncing, with the Windows "asterisk" (or "exclamation" when
 it failed) sound.
 
-### Not on Windows yet
-
-- **Export** (table, database, selected tables): the menu items and buttons
-  are there but say it isn't available yet.
-- Date and time cells are edited as text: no calendar.
-- Tabs don't show their full title in a tooltip when it's cut short.
+The suggested export file name is the table's (or database's) name with the
+characters Windows doesn't allow in file names (`\ / : * ? " < > |`) turned
+into `-`; a name Windows reserves, like `con` or `nul`, gets a leading `_`.
 
 ## GUI
 
@@ -595,7 +594,7 @@ with the same structure / `DROP … IF EXISTS` / data options:
 | `src/main.c`, `src/complete.c` | CLI and its tab completion |
 | `src/gui.c` | GUI (libui-ng), shared by macOS and Windows |
 | `src/platform.c` | The file calls that differ between macOS and Windows: settings folder, UTF-8 paths, replacing a file in one step, temporary files, `getline`, random numbers (no UI) |
-| `src/win/` | The Windows versions of the `*.m` shims in this table, one `*_win.c` per header (Win32 / common controls on libui-ng's Windows API), `win_util.c` (UTF-8 / UTF-16, registry, fonts), and `sqlc.rc` / `sqlc.manifest` (common controls 6, DPI awareness, UTF-8 code page) |
+| `src/win/` | The Windows versions of the `*.m` shims in this table, one `*_win.c` per header (Win32 / common controls on libui-ng's Windows API), `win_util.c` (UTF-8 / UTF-16, registry, fonts), `dlg_win.c` (dialogs built in memory: prompts, export options), and `sqlc.rc` / `sqlc.manifest` (common controls 6, DPI awareness, UTF-8 code page) |
 | `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), File › New Tab (⌘T) and Close Tab (⌘W), which libui-ng lacks; small control sizes and widths; Return in a text field (the filter bar's value); the end-of-export sound, Dock bounce and alert |
 | `src/splitview.m` | Resizable panes (sidebar, editor / results, columns / indexes): an `NSSplitView` wrapped as a libui control |
 | `src/loading.m` | The loading spinner with a tip under it (connecting, refreshing tables): an `NSProgressIndicator` and a wrapping label wrapped as a libui control |
@@ -628,7 +627,8 @@ SQL, the browse page's `SELECT` (filter operators, escaping, `ORDER BY` the
 key, `OFFSET`), key columns and page labels, the SQL tips' length, format and no-repeat pick, the tab titles and
 running-jobs list (truncation, UTF-8), the sidebar search's name match, which errors mean a lost
 connection, and the platform file calls (replacing a file, temporary files,
-`getline`, UTF-8 file names) (no database or network needed).
+`getline`, UTF-8 file names), the export file name made safe for Windows, and
+the date a cell editor's calendar shows for typed text (no database or network needed).
 
 `make win-check` compiles the GUI for Windows without linking, and
 `make win-test` builds and runs the unit tests that work on Windows (platform,
@@ -678,8 +678,8 @@ and the welcome screen at launch and after **Disconnect**). It expects a databas
   the strip is cut off at the window's right edge (no scrolling or overflow
   menu yet): tabs past it, and **+**, can't be clicked until some are closed
   or the window is widened; ⌘T still opens a new tab.
-- Windows: see [Not on Windows yet](#not-on-windows-yet). `make gui-test`
-  and `make export-test` are macOS only.
+- Windows: `make gui-test` and `make export-test` are macOS only, so the
+  Windows GUI is checked by hand.
 - Ask Claude is GUI only (no `sqlc` CLI command yet), and the window is busy
   (Run disabled) until Claude answers; a request can't be cancelled.
 

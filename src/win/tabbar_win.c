@@ -1,6 +1,7 @@
 /* Windows version of tabbar.h: the window's tab strip, drawn with GDI in
  * system colors in a libui container (left-aligned tabs with a close x, a
- * "+" after the last one, middle click closes). Sizes match tabbar.m. */
+ * "+" after the last one, middle click closes, the full title as a
+ * tooltip). Sizes match tabbar.m. */
 
 #include <windows.h>
 #include <windowsx.h>
@@ -37,6 +38,8 @@ typedef struct SqlcTabBar {
     int press_index;
     int press_inside;
     int middle_index;       /* middle button down on this tab, or -1 */
+    HWND tips;              /* tooltip control: one tool per tab */
+    int ntips;              /* tools it has */
 } SqlcTabBar;
 
 static int px(SqlcTabBar *b, int points) { return sqlc_w_scale(b->hwnd, points); }
@@ -87,7 +90,30 @@ static hit_kind hit_at(SqlcTabBar *b, POINT p, int *index) {
     return HIT_NONE;
 }
 
+/* One tooltip tool per tab, over its rectangle; the text is asked for
+ * when shown (TTN_GETDISPINFO), so titles can change. */
+static void rebuild_tips(SqlcTabBar *b) {
+    if (!b->tips) return;
+    TOOLINFOW ti;
+    memset(&ti, 0, sizeof ti);
+    ti.cbSize = sizeof ti;
+    ti.hwnd = b->hwnd;
+    for (int i = 0; i < b->ntips; i++) {
+        ti.uId = (UINT_PTR)i;
+        SendMessageW(b->tips, TTM_DELTOOLW, 0, (LPARAM)&ti);
+    }
+    b->ntips = 0;
+    for (int i = 0; i < b->n; i++) {
+        ti.uFlags = TTF_SUBCLASS;
+        ti.uId = (UINT_PTR)i;
+        ti.rect = item_rect(b, i);
+        ti.lpszText = LPSTR_TEXTCALLBACKW;
+        if (SendMessageW(b->tips, TTM_ADDTOOLW, 0, (LPARAM)&ti)) b->ntips = i + 1;
+    }
+}
+
 static void changed(SqlcTabBar *b) {
+    rebuild_tips(b);
     b->press_kind = HIT_NONE;
     b->press_index = -1;
     b->middle_index = -1;
@@ -245,7 +271,17 @@ static LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT
         return 1;
     case WM_SIZE:
         InvalidateRect(hwnd, NULL, FALSE);
+        rebuild_tips(b); /* tab widths depend on the width */
         break;
+    case WM_NOTIFY: {
+        NMTTDISPINFOW *di = (NMTTDISPINFOW *)lp;
+        if (di->hdr.hwndFrom == b->tips && di->hdr.code == TTN_GETDISPINFOW) {
+            int i = (int)di->hdr.idFrom;
+            di->lpszText = i >= 0 && i < b->n ? b->titles[i] : (WCHAR *)L"";
+            return 0;
+        }
+        break;
+    }
     case WM_LBUTTONDOWN: mouse_down(b, p); return 0;
     case WM_MOUSEMOVE: mouse_move(b, p); return 0;
     case WM_LBUTTONUP: mouse_up(b, p); return 0;
@@ -270,6 +306,7 @@ static LRESULT CALLBACK bar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT
 
 static void SqlcTabBarDestroy(uiControl *c) {
     SqlcTabBar *b = SqlcTabBar(c);
+    if (b->tips) DestroyWindow(b->tips);
     for (int i = 0; i < b->n; i++) free(b->titles[i]);
     free(b->titles);
     uiWindowsEnsureDestroyWindow(b->hwnd);
@@ -299,6 +336,9 @@ uiControl *sqlc_new_tabbar(const sqlc_tabbar_callbacks *cb) {
     b->middle_index = -1;
     b->hwnd = uiWindowsMakeContainer(uiWindowsControl(b), on_resize);
     SetWindowSubclass(b->hwnd, bar_proc, 0x5374, (DWORD_PTR)b);
+    b->tips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                              CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                              b->hwnd, NULL, GetModuleHandleW(NULL), NULL);
     return uiControl(b);
 }
 

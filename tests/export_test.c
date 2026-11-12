@@ -474,6 +474,40 @@ static void test_progress_percent(void) {
     CHECK(pct(2, 2, 0, 18000000000000000000ULL, 0, 18000000000000000000ULL) < 100);
 }
 
+static void test_safe_filename(void) {
+    char b[64];
+    export_safe_filename(b, sizeof b, "orders");
+    CHECK(strcmp(b, "orders") == 0);
+    export_safe_filename(b, sizeof b, "a/b\\c:d*e?f\"g<h>i|j");
+    CHECK(strcmp(b, "a-b-c-d-e-f-g-h-i-j") == 0);
+    export_safe_filename(b, sizeof b, "tab\there");
+    CHECK(strcmp(b, "tab-here") == 0);
+    export_safe_filename(b, sizeof b, "trailing. . ");
+    CHECK(strcmp(b, "trailing") == 0);
+    export_safe_filename(b, sizeof b, "con");
+    CHECK(strcmp(b, "_con") == 0);
+    export_safe_filename(b, sizeof b, "NUL.sql");
+    CHECK(strcmp(b, "_NUL.sql") == 0);
+    export_safe_filename(b, sizeof b, "com1");
+    CHECK(strcmp(b, "_com1") == 0);
+    export_safe_filename(b, sizeof b, "console");
+    CHECK(strcmp(b, "console") == 0);
+    export_safe_filename(b, sizeof b, "com0");
+    CHECK(strcmp(b, "com0") == 0);
+    export_safe_filename(b, sizeof b, "");
+    CHECK(strcmp(b, "export") == 0);
+    export_safe_filename(b, sizeof b, NULL);
+    CHECK(strcmp(b, "export") == 0);
+    export_safe_filename(b, sizeof b, "...");
+    CHECK(strcmp(b, "export") == 0);
+    export_safe_filename(b, sizeof b, "\xC5\xA1ifre"); /* "šifre": kept */
+    CHECK(strcmp(b, "\xC5\xA1ifre") == 0);
+    export_safe_filename(b, 4, "a\xC5\xA1" "b"); /* room for "a" + 2 bytes: "aš" */
+    CHECK(strcmp(b, "a\xC5\xA1") == 0);
+    export_safe_filename(b, 3, "a\xC5\xA1" "b"); /* "š" doesn't fit whole: "a" */
+    CHECK(strcmp(b, "a") == 0);
+}
+
 static void test_format_duration(void) {
     char b[32];
     export_format_duration(b, sizeof b, 0); CHECK(strcmp(b, "0s") == 0);
@@ -603,6 +637,7 @@ int main(void) {
     test_view_order();
     test_select_names();
     test_dump_basename();
+    test_safe_filename();
     test_progress_percent();
     test_format_duration();
     test_format_count();

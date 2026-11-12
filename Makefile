@@ -142,7 +142,7 @@ win-test:
 	$(WIN_BUILD)/sidebar_test.exe
 
 win-check: $(WIN_SRC) $(WIN_HDR) $(WIN_LIBUI_LIB) $(WIN_BUILD)/sqlc_rc.o
-	$(WIN_CC) $(WIN_CFLAGS) $(WIN_DEPS_CFLAGS) -fsyntax-only $(WIN_SRC)
+	$(WIN_CC) $(WIN_CFLAGS) $(WIN_DEPS_CFLAGS) -Werror -fsyntax-only $(WIN_SRC)
 	@echo "win-check: compiled for Windows without warnings or errors"
 
 # ---- dev helpers ----
