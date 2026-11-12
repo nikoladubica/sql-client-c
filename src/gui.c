@@ -58,6 +58,7 @@
 #include "grid_edit.h"
 #include "loading.h"
 #include "row_edit.h"
+#include "sidebar.h"
 #include "table_menu.h"
 #include "profiles.h"
 #include "tabbar.h"
@@ -278,6 +279,7 @@ typedef struct tab {
     /* sidebar: list of tables in the current database */
     uiControl *split;        /* sidebar | Query / Structure */
     uiBox *side_box;
+    uiEntry *side_search;    /* filters the list by table name as you type */
     uiTable *side_table;
     set_model *side_model;
     db_outcome side_data;    /* the visible list (1 column) */
@@ -636,8 +638,9 @@ static void on_table_menu_action(table_menu_item item, int row, void *data);
 
 static int is_view(const char *type) { return type && strstr(type, "VIEW") != NULL; }
 
-/* Rebuild the visible table list from tables_raw and the "Hide views" box,
- * selecting the nkeep tables named in keep (those still in the list). */
+/* Rebuild the visible table list from tables_raw, the "Hide views" box and
+ * the search field (names containing its text, any case), selecting the
+ * nkeep tables named in keep (those still in the list). */
 static void rebuild_sidebar_keeping(tab *t, char *const *keep, size_t nkeep) {
     if (t->side_table) {
         uiBoxDelete(t->side_box, uiBoxNumChildren(t->side_box) - 1);
@@ -651,12 +654,13 @@ static void rebuild_sidebar_keeping(tab *t, char *const *keep, size_t nkeep) {
     t->side_index = NULL;
 
     int hide = uiCheckboxChecked(t->hide_views);
+    char *query = uiEntryText(t->side_search);
     const db_set *raw = t->tables_raw.nsets ? &t->tables_raw.sets[0] : NULL;
     size_t n = raw ? raw->nrows : 0;
 
     db_set *s = calloc(1, sizeof *s);
     t->side_index = calloc(n ? n : 1, sizeof *t->side_index);
-    if (!s || !t->side_index) { free(s); return; }
+    if (!s || !t->side_index) { free(s); uiFreeText(query); return; }
     s->has_rows = 1;
     s->ncols = 1;
     s->names = calloc(1, sizeof *s->names);
@@ -667,13 +671,14 @@ static void rebuild_sidebar_keeping(tab *t, char *const *keep, size_t nkeep) {
     for (size_t r = 0; r < n; r++) {
         const char *name = db_cell(raw, r, 0);
         const char *type = db_cell(raw, r, 1);
-        if (!name || (hide && is_view(type))) continue;
+        if (!name || (hide && is_view(type)) || !sidebar_name_matches(name, query)) continue;
         char buf[512];
         snprintf(buf, sizeof buf, is_view(type) ? "%s  (view)" : "%s", name);
         s->cells[s->nrows] = strdup(buf);
         t->side_index[s->nrows] = r;
         s->nrows++;
     }
+    uiFreeText(query);
     t->side_data.sets = s;
     t->side_data.nsets = 1;
 
@@ -2627,6 +2632,13 @@ static void on_export_db_menu(uiMenuItem *m, uiWindow *w, void *data) {
     export_database_flow(t);
 }
 
+/* Typing in the sidebar's search field: filter the list we have (no reload). */
+static void on_side_search(uiEntry *e, void *data) {
+    (void)e; tab *t = data;
+    rebuild_sidebar(t);
+    if (t->refreshing && t->side_table) sqlc_table_set_enabled(t->side_table, 0);
+}
+
 static void on_hide_views(uiCheckbox *c, void *data) {
     (void)c; tab *t = data;
     /* Views are filtered on the server, so turning this off needs a reload
@@ -3606,6 +3618,7 @@ static void on_disconnect(uiButton *b, void *data) {
     db_outcome_free(&t->tables_raw);
     t->tables_loaded = 0;
     uiButtonSetText(t->load_tables_btn, "Load tables");
+    uiEntrySetText(t->side_search, ""); /* no OnChanged: rebuilt just below */
     rebuild_sidebar_keeping(t, NULL, 0);
     browse_forget(t);
     free(t->pending_browse);
@@ -4580,6 +4593,9 @@ static void build_tab_page(tab *t) {
     t->export_btn = uiNewButton("Export\xE2\x80\xA6");
     uiButtonOnClicked(t->export_btn, on_export, t);
     uiBoxAppend(t->side_box, uiControl(t->export_btn), 0);
+    t->side_search = uiNewSearchEntry();
+    uiEntryOnChanged(t->side_search, on_side_search, t);
+    uiBoxAppend(t->side_box, uiControl(t->side_search), 0);
     /* spinner + tip while the list loads; before the list, which
      * rebuild_sidebar_keeping replaces as the box's last child */
     t->side_loading = sqlc_new_loading();

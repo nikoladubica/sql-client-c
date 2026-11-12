@@ -40,7 +40,8 @@ It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
   sidebar, with its engine, row estimate and collation; switching keeps the
   query, its results and the selection
 - Sidebar listing the tables in the current database, with a **Load tables** /
-  **Refresh tables** button; drag its right edge to resize it (every launch and new tab starts it at 360 points).
+  **Refresh tables** button and a **search field** that narrows the list to the tables whose
+  name contains what you type; drag its right edge to resize it (every launch and new tab starts it at 360 points).
   Shift-click selects a range of tables, ⌘-click adds or removes one (on a Mac,
   Ctrl-click is a right-click)
 - Double-click a table to browse it, 1000 rows a page (`SELECT * ... ORDER BY <key>
@@ -179,6 +180,15 @@ While the table list loads (**Load tables**, **Refresh tables**, or turning
 **Hide views** on or off), the list is dimmed and a spinner with a SQL tip shows
 above it in the sidebar. The tip wraps to as many lines as the sidebar's width
 needs. The list reloaded after each query doesn't show it.
+
+The **search field** above the table list filters it as you type: only the
+tables (and views) whose name contains the text are listed, upper or lower
+case alike (`ord` finds `Orders` and `order_items`); spaces before and after
+the text are ignored, and `%` and `_` are plain characters. Clear the field
+(or press its **x**) to see every table again. The filter stays on when the
+list reloads (after a query, **Refresh tables**, **Hide views**). A selected
+table the filter hides is no longer selected, so with none left **Export…**
+exports the whole database. **Disconnect** clears the field.
 
 The sidebar selects several tables with Shift-click (a range) and ⌘-click
 (add or remove one); Ctrl-click is a right-click on a Mac. The selection is
@@ -536,6 +546,7 @@ with the same structure / `DROP … IF EXISTS` / data options:
 | `src/loading.m` | The loading spinner with a tip under it (connecting, refreshing tables): an `NSProgressIndicator` and a wrapping label wrapped as a libui control |
 | `src/sql_tips.c` | The 50 SQL tips shown while connecting or loading tables, and the no-repeat random pick |
 | `src/tabs.c` | Tab titles and the quit / close-tab list of running jobs (no UI) |
+| `src/sidebar.c` | The sidebar search field's name match (no UI) |
 | `src/tabbar.m` | The window's tab strip: left-aligned tabs with a close button, "+", middle click to close; a custom `NSView` wrapped as a libui control |
 | `src/segmented.m` | The Normal / AI / Structure switch: an `NSSegmentedControl` wrapped as a libui control |
 | `src/export.c` | Streaming SQL / CSV / XML writers, the progress bar's value, time and count formatting, and the temporary file an export is written to (no database code) |
@@ -559,7 +570,7 @@ ordering and table selection, Ask Claude's request/response handling, comment fo
 destructive-statement check, the row editor's value checks and generated
 SQL, the browse page's `SELECT` (filter operators, escaping, `ORDER BY` the
 key, `OFFSET`), key columns and page labels, the SQL tips' length, format and no-repeat pick, the tab titles and
-running-jobs list (truncation, UTF-8), and which errors mean a lost
+running-jobs list (truncation, UTF-8), the sidebar search's name match, and which errors mean a lost
 connection (no database or network needed).
 
 `make export-test` exports an edge-case table in every format and checks the

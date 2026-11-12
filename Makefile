@@ -40,11 +40,11 @@ GUI_BIN := sqlc-gui
 GUI_SRC := src/gui.c src/db.c src/profiles.c src/macos_menu.m src/splitview.m src/segmented.m \
            src/export.c src/export_db.c src/export_dialog.m src/table_menu.m \
            src/ai.c src/ai_db.c src/json.c src/row_edit.c src/grid_edit.m \
-           src/sql_tips.c src/loading.m src/tabs.c src/tabbar.m src/browse.c
+           src/sql_tips.c src/loading.m src/tabs.c src/tabbar.m src/browse.c src/sidebar.c
 GUI_HDR := src/db.h src/profiles.h src/macos_menu.h src/splitview.h src/segmented.h \
            src/export.h src/export_db.h src/export_dialog.h src/table_menu.h \
            src/ai.h src/ai_db.h src/json.h src/row_edit.h src/grid_edit.h \
-           src/sql_tips.h src/loading.h src/tabs.h src/tabbar.h src/browse.h
+           src/sql_tips.h src/loading.h src/tabs.h src/tabbar.h src/browse.h src/sidebar.h
 GUI_LIBS := $(LIBUI_LIB) -framework Foundation -framework AppKit -lobjc -lcurl
 
 gui: $(GUI_BIN)
@@ -71,6 +71,7 @@ test: tests/profiles_test.c src/profiles.c src/profiles.h tests/export_test.c sr
       tests/browse_test.c src/browse.c src/browse.h \
       tests/sql_tips_test.c src/sql_tips.c src/sql_tips.h \
       tests/tabs_test.c src/tabs.c src/tabs.h \
+      tests/sidebar_test.c src/sidebar.c src/sidebar.h \
       tests/db_lost_test.c src/db.h
 	@mkdir -p $(BUILD)
 	$(CC) $(TEST_CFLAGS) -o $(BUILD)/profiles_test tests/profiles_test.c src/profiles.c
@@ -87,6 +88,8 @@ test: tests/profiles_test.c src/profiles.c src/profiles.h tests/export_test.c sr
 	$(BUILD)/sql_tips_test
 	$(CC) $(TEST_CFLAGS) -o $(BUILD)/tabs_test tests/tabs_test.c src/tabs.c
 	$(BUILD)/tabs_test
+	$(CC) $(TEST_CFLAGS) -o $(BUILD)/sidebar_test tests/sidebar_test.c src/sidebar.c
+	$(BUILD)/sidebar_test
 	$(CC) $(TEST_CFLAGS) $(CPPFLAGS) -o $(BUILD)/db_lost_test tests/db_lost_test.c
 	$(BUILD)/db_lost_test
 
