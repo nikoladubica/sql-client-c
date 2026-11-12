@@ -2,13 +2,12 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/stat.h>
-#include <unistd.h>
+
+#include "platform.h"
 
 #define MAX_NAME 128
 
@@ -41,14 +40,13 @@ static int profile_copy(profile *dst, const profile *src) {
 
 char *config_path(const char *file) {
     const char *dir = getenv("SQLC_CONFIG_DIR");
-    char buf[4096];
-    if (dir && *dir) {
-        snprintf(buf, sizeof buf, "%s/%s", dir, file);
-    } else {
-        const char *home = getenv("HOME");
-        if (!home || !*home) { errno = ENOENT; return NULL; }
-        snprintf(buf, sizeof buf, "%s/Library/Application Support/sqlc/%s", home, file);
+    char buf[4096], base[4096];
+    if (!dir || !*dir) {
+        if (plat_config_dir(base, sizeof base) != 0) return NULL;
+        dir = base;
     }
+    int n = snprintf(buf, sizeof buf, "%s%c%s", dir, PLAT_SEP, file);
+    if (n < 0 || (size_t)n >= sizeof buf) { errno = ENAMETOOLONG; return NULL; }
     return strdup(buf);
 }
 
@@ -145,14 +143,14 @@ static int flush(profile_list *pl, profile *cur, int *have) {
 
 int profiles_load(const char *path, profile_list *out) {
     memset(out, 0, sizeof *out);
-    FILE *f = fopen(path, "r");
+    FILE *f = plat_fopen(path, "rb");
     if (!f) return errno == ENOENT ? 0 : -1;
 
     profile cur = { 0 };
     int have = 0, rc = 0;
     char *line = NULL;
     size_t cap = 0;
-    while (rc == 0 && getline(&line, &cap, f) != -1) {
+    while (rc == 0 && plat_getline(&line, &cap, f) != -1) {
         line[strcspn(line, "\r\n")] = '\0';
         char *s = line; /* leading space only: a password may end in spaces */
         while (isspace((unsigned char)*s)) s++;
@@ -225,14 +223,15 @@ static int mkdir_parents(const char *path) {
     char buf[4096];
     if (strlen(path) >= sizeof buf) { errno = ENAMETOOLONG; return -1; }
     strcpy(buf, path);
-    char *slash = strrchr(buf, '/');
+    char *slash = NULL;
+    for (char *p = buf; *p; p++) if (plat_is_sep(*p)) slash = p;
     if (!slash || slash == buf) return 0;
     *slash = '\0';
     for (char *p = buf + 1; ; p++) {
-        if (*p == '/' || *p == '\0') {
+        if (plat_is_sep(*p) || *p == '\0') {
             char c = *p;
             *p = '\0';
-            if (mkdir(buf, 0700) != 0 && errno != EEXIST) return -1;
+            if (plat_mkdir(buf) != 0) return -1;
             if (!c) break;
             *p = c;
         }
@@ -245,23 +244,21 @@ static int write_private(const char *path, void (*fill)(FILE *, const void *), c
     if (mkdir_parents(path) != 0) return -1;
 
     char tmp[4096];
-    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) {
+    if (snprintf(tmp, sizeof tmp, "%s.tmp-XXXXXX", path) >= (int)sizeof tmp) {
         errno = ENAMETOOLONG;
         return -1;
     }
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) return -1;
-    FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); unlink(tmp); return -1; }
+    FILE *f = plat_mkstemp(tmp, 1);
+    if (!f) return -1;
 
     fill(f, data);
 
-    int err = ferror(f) || fflush(f) != 0 || fsync(fd) != 0;
+    int err = ferror(f) || plat_fsync(f) != 0;
     int saved = errno;
     if (fclose(f) != 0) { err = 1; saved = errno; }
-    if (err || rename(tmp, path) != 0) {
+    if (err || plat_replace(tmp, path) != 0) {
         if (!err) saved = errno;
-        unlink(tmp);
+        plat_unlink(tmp);
         errno = saved;
         return -1;
     }
@@ -305,11 +302,11 @@ int secret_write(const char *path, const char *value) {
 }
 
 char *secret_read(const char *path) {
-    FILE *f = fopen(path, "r");
+    FILE *f = plat_fopen(path, "rb");
     if (!f) return NULL;
     char *line = NULL;
     size_t cap = 0;
-    ssize_t n = getline(&line, &cap, f);
+    long n = plat_getline(&line, &cap, f);
     fclose(f);
     if (n <= 0) { free(line); return NULL; }
     line[strcspn(line, "\r\n")] = '\0';
@@ -318,5 +315,5 @@ char *secret_read(const char *path) {
 }
 
 int secret_remove(const char *path) {
-    return unlink(path) == 0 || errno == ENOENT ? 0 : -1;
+    return plat_unlink(path) == 0 || errno == ENOENT ? 0 : -1;
 }

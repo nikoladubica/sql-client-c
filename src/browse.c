@@ -178,7 +178,7 @@ static void thousands(char *out, size_t size, unsigned long long v) {
     char digits[32];
     int n = snprintf(digits, sizeof digits, "%llu", v);
     if (n < 0 || (size_t)n >= sizeof digits) { snprintf(out, size, "%llu", v); return; }
-    char tmp[48];
+    char tmp[32]; /* at most 20 digits and 6 commas */
     size_t o = 0;
     for (int i = 0; i < n; i++) {
         if (i > 0 && (n - i) % 3 == 0) tmp[o++] = ',';

@@ -57,6 +57,7 @@
 #include "export_dialog.h"
 #include "grid_edit.h"
 #include "loading.h"
+#include "platform.h"
 #include "row_edit.h"
 #include "sidebar.h"
 #include "table_menu.h"
@@ -65,6 +66,19 @@
 #include "tabs.h"
 
 #define GUI_MAX_ROWS 10000 /* rows kept per result set in the grid */
+
+/* What differs in the GUI's text between macOS and Windows. */
+#ifdef _WIN32
+#define KEY_RUN "Ctrl+Enter"
+#define KEY_MULTI_SELECT "Ctrl-click or Shift-click"
+#define SETTINGS_DIR "%APPDATA%\\sqlc"
+#define LOGIN_ENV "USERNAME"
+#else
+#define KEY_RUN "\xE2\x8C\x98\xE2\x86\xA9" /* ⌘↩ */
+#define KEY_MULTI_SELECT "\xE2\x8C\x98-click or \xE2\x87\xA7-click" /* ⌘-click or ⇧-click */
+#define SETTINGS_DIR "~/Library/Application Support/sqlc"
+#define LOGIN_ENV "USER"
+#endif
 #define AI_KEY_FILE "claude-api-key" /* in the config folder, mode 0600 */
 #define AI_SCHEMA_BYTES (200u * 1024) /* schema text sent to Claude, at most about */
 
@@ -412,7 +426,7 @@ static int quit_if_done(void) {
     return 1;
 }
 
-static void set_status(tab *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void set_status(tab *t, const char *fmt, ...) PLAT_PRINTF(2, 3);
 static void set_status(tab *t, const char *fmt, ...) {
     char buf[1024];
     va_list ap;
@@ -753,7 +767,7 @@ static void update_conn_label(tab *t) {
 
 /* Start a loading indicator with a random SQL tip, never the last one shown. */
 static void start_loading_with_tip(uiControl *loading) {
-    app.last_tip = sql_tip_pick(app.last_tip, (unsigned long)arc4random());
+    app.last_tip = sql_tip_pick(app.last_tip, plat_random());
     const char *tip = sql_tip(app.last_tip);
     char buf[SQL_TIP_MAX_LEN + 16];
     snprintf(buf, sizeof buf, "Tip: %s", tip ? tip : "");
@@ -1328,7 +1342,7 @@ static int start_browse(tab *t, const char *name, const char *col, browse_op op,
 static void browse_page(tab *t, unsigned long long offset);
 static void rows_done(tab *t, job *j);
 
-static void show_message_page(tab *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void show_message_page(tab *t, const char *fmt, ...) PLAT_PRINTF(2, 3);
 static void show_message_page(tab *t, const char *fmt, ...) {
     char buf[1024];
     va_list ap;
@@ -1675,7 +1689,11 @@ static void notify_export(tab *t, const char *title, const char *message, int fa
 static void notify_export_done(tab *t, const job *j) {
     char took[32], rows[40], where[1024], msg[2048];
     export_format_duration(took, sizeof took, j->seconds);
-    export_tilde_path(where, sizeof where, j->path, getenv("HOME"));
+#ifdef _WIN32
+    export_tilde_path(where, sizeof where, j->path, NULL); /* no "~" on Windows */
+#else
+    export_tilde_path(where, sizeof where, j->path, plat_home());
+#endif
     if (j->kind == JOB_EXPORT) {
         export_format_count(rows, sizeof rows, j->rows);
         snprintf(msg, sizeof msg, "Export finished in %s - %s row%s of %s, saved to %s.",
@@ -2267,7 +2285,7 @@ static void on_run_menu(tab *t) {
         return;
     }
     if (t->mode == MODE_STRUCTURE) { /* the editor is hidden: don't run it unseen */
-        set_status(t, "Switch to Normal to run SQL (\xE2\x8C\x98\xE2\x86\xA9 runs the editor there).");
+        set_status(t, "Switch to Normal to run SQL (" KEY_RUN " runs the editor there).");
         return;
     }
     char *sql = uiMultilineEntryText(t->editor);
@@ -2289,7 +2307,7 @@ static void on_run(uiButton *b, void *data) {
 
 static const char AI_KEY_MESSAGE[] =
     "Paste your Anthropic API key (from console.anthropic.com). It is saved in "
-    "sqlc's settings folder (~/Library/Application Support/sqlc), readable only by you.\n\n"
+    "sqlc's settings folder (" SETTINGS_DIR "), readable only by you.\n\n"
     "When you ask Claude, sqlc sends your request, the server version and the current "
     "database's table and column names, types and keys to the Claude API. Row data is "
     "never sent.";
@@ -3042,7 +3060,7 @@ static void delete_selected_rows(tab *t) {
     if (!rows) return;
     if (nsaved == 0 && !drop_new) {
         free(rows);
-        set_status(t, "Select the rows to delete first (\xE2\x8C\x98-click or \xE2\x87\xA7-click selects several).");
+        set_status(t, "Select the rows to delete first (" KEY_MULTI_SELECT " selects several).");
         return;
     }
     for (size_t i = 1; i < nsaved; i++) /* ascending, for removing them later */
@@ -4456,15 +4474,38 @@ static int on_should_quit(void *data) {
 
 /* ---------- layout ---------- */
 
-/* The libui menus (File, AI); New Tab / Close Tab, Edit and Query are added
- * by sqlc_install_menus once the window exists. Menu items act on the tab
- * in front. */
+#ifdef _WIN32
+/* libui can't add menus once the window exists on Windows, so New Tab,
+ * Close Tab and Query > Run are plain libui items here; their shortcuts
+ * come from sqlc_install_menus (menu_win.c). */
+static void menu_run(void);
+static void menu_new_tab(void);
+static void menu_close_tab(void);
+static void on_new_tab_item(uiMenuItem *m, uiWindow *w, void *d) { (void)m; (void)w; (void)d; menu_new_tab(); }
+static void on_close_tab_item(uiMenuItem *m, uiWindow *w, void *d) { (void)m; (void)w; (void)d; menu_close_tab(); }
+static void on_run_item(uiMenuItem *m, uiWindow *w, void *d) { (void)m; (void)w; (void)d; menu_run(); }
+#endif
+
+/* The libui menus (File, AI); on macOS New Tab / Close Tab, Edit and Query
+ * are added by sqlc_install_menus once the window exists. Menu items act
+ * on the tab in front. */
 static void build_menus(void) {
     uiMenu *file = uiNewMenu("File");
+#ifdef _WIN32
+    uiMenuItemOnClicked(uiMenuAppendItem(file, "New Tab\tCtrl+T"), on_new_tab_item, NULL);
+    uiMenuItemOnClicked(uiMenuAppendItem(file, "Close Tab\tCtrl+W"), on_close_tab_item, NULL);
+    uiMenuAppendSeparator(file);
+#endif
     uiMenuItemOnClicked(uiMenuAppendItem(file, "Export\xE2\x80\xA6"), on_export_menu, NULL);
     uiMenuItemOnClicked(uiMenuAppendItem(file, "Export Database\xE2\x80\xA6"), on_export_db_menu, NULL);
-    uiMenuAppendSeparator(file);
+#ifndef _WIN32
+    uiMenuAppendSeparator(file); /* libui adds one before Quit on Windows */
+#endif
     uiMenuAppendQuitItem(file);
+#ifdef _WIN32
+    uiMenu *query = uiNewMenu("Query");
+    uiMenuItemOnClicked(uiMenuAppendItem(query, "Run\tCtrl+Enter"), on_run_item, NULL);
+#endif
     uiMenu *ai = uiNewMenu("AI");
     uiMenuItemOnClicked(uiMenuAppendItem(ai, "Ask Claude"), on_ask_claude_menu, NULL);
     uiMenuAppendSeparator(ai);
@@ -4505,7 +4546,7 @@ static void build_tab_page(tab *t) {
     t->user = uiNewEntry();
     t->pass = uiNewPasswordEntry();
     t->db   = uiNewEntry();
-    const char *login = getenv("USER");
+    const char *login = getenv(LOGIN_ENV);
     if (login) uiEntrySetText(t->user, login);
     t->remember_pw = uiNewCheckbox("Remember password");
     uiCheckboxSetChecked(t->remember_pw, 1);
@@ -4659,7 +4700,7 @@ static void build_tab_page(tab *t) {
 
     uiBox *run_row = uiNewHorizontalBox();
     uiBoxSetPadded(run_row, 1);
-    t->run_btn = uiNewButton("Run (\xE2\x8C\x98\xE2\x86\xA9)"); /* "Run (⌘↩)" */
+    t->run_btn = uiNewButton("Run (" KEY_RUN ")");
     uiButtonOnClicked(t->run_btn, on_run, t);
     uiBoxAppend(run_row, uiControl(t->run_btn), 0);
     uiBoxAppend(run_row, uiControl(uiNewLabel("Double-click a table to browse it. "
@@ -4677,7 +4718,7 @@ static void build_tab_page(tab *t) {
     uiBoxAppend(ai_box, uiControl(t->ai_task), 1);
     uiBox *ai_row = uiNewHorizontalBox();
     uiBoxSetPadded(ai_row, 1);
-    t->ai_btn = uiNewButton("Ask Claude (\xE2\x8C\x98\xE2\x86\xA9)"); /* "Ask Claude (⌘↩)" */
+    t->ai_btn = uiNewButton("Ask Claude (" KEY_RUN ")");
     uiButtonOnClicked(t->ai_btn, on_ask_claude, t);
     uiBoxAppend(ai_row, uiControl(t->ai_btn), 0);
     uiBoxAppend(ai_row, uiControl(uiNewLabel("The SQL appears in the editor (Normal view); "

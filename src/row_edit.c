@@ -7,6 +7,18 @@
 #include <string.h>
 #include <strings.h>
 
+#include "platform.h"
+
+/* 1 if needle appears in s ignoring ASCII case (strcasestr isn't in
+ * Windows' C library). NULL s: 0. */
+static int contains_ci(const char *s, const char *needle) {
+    if (!s) return 0;
+    size_t n = strlen(needle);
+    for (; *s; s++)
+        if (strncasecmp(s, needle, n) == 0) return 1;
+    return 0;
+}
+
 /* ---------- column kinds ---------- */
 
 col_kind row_edit_kind(const char *t, int *approx) {
@@ -73,11 +85,11 @@ int table_info_load(table_info *ti, const db_set *columns, const db_set *rows) {
         ci->kind = row_edit_kind(db_cell(columns, r, 1), &ci->approx);
         ci->nullable = nullable && strcasecmp(nullable, "YES") == 0;
         ci->primary = key && strcmp(key, "PRI") == 0;
-        ci->auto_increment = extra && strcasestr(extra, "auto_increment") != NULL;
+        ci->auto_increment = contains_ci(extra, "auto_increment");
         /* "VIRTUAL GENERATED", "STORED GENERATED", "PERSISTENT"; not MySQL's
          * DEFAULT_GENERATED (an expression default, still writable) */
-        ci->generated = extra && (strcasestr(extra, "VIRTUAL") || strcasestr(extra, "STORED") ||
-                                  strcasestr(extra, "PERSISTENT"));
+        ci->generated = contains_ci(extra, "VIRTUAL") || contains_ci(extra, "STORED") ||
+                        contains_ci(extra, "PERSISTENT");
         if (ci->primary) ti->npk++;
     }
     free(used);
@@ -97,7 +109,7 @@ int row_edit_editable(const table_info *ti, unsigned int col) {
 
 /* ---------- typed values ---------- */
 
-static void set_err(char *err, size_t n, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void set_err(char *err, size_t n, const char *fmt, ...) PLAT_PRINTF(3, 4);
 static void set_err(char *err, size_t n, const char *fmt, ...) {
     if (!err || !n) return;
     va_list ap;

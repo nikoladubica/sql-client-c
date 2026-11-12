@@ -1,0 +1,7 @@
+// sqlc-gui.exe resources: the application manifest (Common Controls 6, DPI
+// awareness, UTF-8 code page). libui-ng is linked statically, so the
+// manifest has to come from the application.
+#pragma code_page(65001)
+
+// 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST
+1 24 "sqlc.manifest"

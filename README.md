@@ -2,8 +2,9 @@
 
 A small MySQL / MariaDB client written in C, built on
 [MariaDB Connector/C](https://mariadb.com/kb/en/mariadb-connector-c/).
-It comes as a command-line client (`sqlc`) and a simple native macOS GUI
-(`sqlc-gui`, built with [libui-ng](https://github.com/libui-ng/libui-ng)).
+It comes as a command-line client (`sqlc`) and a simple native GUI
+(`sqlc-gui`, built with [libui-ng](https://github.com/libui-ng/libui-ng)) for
+macOS and, as an early version, Windows (see [Windows](#windows)).
 It works with both MariaDB and MySQL servers and runs natively on Apple Silicon.
 
 ## Features
@@ -99,6 +100,58 @@ make compile_flags.txt   # optional: include paths for clangd / your editor
 
 If you cloned without `--recursive`, the Makefile fetches the submodule for you
 (or run `git submodule update --init`).
+
+## Windows
+
+`sqlc-gui.exe` is the same GUI on Windows 10 and 11 (64-bit). The CLI isn't
+built for Windows. This is an early version: everything in [GUI](#gui) works
+except what is listed under [Not on Windows yet](#not-on-windows-yet).
+
+**Download:** each push builds it on GitHub Actions (workflow **Windows GUI**);
+the run's `sqlc-gui-windows-x64` artifact is a zip with `sqlc-gui.exe`, the
+DLLs it needs and MariaDB's authentication plugins (in `plugin`). Unzip it
+anywhere and run `sqlc-gui.exe`; keep the files together.
+
+**Build** in an [MSYS2](https://www.msys2.org) UCRT64 shell:
+
+```sh
+pacman -S make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf \
+          mingw-w64-ucrt-x86_64-libmariadbclient mingw-w64-ucrt-x86_64-curl
+git clone --recursive https://github.com/nikoladubica/sql-client-c.git
+cd sql-client-c
+make windows    # builds ./sqlc-gui.exe
+make win-test   # the unit tests that run on Windows (no database needed)
+```
+
+On macOS or Linux, `make win-check` compiles everything for Windows with
+MinGW-w64 (`brew install mingw-w64`) without linking, as a quick check that a
+change still builds there; `make windows` cross-compiles too, given Windows
+builds of MariaDB Connector/C and libcurl (set `WIN_DEPS_CFLAGS` and
+`WIN_DEPS_LIBS`).
+
+**What's different from macOS:**
+
+| macOS | Windows |
+| --- | --- |
+| ⌘↩ runs the editor (or asks Claude) | Ctrl+Enter; also **Query › Run** |
+| ⌘T / ⌘W, **File › New Tab / Close Tab** | Ctrl+T / Ctrl+W, the same menu items |
+| ⌘-click adds a row or table to the selection | Ctrl-click (Shift-click selects a range on both) |
+| Edit menu (Undo, Cut, Copy, Paste, Select All) | the text fields' own Ctrl+Z / X / C / V / A and right-click menu |
+| Settings in `~/Library/Application Support/sqlc` | Settings in `%APPDATA%\sqlc` (the same files: `connections`, `claude-api-key`) |
+| Divider positions in the user defaults | Divider positions in the registry, `HKEY_CURRENT_USER\Software\sqlc` |
+| Spinner while connecting / loading tables | A moving progress bar |
+| Export saved message shows `~/...` | It shows the full path |
+
+When a long job ends in the background, the taskbar button flashes instead
+of the Dock icon bouncing, with the Windows "asterisk" (or "exclamation" when
+it failed) sound.
+
+### Not on Windows yet
+
+- **Export** (table, database, selected tables): the menu items and buttons
+  are there but say it isn't available yet.
+- Date and time cells are edited as text: no calendar.
+- Tabs don't show their full title in a tooltip when it's cut short.
 
 ## GUI
 
@@ -540,7 +593,9 @@ with the same structure / `DROP … IF EXISTS` / data options:
 | --- | --- |
 | `src/db.c`, `src/db.h` | Shared core: run SQL, collect results, views filter |
 | `src/main.c`, `src/complete.c` | CLI and its tab completion |
-| `src/gui.c` | GUI (libui-ng) |
+| `src/gui.c` | GUI (libui-ng), shared by macOS and Windows |
+| `src/platform.c` | The file calls that differ between macOS and Windows: settings folder, UTF-8 paths, replacing a file in one step, temporary files, `getline`, random numbers (no UI) |
+| `src/win/` | The Windows versions of the `*.m` shims in this table, one `*_win.c` per header (Win32 / common controls on libui-ng's Windows API), `win_util.c` (UTF-8 / UTF-16, registry, fonts), and `sqlc.rc` / `sqlc.manifest` (common controls 6, DPI awareness, UTF-8 code page) |
 | `src/macos_menu.m` | Native Edit menu and Query › Run (⌘↩), File › New Tab (⌘T) and Close Tab (⌘W), which libui-ng lacks; small control sizes and widths; Return in a text field (the filter bar's value); the end-of-export sound, Dock bounce and alert |
 | `src/splitview.m` | Resizable panes (sidebar, editor / results, columns / indexes): an `NSSplitView` wrapped as a libui control |
 | `src/loading.m` | The loading spinner with a tip under it (connecting, refreshing tables): an `NSProgressIndicator` and a wrapping label wrapped as a libui control |
@@ -560,6 +615,7 @@ with the same structure / `DROP … IF EXISTS` / data options:
 | `src/ai_db.c` | Current database's schema as text for the prompt |
 | `src/json.c` | Small JSON builder and parser used by `ai.c` |
 | `tests/` | Unit tests (`make test`), e.g. `tests/browse_test.c` for `src/browse.c` |
+| `.github/workflows/windows.yml` | Builds `sqlc-gui.exe` with MSYS2, runs `make win-test`, uploads the zip |
 | `third_party/libui-ng` | libui-ng submodule |
 
 ## Development
@@ -570,8 +626,14 @@ ordering and table selection, Ask Claude's request/response handling, comment fo
 destructive-statement check, the row editor's value checks and generated
 SQL, the browse page's `SELECT` (filter operators, escaping, `ORDER BY` the
 key, `OFFSET`), key columns and page labels, the SQL tips' length, format and no-repeat pick, the tab titles and
-running-jobs list (truncation, UTF-8), the sidebar search's name match, and which errors mean a lost
-connection (no database or network needed).
+running-jobs list (truncation, UTF-8), the sidebar search's name match, which errors mean a lost
+connection, and the platform file calls (replacing a file, temporary files,
+`getline`, UTF-8 file names) (no database or network needed).
+
+`make win-check` compiles the GUI for Windows without linking, and
+`make win-test` builds and runs the unit tests that work on Windows (platform,
+saved connections, row editing, browse, SQL tips, tabs, sidebar search); see
+[Windows](#windows).
 
 `make export-test` exports an edge-case table in every format and checks the
 result: the SQL is re-imported into an empty database and compared with
@@ -616,6 +678,8 @@ and the welcome screen at launch and after **Disconnect**). It expects a databas
   the strip is cut off at the window's right edge (no scrolling or overflow
   menu yet): tabs past it, and **+**, can't be clicked until some are closed
   or the window is widened; ⌘T still opens a new tab.
+- Windows: see [Not on Windows yet](#not-on-windows-yet). `make gui-test`
+  and `make export-test` are macOS only.
 - Ask Claude is GUI only (no `sqlc` CLI command yet), and the window is busy
   (Run disabled) until Claude answers; a request can't be cancelled.
 

@@ -7,10 +7,11 @@
 #include <string.h>
 
 #include "db.h"
+#include "platform.h"
 
 #define PROGRESS_EVERY 5000
 
-static char *fmt_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static char *fmt_error(const char *fmt, ...) PLAT_PRINTF(1, 2);
 static char *fmt_error(const char *fmt, ...) {
     char buf[1024];
     va_list ap;

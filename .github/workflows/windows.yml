@@ -1,0 +1,67 @@
+# Builds sqlc-gui.exe for Windows (MSYS2 UCRT64 / MinGW-w64) and runs the
+# database-free unit tests there. No database server, no network tests.
+# The zip artifact holds the exe and the DLLs it needs, ready to run.
+name: Windows GUI
+
+on:
+  push:
+    branches: [main, windows-gui]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            zip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-libmariadbclient
+            mingw-w64-ucrt-x86_64-curl
+
+      - name: Unit tests (no database)
+        run: make win-test
+
+      - name: Build sqlc-gui.exe
+        run: |
+          make -j4 windows || {
+            echo "::group::MariaDB package files (for the Makefile's flags)"
+            pacman -Ql mingw-w64-ucrt-x86_64-libmariadbclient | grep -E '\.pc$|config|\.h$|\.a$|\.dll' | head -50
+            echo "::endgroup::"
+            exit 1
+          }
+
+      - name: Bundle with its DLLs
+        run: |
+          mkdir -p dist/sqlc
+          cp sqlc-gui.exe dist/sqlc/
+          # every DLL it loads from the MSYS2 prefix (not Windows' own)
+          ldd sqlc-gui.exe | awk '/ucrt64/ {print $3}' | sort -u | xargs -r -I{} cp {} dist/sqlc/
+          # MariaDB's authentication plugins (caching_sha2_password for MySQL 8, ...)
+          if [ -d /ucrt64/lib/mariadb/plugin ]; then
+            mkdir -p dist/sqlc/plugin
+            cp /ucrt64/lib/mariadb/plugin/*.dll dist/sqlc/plugin/ 2>/dev/null || true
+            for p in dist/sqlc/plugin/*.dll; do
+              [ -f "$p" ] && ldd "$p" | awk '/ucrt64/ {print $3}' | xargs -r -I{} cp -n {} dist/sqlc/
+            done
+          fi
+          ls -la dist/sqlc
+          cd dist && zip -r ../sqlc-gui-windows-x64.zip sqlc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqlc-gui-windows-x64
+          path: sqlc-gui-windows-x64.zip

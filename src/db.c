@@ -6,6 +6,8 @@
 #include <string.h>
 #include <strings.h>
 
+#include "platform.h"
+
 char *db_error_string(MYSQL *conn) {
     const char *msg = mysql_error(conn);
     size_t len = strlen(msg) + 64;
@@ -21,6 +23,15 @@ MYSQL *db_connect(const char *host, const char *user, const char *pass,
     MYSQL *conn = mysql_init(NULL);
     if (!conn) { *err = strdup("mysql_init failed"); return NULL; }
     mysql_options(conn, MYSQL_SET_CHARSET_NAME, "utf8mb4");
+#ifdef _WIN32
+    /* authentication plugins (caching_sha2_password, ...) ship in "plugin"
+     * next to sqlc-gui.exe, not in the path Connector/C was built with */
+    char plugins[1024];
+    if (plat_exe_dir(plugins, sizeof plugins - 8) == 0) {
+        strcat(plugins, "\\plugin");
+        mysql_options(conn, MYSQL_PLUGIN_DIR, plugins);
+    }
+#endif
     if (!mysql_real_connect(conn, host, user, pass, db, port, NULL,
                             CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS)) {
         *err = db_error_string(conn);

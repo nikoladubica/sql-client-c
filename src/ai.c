@@ -229,6 +229,10 @@ int ai_generate(const char *api_key, const char *request_json, ai_result *out) {
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); /* we're on a worker thread */
+#ifdef _WIN32
+    /* trust Windows' certificate store, not a CA bundle path from the build machine */
+    curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+#endif
 
     CURLcode rc = curl_easy_perform(curl);
     long status = 0;

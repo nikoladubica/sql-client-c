@@ -4,8 +4,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+
+#include "platform.h"
 
 /* An INSERT is closed after this many rows or (roughly) bytes, well below
  * the default max_allowed_packet (16 MB in MariaDB/MySQL 8). */
@@ -580,19 +580,9 @@ FILE *export_temp_open(const char *path, char **tmp, char **err) {
     *tmp = malloc(n);
     if (!*tmp) { *err = strdup("Out of memory"); return NULL; }
     snprintf(*tmp, n, "%s.sqlc-XXXXXX", path);
-    int fd = mkstemp(*tmp);
-    if (fd < 0) {
-        *err = path_error("Could not create", path, errno);
-        free(*tmp);
-        *tmp = NULL;
-        return NULL;
-    }
-    fchmod(fd, 0644);
-    FILE *f = fdopen(fd, "w");
+    FILE *f = plat_mkstemp(*tmp, 0);
     if (!f) {
-        *err = path_error("Could not write", path, errno);
-        close(fd);
-        unlink(*tmp);
+        *err = path_error("Could not create", path, errno);
         free(*tmp);
         *tmp = NULL;
     }
@@ -602,15 +592,15 @@ FILE *export_temp_open(const char *path, char **tmp, char **err) {
 int export_temp_finish(FILE *f, char *tmp, const char *path, int ok, int write_errno,
                        char **err) {
     int rc = -1;
-    if (ok && !write_errno && (fflush(f) != 0 || fsync(fileno(f)) != 0)) write_errno = errno ? errno : EIO;
+    if (ok && !write_errno && plat_fsync(f) != 0) write_errno = errno ? errno : EIO;
     if (fclose(f) != 0 && ok && !write_errno) write_errno = errno ? errno : EIO;
     if (write_errno) {
         if (!*err) *err = path_error("Could not write", path, write_errno);
     } else if (ok) {
-        if (rename(tmp, path) == 0) rc = 0;
+        if (plat_replace(tmp, path) == 0) rc = 0;
         else if (!*err) *err = path_error("Could not save", path, errno);
     }
-    if (rc != 0) unlink(tmp);
+    if (rc != 0) plat_unlink(tmp);
     free(tmp);
     return rc;
 }
